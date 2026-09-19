@@ -1219,44 +1219,40 @@ def validate_prompt(
             if seg_frames
             else ("the plan" if requested else f"hop {hop}")
         )
-        if total_frames and shots and len(segs) != len(shots):
-            if seg_frames:
-                detail = (
-                    f"segment_frames {seg_frames} splits {total_frames} frames into "
-                    f"{len(segs)} window(s) = {len(segs) - 1} cut(s)"
-                )
-            else:
-                detail = (
-                    f"window {chunk}/overlap {overlap} splits {total_frames} frames "
-                    f"into {len(segs)} window(s) = {len(segs) - 1} cut(s)"
-                )
-            errors.append(
-                f"prompt describes {len(shots)} shot(s) = {len(shots) - 1} cut(s), but "
-                f"{detail} — the model and the executor would cut a different "
-                "number of times"
-            )
-
+        # Window boundaries are HARD breaks: overlap is 0, so no information
+        # crosses them — each one must therefore be a shot change the prompt
+        # declares, or the model keeps shooting the old scene where the executor
+        # has already started a new window.  The reverse is perfectly legal: a
+        # prompt may declare MORE timestamps than the executor cuts, and those
+        # extra ones are shot changes the model performs *inside* one window
+        # (exactly how the first pass does multi-shot clips in a single run).
         if cut_secs:
-            if len(truth) != len(cut_secs):
-                errors.append(
-                    f"the plan cuts {len(truth)} time(s) but the prompt declares "
-                    f"{len(cut_secs)} timestamp(s)"
-                )
-            bad = [
-                (n + 1, int(round(sec * FPS)), truth[n])
-                for n, sec in enumerate(cut_secs)
-                if n < len(truth) and abs(int(round(sec * FPS)) - truth[n]) > 1
+            prompt_frames = [int(round(sec * FPS)) for sec in cut_secs]
+            missing = [
+                f for f in truth if not any(abs(f - p) <= 1 for p in prompt_frames)
             ]
-            for shot_no, frame, want_frame in bad[:MAX_LISTED]:
+            for frame in missing[:MAX_LISTED]:
                 errors.append(
-                    f"[Shot {shot_no}] timestamp is frame {frame} ({timecode(frame)}) "
-                    f"but {origin} cuts at frame {want_frame} "
-                    f"({timecode(want_frame)}) — off by {frame - want_frame:+d} frame(s)"
+                    f"the executor cuts at frame {frame} ({timecode(frame)}) but the "
+                    "prompt declares no 'At MM:SS.mmm' there — a window boundary is a "
+                    "hard break (no context crosses it), so the model has to be told "
+                    "to change shot at that exact frame. Declared: "
+                    + (", ".join(timecode(p) for p in prompt_frames) or "(none)")
                 )
-            if not bad and any(
-                int(round(sec * FPS)) != truth[n]
-                for n, sec in enumerate(cut_secs)
-                if n < len(truth)
+            extra = [
+                p for p in prompt_frames if not any(abs(p - t) <= 1 for t in truth)
+            ]
+            if extra and not missing:
+                info["in_window_cuts"] = [seconds_for_frames(p) for p in extra]
+                warnings.append(
+                    f"{len(extra)} timestamp(s) fall INSIDE a window ("
+                    + ", ".join(timecode(p) for p in extra[:MAX_LISTED])
+                    + ") — those shot changes are the model's own, done within a single "
+                    "sampling window; the executor only splits on its own boundaries, "
+                    "so this is allowed"
+                )
+            elif not missing and not extra and any(
+                int(round(sec * FPS)) != t for sec, t in zip(cut_secs, truth)
             ):
                 warnings.append(
                     "shot timestamps sit within one frame of the real cut frames "

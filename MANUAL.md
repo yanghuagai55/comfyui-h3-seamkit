@@ -183,7 +183,7 @@ D:\comfyui\comfyenv\python.exe D:\comfyui\ComfyUI\custom_nodes\comfyui-h3-hardcu
 | 2 | `[Shot N]` 编号是否从 1 连续（只在 `detailed_description` 里数，不会把 `retention_analysis` 里的引用误算成镜头） | 错 |
 | 3 | **有没有"不切"的措辞** —— `no cuts` / `without a cut` / `never cuts` / `continuous take` / `unbroken` / `in one take` / `no edit` | 错 |
 | 4 | `[Shot 2]` 起是否都以 `At MM:SS.mmm,` 开头 | 错 |
-| 5 | 镜头数 = 段数？（提示词说 3 镜、执行器只切 1 刀 → 错） | 错 |
+| 5 | **执行器每一刀是否都出现在提示词时间戳里**（段边界是硬断点，模型必须被告知在此换镜）。**提示词时间戳多于刀数 = 段内模型自己切镜，合法** | 错（只拦"刀不在提示词里"） |
 | 6 | **时间戳落不落在执行器真会切的那一帧**（计划已接线 → 计划是真值；未接线 → 用 17 帧网格判） | 错 |
 | 7 | 提示词里写的时长 vs `total_seconds` | 警 |
 | 8 | 段长 × 画布MP 是否越过 OOM 锚点（画布从 plan 的 target_width/height 算） | 错 / 警 |

@@ -189,7 +189,7 @@ cut points    : 3 hard cut(s)
 | 2 | `[Shot N]` 编号从 1 连续（**只在 `detailed_description` 里数**，不会把 `retention_analysis` 的引用误算成镜头） | 错 |
 | 3 | **"不切"措辞** —— `no cuts` / `without a cut` / `never cuts` / `continuous take` / `unbroken` / `in one take` / `no edit`，报错还告诉你行号 | 错 |
 | 4 | `[Shot 2]` 起是否都以 `At MM:SS.mmm,` 开头 | 错 |
-| 5 | 镜头数 vs 段数（提示词说 3 镜、执行器只切 1 刀 → 错） | 错 |
+| 5 | **执行器每一刀是否都在提示词时间戳里**（段边界是硬断点）。**提示词时间戳多于刀数 = 段内模型自己切镜，合法** | 错（只拦"刀不在提示词里"） |
 | 6 | **时间戳是否落在执行器真会切的那一帧** | 错 |
 | 7 | 提示词写的时长 vs `total_seconds` | 警 |
 | 8 | 段长 × 画布MP 是否越过 OOM 锚点 | 错 / 警 |
