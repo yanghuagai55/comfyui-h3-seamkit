@@ -201,6 +201,39 @@ def _sample_fullframe(
     return sampled.tensors[0]
 
 
+def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
+    """First-pass latent -> the tokens where the model changed shots (no VAE).
+
+    The upscaler never sees the prompt, so where the model actually cut is only
+    observable in the latent we were handed.  Diffing the token axis and scoring
+    each token against its own neighbourhood finds a cut even when the scene is
+    busy — a fight moves every token, so a global threshold is useless.
+    Returns a list of `(token_index, ratio)`; the change sits between that token
+    and the next one.
+    """
+    v = video.detach().float()
+    if v.ndim != 5 or v.shape[2] < 3:
+        return []
+    d = (v[:, :, 1:] - v[:, :, :-1]).abs().mean(dim=(0, 1, 3, 4))
+    n = int(d.numel())
+    hits = []
+    for i in range(n):
+        lo, hi = max(0, i - win), min(n, i + win + 1)
+        med = float(d[lo:hi].median())
+        if med <= 0:
+            continue
+        ratio = float(d[i]) / med
+        if ratio >= sens:
+            hits.append((i, ratio))
+    # Keep the strongest when neighbours fire together (a cut smears over 1-2 tokens)
+    hits.sort(key=lambda x: -x[1])
+    kept = []
+    for i, r in hits:
+        if all(abs(i - j) > 1 for j, _ in kept):
+            kept.append((i, r))
+    return sorted(kept)
+
+
 def execute(
     model,
     conditioning,
@@ -211,6 +244,8 @@ def execute(
     plan,
     negative=None,
     cfg: float = 1.0,
+    auto_seam_hunt: bool = False,
+    auto_seam_sensitivity: int = 20,
 ):
     core = _core()
     learned = _learned()
@@ -242,8 +277,37 @@ def execute(
         _noise_report,
     ) = core._build_global_target_av_noise(noise, latent, video, audio, plan)
 
-    # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
+    # ---- optional: put the window boundary just BEFORE the model's own cut ----
+    # The upscaler never sees the prompt, so the model's shot change is only
+    # observable in the latent we are holding.  Measuring it here costs no VAE
+    # decode, and placing the split before it keeps the seam on continuous
+    # content — the model performs the cut itself, inside the window.
     segment_frames = (plan.get("hardcut") or {}).get("segment_frames")
+    seam_hunt = None
+    if auto_seam_hunt:
+        hits = _hunt_shot_changes(
+            video, sens=max(0.5, float(auto_seam_sensitivity) / 10.0)
+        )
+        tokens = []
+        for idx, _ratio in hits:
+            token = max(5, (idx // 5) * 5)  # nearest grid point BEFORE the change
+            if token < int(video.shape[2]) and token not in tokens:
+                tokens.append(token)
+            if len(tokens) >= 9:
+                break
+        if tokens:
+            segment_frames = [core.frames_for_tokens(t) for t in tokens]
+            seam_hunt = {
+                "sensitivity": round(max(0.5, float(auto_seam_sensitivity) / 10.0), 2),
+                "hits": [
+                    {"between_tokens": int(i), "ratio": round(float(r), 2)}
+                    for i, r in hits[:9]
+                ],
+                "boundary_tokens": tokens,
+                "boundary_frames": list(segment_frames),
+            }
+
+    # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
     if segment_frames:
         segments = explicit_segments(
             int(video.shape[2]), frame_count, segment_frames
@@ -322,6 +386,8 @@ def execute(
         "lengths": [r["length_frames"] for r in segment_reports],
         "segments": segment_reports,
     }
+    if seam_hunt is not None:
+        report["seam_hunt"] = seam_hunt
     return output, json.dumps(report)
 
 
@@ -351,6 +417,29 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                 PLAN_TYPE.Input("plan"),
                 io.Conditioning.Input("negative", optional=True),
                 io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=0.1),
+                io.Boolean.Input(
+                    "auto_seam_hunt",
+                    default=False,
+                    tooltip=(
+                        "自动找切镜、把窗口边界挪到它前面（**不用 VAE，直接在 latent 上算**）。\n"
+                        "二采看不到提示词，模型究竟在哪一帧换镜头只有 latent 知道。\n"
+                        "开启后：在时间轴找 latent 的突变（局部邻域法，剧烈动作也不会被淹），\n"
+                        "把窗口边界放在突变**之前**最近的 17 帧网格点上 —— 缝就落在内容连续处，"
+                        "剪辑由模型自己在窗口内完成。\n"
+                        "会覆盖 plan 里的 segment_frames；报告里给出检测到的 token 与最终边界。"
+                    ),
+                ),
+                io.Int.Input(
+                    "auto_seam_sensitivity",
+                    default=20,
+                    min=5,
+                    max=80,
+                    step=1,
+                    tooltip=(
+                        "检测灵敏度（×0.1）。某个 token 的变化超过「自己邻域中位数的 N/10 倍」"
+                        "才算一次切镜 —— 20 = 2.0 倍。调小＝更敏感（可能多切），调大＝更保守。"
+                    ),
+                ),
             ],
             outputs=[io.Latent.Output("latent"), io.String.Output("report")],
         )
