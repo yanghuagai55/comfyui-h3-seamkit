@@ -225,6 +225,29 @@ def _sample_fullframe(
     return sampled.tensors[0]
 
 
+def _latent_change_profile(video, win: int = 2) -> list:
+    """Every token boundary scored against its own neighbourhood - NO threshold.
+
+    `[(token_index, ratio), ...]` for all boundaries; the change sits between
+    that token and the next one.  Kept threshold-free because the caller knows
+    where to look (the planned cuts) and busy footage never clears a fixed
+    ratio anyway.
+    """
+    v = video.detach().float()
+    if v.ndim != 5 or v.shape[2] < 3:
+        return []
+    d = (v[:, :, 1:] - v[:, :, :-1]).abs().mean(dim=(0, 1, 3, 4))
+    n = int(d.numel())
+    out = []
+    for i in range(n):
+        lo, hi = max(0, i - win), min(n, i + win + 1)
+        med = float(d[lo:hi].median())
+        if med <= 0:
+            continue
+        out.append((i, float(d[i]) / med))
+    return out
+
+
 def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     """First-pass latent -> the tokens where the model changed shots (no VAE).
 
@@ -256,6 +279,53 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
         if all(abs(i - j) > 1 for j, _ in kept):
             kept.append((i, r))
     return sorted(kept)
+
+
+def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
+    """Per planned cut: the strongest latent change within `tolerance` frames.
+
+    Returns `(aligned, boundary_tokens)`.  `aligned` carries the per-cut report
+    including the top candidates, so the latent's behaviour near the cut is
+    visible instead of a bare accept/reject.
+    """
+    core = _core()
+    aligned, boundary_tokens = [], []
+    for cut in planned:
+        cands = [
+            (idx, r)
+            for idx, r in profile
+            if 0 < int(idx) + 1 < int(video_tokens)
+            and abs(core.frames_for_tokens(int(idx) + 1) - cut) <= tolerance
+        ]
+        if not cands:
+            continue
+        cands.sort(key=lambda x: -x[1])
+        best_idx, best_ratio = cands[0]
+        top = [
+            [core.frames_for_tokens(int(i) + 1), round(float(r), 2)]
+            for i, r in cands[:3]
+        ]
+        if best_ratio < 1.1:
+            aligned.append({
+                "planned_cut": cut,
+                "moved": False,
+                "note": f"latent is flat near the cut (best ratio {best_ratio:.2f} < 1.1)",
+                "top_candidates": top,
+            })
+            continue
+        token = int(best_idx) + 1
+        frame = core.frames_for_tokens(token)
+        if token not in boundary_tokens:
+            boundary_tokens.append(token)
+        aligned.append({
+            "planned_cut": cut,
+            "moved": frame != cut,
+            "boundary_token": token,
+            "boundary_frame": frame,
+            "ratio": round(float(best_ratio), 2),
+            "top_candidates": top,
+        })
+    return aligned, boundary_tokens
 
 
 def execute(
@@ -311,60 +381,40 @@ def execute(
     segment_frames = planned or None
     seam_hunt = None
     if auto_seam_hunt:
-        hits = _hunt_shot_changes(
-            video, sens=max(0.5, float(auto_seam_sensitivity) / 10.0)
+        # Threshold-based detection died on busy footage: a fight moves every
+        # token, so the real shot change never clears a fixed ratio while a
+        # hard action beat does (measured: the only hit was the finale, 119
+        # frames away from the cut).  The planned cut is already a strong
+        # prior, so instead of hunting hits and gating them, take the
+        # STRONGEST latent change within the tolerance window of each planned
+        # cut.  No threshold; the top candidates go into the report so the
+        # latent's behaviour near the cut is visible at last.
+        profile = _latent_change_profile(video)
+        aligned, boundary_tokens = _align_to_profile(
+            profile, planned, tolerance, int(video.shape[2])
         )
-        tokens, accepted, rejected = [], [], []
-        for idx, ratio in hits:
-            change_frame = core.frames_for_tokens(int(idx) + 1)  # between idx and idx+1
-            # Land the boundary ON the token where the new content starts, not one
-            # token before it.  The executor splits at the start of a token, so
-            # putting it on the changed token makes the window begin with the new
-            # shot: the seam then sits exactly where the picture changes and the
-            # cut hides it.  (Starting one token early leaves the seam 4 frames
-            # before the change, on continuous content, where it reads as a jump.)
-            # Token edges run 0,1,5,9,13,17,18,22,... so the resolution here is
-            # 1-4 frames, never the old 17-frame grid.
-            token = max(1, int(idx) + 1)
-            if token >= int(video.shape[2]):
-                continue
-            # Sanity gate: the hunt can fire on a hard action beat.  Only trust it
-            # when the change lands within `seam_tolerance` frames of a cut that
-            # #56 planned; anything farther is reported and dropped.
-            if planned:
-                nearest = min(planned, key=lambda c: abs(c - change_frame))
-                distance = abs(nearest - change_frame)
-                if distance > tolerance:
-                    rejected.append({
-                        "between_tokens": int(idx),
-                        "change_frame": change_frame,
-                        "nearest_planned_cut": nearest,
-                        "distance": distance,
-                        "ratio": round(float(ratio), 2),
-                    })
-                    continue
-            if token not in tokens:
-                tokens.append(token)
-                accepted.append({
-                    "between_tokens": int(idx),
-                    "change_frame": change_frame,
-                    "boundary_token": token,
-                    "boundary_frame": core.frames_for_tokens(token),
-                    "ratio": round(float(ratio), 2),
-                })
-            if len(tokens) >= 9:
-                break
-        if tokens:
-            segment_frames = [core.frames_for_tokens(t) for t in tokens]
+        if boundary_tokens:
+            boundary_tokens.sort()
+            cand = [core.frames_for_tokens(t) for t in boundary_tokens]
+            tail = frame_count - cand[-1]
+            if tail < FRAME_GRID:
+                seam_hunt_note = (
+                    f"hunted boundary {cand[-1]} leaves a {tail}-frame tail; keeping the plan"
+                )
+            else:
+                segment_frames = cand
+                seam_hunt_note = None
+        else:
+            seam_hunt_note = "no latent change found within tolerance of any planned cut"
         seam_hunt = {
-            "sensitivity": round(max(0.5, float(auto_seam_sensitivity) / 10.0), 2),
             "tolerance_frames": tolerance,
             "planned_cuts": planned,
-            "accepted": accepted,
-            "rejected": rejected,
-            "boundary_tokens": tokens,
-            "boundary_frames": [core.frames_for_tokens(t) for t in tokens],
+            "aligned": aligned,
+            "boundary_tokens": boundary_tokens,
+            "boundary_frames": [core.frames_for_tokens(t) for t in boundary_tokens],
         }
+        if seam_hunt_note:
+            seam_hunt["note"] = seam_hunt_note
 
     # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
     if segment_frames:
@@ -495,8 +545,10 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     max=80,
                     step=1,
                     tooltip=(
-                        "检测灵敏度（×0.1）。某个 token 的变化超过「自己邻域中位数的 N/10 倍」"
-                        "才算一次切镜 —— 20 = 2.0 倍。调小＝更敏感（可能多切），调大＝更保守。"
+                        "（已停用，保留兼容）旧版用固定阈值检测（20 = 2.0 倍），在打斗类"
+                        "内容上会把真转镜漏掉、反而抓到动作重击。现改为：在每个计划切点的"
+                        "容差窗内直接取 latent 变化最强的 token 作为边界 —— 无阈值。"
+                        "低于 1.1 倍视为平坦，保持原计划边界。"
                     ),
                 ),
             ],
