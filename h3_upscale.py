@@ -281,6 +281,12 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     return sorted(kept)
 
 
+# A smeared turn fires on both sides of its transition token; when the back
+# shoulder is at least this fraction of the front one, the boundary moves to
+# the back shoulder so the seam lands on the first new-shot frame.
+SHOULDER_TAKEOVER = 0.7
+
+
 def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
     """Per planned cut: the strongest latent change within `tolerance` frames.
 
@@ -315,6 +321,30 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
             continue
         token = int(best_idx) + 1
         frame = core.frames_for_tokens(token)
+        # Shoulder takeover: a smeared turn fires on BOTH sides of its
+        # transition token - the strongest diff sits on the FRONT shoulder
+        # (entering the transition frame) while the visible shot change (the
+        # first new-shot frame) sits on the BACK one.  Measured: planned 68,
+        # profile [68:1.7, 69:1.37] -> the shot actually changes 68|69, so the
+        # argmax boundary landed one frame early.  When the NEXT boundary is
+        # within one 17-frame block and nearly as strong, prefer it: the seam
+        # then lands on the first NEW-shot frame and the transition frame
+        # stays whole inside the old window.
+        note = None
+        for idx, r in cands:
+            if int(idx) != int(best_idx) + 1:
+                continue
+            nxt = core.frames_for_tokens(int(idx) + 1)
+            if (r >= SHOULDER_TAKEOVER * best_ratio
+                    and 0 < nxt - frame <= FRAME_GRID
+                    and abs(nxt - cut) <= tolerance):
+                token, frame = int(idx) + 1, nxt
+                note = (
+                    "shoulder takeover: the smeared turn fires on both sides of "
+                    "its transition token, so the boundary moved to the back "
+                    "shoulder and the seam lands on the first new-shot frame"
+                )
+            break
         if token not in boundary_tokens:
             boundary_tokens.append(token)
         aligned.append({
@@ -325,6 +355,8 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
             "ratio": round(float(best_ratio), 2),
             "top_candidates": top,
         })
+        if note:
+            aligned[-1]["note"] = note
     return aligned, boundary_tokens
 
 
