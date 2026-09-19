@@ -61,12 +61,32 @@ def _sampling():
     return _upstream("sampling", require="minimax-h3-audio-T8")
 
 
-def explicit_segments(video_tokens: int, total_frames: int, cut_frames) -> list:
+def _snap_boundary(frame: int, video_tokens: int, step: int = 1):
+    """Frame -> (token, frame) at the nearest token edge, `step` tokens apart.
+
+    A window can only start on a token edge, but NOT only every 5th one: the
+    token->frame map is `[1,4,4,4,4]` repeating, so edges land on
+    0,1,5,9,13,17,18,22,... — i.e. every token is a legal boundary and the real
+    resolution is 1-4 frames.  `step=5` reproduces the old 17-frame grid (kept
+    for callers that want it); `step=1` uses every edge.
+    """
+    core = _core()
+    choices = [
+        (token, core.frames_for_tokens(token))
+        for token in range(0, int(video_tokens) + 1, max(1, int(step)))
+    ]
+    return min(choices, key=lambda item: abs(item[1] - int(frame)))
+
+
+def explicit_segments(
+    video_tokens: int, total_frames: int, cut_frames, token_step: int = 1
+) -> list:
     """Explicit cut-frame list -> UNEQUAL window bounds.
 
-    Each boundary is snapped to the 17-frame token grid (that is a hard H3
-    constraint).  `cut_frames` is in frames; 0 and the clip end are implied and
-    must not be listed.
+    Each boundary is snapped to the nearest TOKEN edge (`token_step=1` = finest,
+    1-4 frame resolution; `token_step=5` = the coarse 17-frame grid).
+    `cut_frames` is in frames; 0 and the clip end are implied and must not be
+    listed.
 
     Every cut is validated against the grid *by the number the caller wrote*,
     before any bounds are built, so a rejected cut is always reported with that
@@ -84,12 +104,12 @@ def explicit_segments(video_tokens: int, total_frames: int, cut_frames) -> list:
             raise ValueError(
                 f"cut frame {f} is not inside the clip (0, {total_frames})"
             )
-        token, frame = core._snap_frame(f, video_tokens)
+        token, frame = _snap_boundary(f, video_tokens, token_step)
         if token <= 0:
             raise ValueError(
                 f"cut frame {f} snaps back onto the clip start (token 0), which would "
-                "leave the first window empty. Keep cuts at least 9 frames in — the "
-                "usable grid points are 17, 34, 51, ..."
+                "leave the first window empty. Keep cuts at least a few frames in — "
+                "with token_step=1 the usable edges start at frame 1."
             )
         snapped.append((f, token, frame))
 
@@ -293,7 +313,10 @@ def execute(
         tokens, accepted, rejected = [], [], []
         for idx, ratio in hits:
             change_frame = core.frames_for_tokens(int(idx) + 1)  # between idx and idx+1
-            token = max(5, (int(idx) // 5) * 5)  # grid point just BEFORE the change
+            # The token edge right before the change - not the old 17-frame grid.
+            # token edges run 0,1,5,9,13,17,18,22,... so this lands within 1-4
+            # frames of the change instead of up to 8 frames away.
+            token = max(1, int(idx))
             if token >= int(video.shape[2]):
                 continue
             # Sanity gate: the hunt can fire on a hard action beat.  Only trust it
