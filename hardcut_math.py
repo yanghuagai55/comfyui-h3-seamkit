@@ -1158,9 +1158,12 @@ def validate_prompt(
                 "was supplied, so the shot-count and last-window checks are skipped"
             )
     elif declared_seconds is not None and abs(declared_seconds - float(total_seconds)) > 1e-6:
-        warnings.append(
-            f"prompt says '{declared_seconds:g}-second' but the plan is "
-            f"{float(total_seconds):g}s"
+        # Info, not a warning: a round number in the prompt vs the 17n+5 grid is
+        # expected and harmless, and a warning here made callers rewrite prompts
+        # that were already fine.
+        info["declared_seconds_note"] = (
+            f"prompt says '{declared_seconds:g}-second', plan is "
+            f"{float(total_seconds):g}s (snapped to the 17n+5 frame grid)"
         )
     info["total_seconds"] = float(total_seconds) if total_seconds else None
     total_frames = frames_for_seconds(total_seconds) if total_seconds else None
@@ -1243,14 +1246,12 @@ def validate_prompt(
                 p for p in prompt_frames if not any(abs(p - t) <= 1 for t in truth)
             ]
             if extra and not missing:
+                # Legal by design: the executor only hard-splits on its own
+                # boundaries, and these extra timestamps are shot changes the
+                # model performs inside one window.  Recorded as info (shown as a
+                # plain line in the report), never as a warning — a warning here
+                # made callers edit perfectly valid prompts.
                 info["in_window_cuts"] = [seconds_for_frames(p) for p in extra]
-                warnings.append(
-                    f"{len(extra)} timestamp(s) fall INSIDE a window ("
-                    + ", ".join(timecode(p) for p in extra[:MAX_LISTED])
-                    + ") — those shot changes are the model's own, done within a single "
-                    "sampling window; the executor only splits on its own boundaries, "
-                    "so this is allowed"
-                )
             elif not missing and not extra and any(
                 int(round(sec * FPS)) != t for sec, t in zip(cut_secs, truth)
             ):
@@ -1347,6 +1348,8 @@ def format_validation(result: dict) -> str:
             f"clip          : prompt says {result['declared_seconds']:g}s "
             "(no plan length available)"
         )
+    if result.get("declared_seconds_note"):
+        lines.append("clip note     : " + result["declared_seconds_note"])
     if result.get("shots"):
         lines.append(
             "shots found   : " + ", ".join(f"[Shot {i}]" for i in result["shots"])
@@ -1359,6 +1362,16 @@ def format_validation(result: dict) -> str:
                 f"{c:.3f}s (frame {int(round(c * FPS))}, {timecode(int(round(c * FPS)))})"
                 for c in cuts
             )
+        )
+    in_window = result.get("in_window_cuts") or []
+    if in_window:
+        lines.append(
+            "in-window cuts: "
+            + ", ".join(
+                f"{c:.3f}s ({timecode(int(round(c * FPS)))})" for c in in_window
+            )
+            + "  -> shot changes the MODEL performs inside one window (legal: the "
+            "executor only hard-splits on its own boundaries)"
         )
     if result.get("chunk"):
         chunk = result["chunk"]

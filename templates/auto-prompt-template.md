@@ -167,7 +167,47 @@ N/A.
 
 ---
 
-## 七、节点会怎么检验（错一条就拦停）
+## 七、示例 2 —— **3 个镜头 / 2 个采样窗口（完全合法，已实测跑通）**
+
+> 这一份**真跑过**：10 秒片，一采 + 二采共 26 分 44 秒，产出 `exp_4v10a_00038.mp4`。
+
+**规则回顾**：执行器只在自己那几刀上硬切；**提示词里多出来的时间戳 = 模型在同一个窗口内自己切的镜头**。
+
+```text
+片长 10 秒，chunk_step = 8   →   执行器只切 1 刀（4.958s）= 2 个窗口
+
+提示词写 3 个镜头：
+  [Shot 1]                       0.000 → 4.958s    （窗口 1）
+  [Shot 2] At 00:04.958, …       4.958 → 8.500s    ← 窗口边界，硬切
+  [Shot 3] At 00:08.500, …       8.500 → 10.125s   ← 在窗口 2 内部，模型自己切
+```
+
+**为什么合法**：`[Shot N] At MM:SS.mmm` 是模型的原生能力（一采整片出多镜就是这么做的）。
+**只有窗口边界必须写时间戳**（那是硬断点，不告诉它就会继续拍旧场面）；窗口内部的切换交给模型。
+
+**节点的报告（0 错 0 警）**：
+
+```text
+=== H3 HARD-CUT PROMPT CHECK ===
+status        : OK   (0 error(s), 0 warning(s))
+clip note     : prompt says '10-second', plan is 10.125s (snapped to the 17n+5 frame grid)
+shots found   : [Shot 1], [Shot 2], [Shot 3]
+prompt cuts   : 4.958s (frame 119, 00:04.958), 8.500s (frame 204, 00:08.500)
+in-window cuts: 8.500s (00:08.500)  -> shot changes the MODEL performs inside one window
+                (legal: the executor only hard-splits on its own boundaries)
+executor grid : UNEQUAL windows, lengths [119, 124], overlap 0
+  #0  frames [   0 ->  119)   119f    0.000s ->   4.958s
+  #1  frames [ 119 ->  243)   124f    4.958s ->  10.125s  <- CUT
+```
+
+**什么时候用它**：剧情要 3 个镜头，但你不想为多一个窗口多付一次采样开销 —— 少切一刀，让模型在窗口内切。
+
+**什么时候别用**：窗口内那次切换是模型自由发挥（运镜未必像硬切那么干净）。
+要**确定地**切成 3 段 → 查第三条的表，把 `chunk_step` 调到能切 3 段的档位。
+
+---
+
+## 八、节点会怎么检验（错一条就拦停）
 
 | 检查 | 说明 |
 |---|---|
