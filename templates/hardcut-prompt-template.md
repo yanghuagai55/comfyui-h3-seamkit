@@ -50,7 +50,7 @@ non_diegetic_music:
 
 **① 切点记法**：`00:04.250`（分:秒.毫秒三位），**秒数必须等于插件的 `cut_seconds`**。
 
-**② 切点必须是 17 帧的整数倍**（`0.708s × k`）。可达切点由 `hardcut_math.py` 枚举：
+**② 切点推荐 17 帧的整数倍**（`0.708s × k` = 独占帧，模型能放最干净的转镜）。更细的 **token 边界**（1-4 帧粒度，如 115 帧 = 00:04.792）也合法——"提前切"就靠它。17 倍数档由 `hardcut_math.py` 枚举：
 
 ```bash
 D:\comfyui\comfyenv\python.exe ...\comfyui-h3-hardcut\hardcut_math.py 8 4.25 --mp 1.5
