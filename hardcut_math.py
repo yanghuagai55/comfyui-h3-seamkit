@@ -361,6 +361,10 @@ def snap_frame_grid(frames: Iterable[float] | None) -> list[int]:
     """Snap explicit cut frames onto the 17-frame token grid, ascending, deduped.
 
     Matches the executor's `_snap_frame` (nearest `frames_for_tokens(5k) = 17k`).
+
+    NOTE: the executor's real boundary resolution is FINER than this — a window
+    may start on ANY token edge (0,1,5,9,13,17,18,..., resolution 1-4 frames).
+    New code should use `snap_token_edge`, which mirrors the executor exactly.
     """
     out = sorted(
         {
@@ -370,6 +374,42 @@ def snap_frame_grid(frames: Iterable[float] | None) -> list[int]:
         }
     )
     return out
+
+
+_FRAME_PER_TOKEN = (1, 4, 4, 4, 4)  # H3 temporal compression, one 17f block
+
+
+def frames_for_token_count(tokens: int) -> int:
+    """Frames covered by the first `tokens` tokens (H3 [1,4,4,4,4] pattern)."""
+    per = _FRAME_PER_TOKEN
+    full, rest = divmod(max(0, int(tokens)), len(per))
+    return full * sum(per) + sum(per[:rest])
+
+
+def snap_token_edge(
+    frames: Iterable[float] | None, video_tokens: int | None = None
+) -> list[int]:
+    """Snap cut frames onto the nearest TOKEN edge — mirrors the executor.
+
+    Same math as `h3_upscale._snap_boundary`: token `t` covers
+    `frames_for_token_count(t)` frames, so edges sit at 0,1,5,9,13,17,18,...
+    (1-4 frame resolution).  Ties resolve to the LOWER edge, exactly like the
+    executor's `min()` over ascending tokens.  A window boundary can only sit
+    on these edges, so this is the honest prediction of where a cut lands.
+    """
+    vals = [float(f) for f in frames or () if f is not None and float(f) > 0]
+    if not vals:
+        return []
+    if video_tokens is None:
+        need = max(int(v) for v in vals)
+        video_tokens = 1
+        while frames_for_token_count(video_tokens) < need:
+            video_tokens += 1
+    choices = [
+        (t, frames_for_token_count(t)) for t in range(0, int(video_tokens) + 1)
+    ]
+    out = sorted({min(choices, key=lambda c: abs(c[1] - v))[1] for v in vals})
+    return [f for f in out if f > 0]
 
 
 def chunk_ladder(
@@ -427,7 +467,8 @@ def plan_hard_cut(
     Two modes:
 
     * **explicit frames** (`segment_frames` given) — UNEQUAL window lengths.  Each
-      frame is snapped to the 17-frame grid and used as a window boundary, so the
+      frame is snapped to the nearest TOKEN edge (1-4 frame resolution, same as
+      the executor's `_snap_boundary`) and used as a window boundary, so the
       first shot can be 68 frames and the next 124.  `chunk` then just means the
       longest window (used for the load estimate).
     * **equal stride** (default) — `cut_points` (seconds) solve a constant window
@@ -446,7 +487,9 @@ def plan_hard_cut(
     chunk_step = int(chunk_step or 0)
     min_tail = int(round(MIN_TAIL_SECONDS * FPS))
 
-    seg_frames = snap_frame_grid(segment_frames)
+    # Fine token-edge snapping (1-4f resolution), same as the executor — the
+    # old 17-frame coarse grid silently moved legal edges like 115 onto 119.
+    seg_frames = snap_token_edge(segment_frames)
     if seg_frames:
         seg_frames = [f for f in seg_frames if 0 < f < total_frames]
         if seg_frames:
@@ -1229,7 +1272,7 @@ def validate_prompt(
     requested = parse_cut_points(requested_cuts)
     info["requested"] = requested
     seed = requested or cut_secs
-    seg_frames = snap_frame_grid(segment_frames) if segment_frames else []
+    seg_frames = snap_token_edge(segment_frames) if segment_frames else []
     if seg_frames and total_frames:
         seg_frames = [f for f in seg_frames if 0 < f < total_frames]
     info["segment_frames"] = seg_frames
@@ -1287,9 +1330,28 @@ def validate_prompt(
         # (exactly how the first pass does multi-shot clips in a single run).
         if cut_secs:
             prompt_frames = [int(round(sec * FPS)) for sec in cut_secs]
-            missing = [
-                f for f in truth if not any(abs(f - p) <= 1 for p in prompt_frames)
-            ]
+            missing = []
+            early = []
+            for f in truth:
+                if any(abs(f - p) <= 1 for p in prompt_frames):
+                    continue
+                later = [p for p in prompt_frames if p > f]
+                if later and min(later) - f <= FRAME_GRID:
+                    # "Early" boundary: the executor retreats BEFORE the next
+                    # declared shot, within one 17-frame block.  The seam then
+                    # falls inside the OLD shot and the model performs the shot
+                    # change inside window 2 — the same contract as an
+                    # equal-window split.  This is the only way to keep the new
+                    # shot whole when the measured turn lands on a shared-token
+                    # frame: a window boundary can never sit there, so
+                    # retreating to the previous token edge is the fix.
+                    early.append((f, min(later)))
+                else:
+                    missing.append(f)
+            if early:
+                info["early_cuts"] = [
+                    {"frame": f, "next_declared": p} for f, p in early
+                ]
             for frame in missing[:MAX_LISTED]:
                 errors.append(
                     f"the executor cuts at frame {frame} ({timecode(frame)}) but the "
@@ -1428,6 +1490,21 @@ def format_validation(result: dict) -> str:
             )
             + "  -> shot changes the MODEL performs inside one window (legal: the "
             "executor only hard-splits on its own boundaries)"
+        )
+    early = result.get("early_cuts") or []
+    if early:
+        parts = [
+            f"frame {e['frame']} ({timecode(e['frame'])}), "
+            f"{e['next_declared'] - e['frame']}f before the declared "
+            f"{timecode(e['next_declared'])}"
+            for e in early
+        ]
+        lines.append(
+            "early cuts    : "
+            + "; ".join(parts)
+            + "  -> legal: boundary sits inside the OLD shot, so the turn is "
+            "sampled whole inside window 2 and the seam hides in a slow-moving "
+            "region (amplitude scales with sigma0)"
         )
     if result.get("chunk"):
         chunk = result["chunk"]
