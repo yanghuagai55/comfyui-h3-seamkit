@@ -282,30 +282,57 @@ def execute(
     # observable in the latent we are holding.  Measuring it here costs no VAE
     # decode, and placing the split before it keeps the seam on continuous
     # content — the model performs the cut itself, inside the window.
-    segment_frames = (plan.get("hardcut") or {}).get("segment_frames")
+    planned = [int(c) for c in ((plan.get("hardcut") or {}).get("segment_frames") or [])]
+    tolerance = max(0, int((plan.get("hardcut") or {}).get("seam_tolerance", 17)))
+    segment_frames = planned or None
     seam_hunt = None
     if auto_seam_hunt:
         hits = _hunt_shot_changes(
             video, sens=max(0.5, float(auto_seam_sensitivity) / 10.0)
         )
-        tokens = []
-        for idx, _ratio in hits:
-            token = max(5, (idx // 5) * 5)  # nearest grid point BEFORE the change
-            if token < int(video.shape[2]) and token not in tokens:
+        tokens, accepted, rejected = [], [], []
+        for idx, ratio in hits:
+            change_frame = core.frames_for_tokens(int(idx) + 1)  # between idx and idx+1
+            token = max(5, (int(idx) // 5) * 5)  # grid point just BEFORE the change
+            if token >= int(video.shape[2]):
+                continue
+            # Sanity gate: the hunt can fire on a hard action beat.  Only trust it
+            # when the change lands within `seam_tolerance` frames of a cut that
+            # #56 planned; anything farther is reported and dropped.
+            if planned:
+                nearest = min(planned, key=lambda c: abs(c - change_frame))
+                distance = abs(nearest - change_frame)
+                if distance > tolerance:
+                    rejected.append({
+                        "between_tokens": int(idx),
+                        "change_frame": change_frame,
+                        "nearest_planned_cut": nearest,
+                        "distance": distance,
+                        "ratio": round(float(ratio), 2),
+                    })
+                    continue
+            if token not in tokens:
                 tokens.append(token)
+                accepted.append({
+                    "between_tokens": int(idx),
+                    "change_frame": change_frame,
+                    "boundary_token": token,
+                    "boundary_frame": core.frames_for_tokens(token),
+                    "ratio": round(float(ratio), 2),
+                })
             if len(tokens) >= 9:
                 break
         if tokens:
             segment_frames = [core.frames_for_tokens(t) for t in tokens]
-            seam_hunt = {
-                "sensitivity": round(max(0.5, float(auto_seam_sensitivity) / 10.0), 2),
-                "hits": [
-                    {"between_tokens": int(i), "ratio": round(float(r), 2)}
-                    for i, r in hits[:9]
-                ],
-                "boundary_tokens": tokens,
-                "boundary_frames": list(segment_frames),
-            }
+        seam_hunt = {
+            "sensitivity": round(max(0.5, float(auto_seam_sensitivity) / 10.0), 2),
+            "tolerance_frames": tolerance,
+            "planned_cuts": planned,
+            "accepted": accepted,
+            "rejected": rejected,
+            "boundary_tokens": tokens,
+            "boundary_frames": [core.frames_for_tokens(t) for t in tokens],
+        }
 
     # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
     if segment_frames:
