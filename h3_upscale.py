@@ -132,18 +132,22 @@ def explicit_segments(
             "about 2 s is a safe choice)."
         )
 
-    bounds = [0] + [f for f, _t, _fr in snapped] + [int(total_frames)]
+    # Use the frames the snap above produced, not the raw numbers - and keep
+    # snapping with `_snap_boundary` (token_step aware).  Re-snapping through the
+    # coarse `core._snap_frame` here used to throw the fine grid away again and
+    # pull every boundary back onto a multiple of 17.
+    bounds = [0] + [fr for _f, _t, fr in snapped] + [int(total_frames)]
     segments = []
     for i in range(len(bounds) - 1):
         lo, hi = bounds[i], bounds[i + 1]
         if lo == 0:
             start_token, start_frame = 0, 0
         else:
-            start_token, start_frame = core._snap_frame(lo, video_tokens)
+            start_token, start_frame = _snap_boundary(lo, video_tokens, token_step)
         if hi >= total_frames:  # exact clip end, never snapped away
             end_token, end_frame = video_tokens, total_frames
         else:
-            end_token, end_frame = core._snap_frame(hi, video_tokens)
+            end_token, end_frame = _snap_boundary(hi, video_tokens, token_step)
         if end_token <= start_token:  # defensive: every case is caught above
             raise ValueError(
                 f"window {i} collapses to {end_token} token(s) (frames {start_frame}.."
@@ -297,7 +301,7 @@ def execute(
         _noise_report,
     ) = core._build_global_target_av_noise(noise, latent, video, audio, plan)
 
-    # ---- optional: put the window boundary just BEFORE the model's own cut ----
+    # ---- optional: put the window boundary ON the model's own cut ----
     # The upscaler never sees the prompt, so the model's shot change is only
     # observable in the latent we are holding.  Measuring it here costs no VAE
     # decode, and placing the split before it keeps the seam on continuous
@@ -313,10 +317,15 @@ def execute(
         tokens, accepted, rejected = [], [], []
         for idx, ratio in hits:
             change_frame = core.frames_for_tokens(int(idx) + 1)  # between idx and idx+1
-            # The token edge right before the change - not the old 17-frame grid.
-            # token edges run 0,1,5,9,13,17,18,22,... so this lands within 1-4
-            # frames of the change instead of up to 8 frames away.
-            token = max(1, int(idx))
+            # Land the boundary ON the token where the new content starts, not one
+            # token before it.  The executor splits at the start of a token, so
+            # putting it on the changed token makes the window begin with the new
+            # shot: the seam then sits exactly where the picture changes and the
+            # cut hides it.  (Starting one token early leaves the seam 4 frames
+            # before the change, on continuous content, where it reads as a jump.)
+            # Token edges run 0,1,5,9,13,17,18,22,... so the resolution here is
+            # 1-4 frames, never the old 17-frame grid.
+            token = max(1, int(idx) + 1)
             if token >= int(video.shape[2]):
                 continue
             # Sanity gate: the hunt can fire on a hard action beat.  Only trust it
@@ -474,7 +483,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "自动找切镜、把窗口边界挪到它前面（**不用 VAE，直接在 latent 上算**）。\n"
                         "二采看不到提示词，模型究竟在哪一帧换镜头只有 latent 知道。\n"
                         "开启后：在时间轴找 latent 的突变（局部邻域法，剧烈动作也不会被淹），\n"
-                        "把窗口边界放在突变**之前**最近的 17 帧网格点上 —— 缝就落在内容连续处，"
+                        "把窗口边界放在**突变所在的那个 token** 上 —— 缝与画面切换重合，被切镜盖住，"
                         "剪辑由模型自己在窗口内完成。\n"
                         "会覆盖 plan 里的 segment_frames；报告里给出检测到的 token 与最终边界。"
                     ),
