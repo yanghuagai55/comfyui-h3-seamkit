@@ -322,8 +322,25 @@ D:\comfyui\comfyenv\python.exe hardcut_math.py 8 4.25 --mp 1.5 --step -2      # 
 **还能不开 ComfyUI 就体检提示词**（跑的是 `#49` 同一个校验器，退出码 0=通过 / 1=有问题）：
 
 ```bash
-D:\comfyui\comfyenv\python.exe hardcut_math.py --check prompt.txt --total 8 --cuts 4.25 --mp 1.5
+# 等长（切点用秒）
+D:\comfyui\comfyenv\python.exe hardcut_math.py --check prompt.txt --total 8 --cuts 4.25 --mp 1.544
+
+# 不等长（切点用帧，可多个）—— 窗口长度自动按模型里的算法推导，与真实运行一致
+D:\comfyui\comfyenv\python.exe hardcut_math.py --check prompt.txt --total 8 --frames 68 --mp 1.544
+D:\comfyui\comfyenv\python.exe hardcut_math.py --check prompt.txt --total 8 --frames 68,136 --mp 1.544
+
+# 想手动指定窗口长度（覆盖自动推导）
+... --check prompt.txt --total 8 --frames 68 --chunk 136
 ```
+
+| 参数 | 说明 |
+|---|---|
+| `--total` | 片长（秒） |
+| `--cuts` | **等长**切点，秒，逗号分隔 |
+| `--frames` | **不等长**切点，帧，逗号分隔（`68` / `68,136`）；与 `--frames` 同用时以它为准 |
+| `--chunk` | 窗口长度（帧），只在不自动推导时用 |
+| `--mp` | 二采画布 MP（**建议填真值 1.544**，即 1664×928） |
+| `--step` | overlap 帧数，硬切填 0 |
 
 定调句写完先在这里过一遍，比在 ComfyUI 里点运行快得多。
 
