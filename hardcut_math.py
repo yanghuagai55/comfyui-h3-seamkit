@@ -86,6 +86,62 @@ def timecode(frame: int) -> str:
     return f"{mm:02d}:{ss:02d}.{ms:03d}"
 
 
+_ANY_STAMP_RE = re.compile(r"(\d{1,3}):(\d{2})\.(\d{3})")
+
+
+def shift_shot_times(prompt: str, shift_frames: int) -> tuple[str, list[dict]]:
+    """Move every declared shot change by `shift_frames` frames, wherever it is quoted.
+
+    The model does not turn exactly where it is told: measured offsets run from
+    -10 to +1 frames and depend on the content and the seed.  The executor, on the
+    other hand, can only split on the token grid (1-4 frame granularity), so
+    asking the model for a slightly different time is the one lever with a reach
+    finer than the grid — and it belongs here rather than in the prompt text, so
+    the model that *writes* the prompt never has to be taught plugin mechanics.
+
+    Only stamps matching a declared `[Shot N]` cut are moved; in-shot beats
+    (e.g. "By 00:06.500 Takagi has been driven back") keep their values.  Every
+    occurrence of a matched stamp is rewritten, because the summary, the shot
+    line and the soundscape all quote the same string.
+
+    Returns `(new_prompt, moved)`; `moved` is `[]` when nothing changed.
+    """
+    shift = int(shift_frames or 0)
+    if not shift or not prompt:
+        return prompt, []
+    declared = {
+        int(round(shot["cut_seconds"] * FPS))
+        for shot in parse_shots(prompt)
+        if shot.get("cut_seconds")
+    }
+    if not declared:
+        return prompt, []
+
+    moved: list[dict] = []
+    out = prompt
+    for literal in dict.fromkeys(m.group(0) for m in _ANY_STAMP_RE.finditer(prompt)):
+        minutes, seconds, millis = _ANY_STAMP_RE.match(literal).groups()
+        old_frame = int(
+            round((int(minutes) * 60 + int(seconds) + int(millis) / 1000.0) * FPS)
+        )
+        if old_frame not in declared:
+            continue
+        new_frame = old_frame + shift
+        if new_frame <= 0:
+            continue
+        new = timecode(new_frame)
+        if new == literal:
+            continue
+        out = out.replace(literal, new)
+        moved.append(
+            {"old": literal, "new": new, "old_frame": old_frame, "new_frame": new_frame}
+        )
+    if not moved:
+        return prompt, []
+    moved.sort(key=lambda row: row["old_frame"])
+    return out, moved
+
+
 # --------------------------------------------------------------------------
 # segmentation (mirrors T8 compute_temporal_segments for overlap = 0)
 # --------------------------------------------------------------------------

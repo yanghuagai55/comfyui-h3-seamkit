@@ -4,7 +4,8 @@
 > 提示词规范：`refs\H3-R2V提示词模板-官方.md`　·　负载锚点实测：RTX 4060 Laptop 8GB，二采 1664×928（1.544MP）
 
 > **一个节点顶替「规划 + 校验 + 拼时间戳 + 两块画布 + 帧数表达式」。**
-> 你只给**时长**和 **`chunk_step` 档位**；提示词从 `prompt` 口进来、原样出去（顺带被校验）。
+> 你只给**时长**和 **`chunk_step` 档位**；提示词从 `prompt` 口进来 → **被校验 → 被改写（时间戳 +`prompt_shift_frames` 帧）→ 再送出去**。
+> 改写是节点干的，所以**写提示词时不需要知道任何机制**（见文末「时间戳自动改写」）。
 > 切不出来、或提示词与切分对不上 → **直接报错拦停**，不让你白跑半小时。
 >
 > 📌 **喂 LLM 直接用 `templates\auto-prompt-template.md`** —— 给它「片长 + `chunk_step` + 剧情」，
@@ -41,6 +42,9 @@
 | `aspect_ratio` | 16:9 | 两块画布共用（选项取自 ComfyUI 自带表） |
 | `multiple` | 32 | 画布取整倍数（H3 要 32），一般不动 |
 | `model_name` / `precision` / `release_policy` / `anchor_strength` / `second_pass_audio_policy` | — | 照抄上游 plan 节点，一般不动 |
+| `second_pass_sigma0` | 0.30 | 二采 denoise（σ₀），经 `sigma0` 口接 `BasicScheduler.denoise`。**缝幅度 ∝ σ₀** |
+| `seam_tolerance_frames` | 17 | `#40` 的 `auto_seam_hunt` 采纳检测结果时允许的偏差（帧） |
+| **`prompt_shift_frames`** | **1** | **改写 `prompt` 输出**：把每个 `[Shot N] At MM:SS.mmm` 整体平移 N 帧（正 = 写晚一点）。见文末「时间戳自动改写」 |
 
 ---
 
@@ -211,3 +215,49 @@ disagree, so the model would not cut where the executor cuts.
 4. **提示词里 `summary` 没写 "no cuts / continuous take / unbroken"** —— 最常见的拦停原因
 5. **`retention_analysis` 列全所有 `[Shot N]`** —— 漏了切完会长相漂移
 6. **`load estimate` 是 SAFE** —— 不是就加大 `chunk_step` 或降 `second_megapixels`
+
+---
+
+## 十一、时间戳自动改写（`prompt_shift_frames`）
+
+**问题**：模型不会正好在被告知的时刻转镜。实测偏移 **−10 ~ +1 帧**（随内容 / 种子变），
+而执行器的边界**只能落在 token 网格上**（粒度 1~4 帧）——
+所以「让模型去够边界那一帧」是**唯一比网格更细的旋钮**。
+
+**做法**：本节点算完切点后，把 `prompt` **输出**里的每个 `[Shot N] At MM:SS.mmm` 整体平移
+`prompt_shift_frames` 帧（默认 **+1**）再送出。**输入口那份提示词不被修改。**
+
+```
+输入（你写的，声明 = 计划切点）     输出（节点改写后，送进一采 / 二采）
+  [Shot 2] At 00:04.958    ──►      [Shot 2] At 00:05.000     (frame 119 → 120)
+  [Shot 3] At 00:08.500    ──►      [Shot 3] At 00:08.542     (frame 204 → 205)
+  执行器边界仍然是 f119 / f124（按计划切，不受改写影响）
+```
+
+**为什么放在节点里，而不是写进提示词**
+
+> 提示词里的每一句"机制说明"都在稀释剧情描述的权重。
+> 让**写提示词的 LLM 完全不知道这些**（它只管剧情与镜头），机制由节点在输出前机械地加上。
+
+**规则**
+
+- **只动镜头声明的秒数**；镜内动作节拍（如 `By 00:06.500 …`）**不动**
+- summary / shot 行 / soundscape 里**引用的同一个时间戳会一起改**，保持自洽
+- 填 `0` = 不改写；**可填负数**（模型偏晚时往回调）
+- 写提示词时**照计划切点写**（差 1 帧以内都能过）。若你已自己 +1，节点再 +1 会变成偏 2 帧 →
+  报告里会出 `WARNING: after the shift the declared times no longer sit within 1 frame …`
+
+**报告里长这样**
+
+```text
+prompt time shift (+1 frame(s)) — only the `prompt` OUTPUT moves:
+  the executor still splits where the plan says; the model is asked for the time it
+  actually turns at, so the shot change and the window boundary line up:
+    00:04.958 -> 00:05.000   (frame 119 -> 120)
+    00:08.500 -> 00:08.542   (frame 204 -> 205)
+  only declared shot changes move; in-shot beats keep their values, and every
+  quote of a moved stamp (summary / shot line / soundscape) is rewritten together.
+```
+
+**怎么定这个值**：先跑一次 → 量「实际转镜帧 vs 执行器边界」的差 → 填进 `prompt_shift_frames`
+（正 = 写晚）。量法见 README 的 `tools\analyze_cut.py` 一节。

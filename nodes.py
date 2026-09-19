@@ -46,6 +46,7 @@ from .hardcut_math import (
     geometry_from_plan,
     plan_hard_cut,
     resolution_for,
+    shift_shot_times,
     timecode,
     validate_prompt,
 )
@@ -538,6 +539,24 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "调大 = 更信任检测（但误检风险↑）；调小 = 只认同一个网格点附近的变化。"
                     ),
                 ),
+                io.Int.Input(
+                    "prompt_shift_frames",
+                    default=1,
+                    min=-17,
+                    max=17,
+                    step=1,
+                    tooltip=(
+                        "★ 改写 `prompt` 输出的时间戳（帧）：本节点算完切点后，把提示词里"
+                        "**每个 `[Shot N] At MM:SS.mmm`** 整体平移这么多帧再输出（正 = 写晚一点）。\n"
+                        "为什么需要：模型不会正好在被告知的时刻转镜（实测偏移 −10 ~ +1 帧，"
+                        "随内容/种子变），而执行器的边界只能落在 token 网格上 —— "
+                        "**改提示词的时间是唯一比网格更细的旋钮**。\n"
+                        "它在这里做，是为了**不让写提示词的大模型知道这些机制**"
+                        "（少喂非剧情内容 = 剧情权重不被稀释）。\n"
+                        "只动镜头声明的秒数，镜内动作节拍不动；summary / soundscape 里引用的同一时间"
+                        "会一起改，保持自洽。填 0 = 不改写。"
+                    ),
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -575,6 +594,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         second_pass_audio_policy: str,
         second_pass_sigma0: float,
         seam_tolerance_frames: int,
+        prompt_shift_frames: int,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -667,6 +687,49 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     "and the split this node picked disagree, so the model would not "
                     "cut where the executor cuts.\n\n" + report
                 )
+
+            # The model turns a little off the time it is given (measured -10..+1
+            # frames, content- and seed-dependent) while the executor can only
+            # split on the token grid — asking for a slightly different time is
+            # therefore the one lever finer than the grid.  It lives here, not in
+            # the prompt, so whoever writes the prompt never has to be taught
+            # plugin mechanics (and the plot keeps its weight in the text).
+            out_prompt, moved = shift_shot_times(incoming, prompt_shift_frames)
+            if moved:
+                report += (
+                    "\n\nprompt time shift ("
+                    f"{int(prompt_shift_frames):+d} frame(s)) — only the `prompt` OUTPUT moves:\n"
+                    "  the executor still splits where the plan says; the model is asked for the "
+                    "time it\n  actually turns at, so the shot change and the window boundary "
+                    "line up:"
+                )
+                for row in moved:
+                    report += (
+                        f"\n    {row['old']} -> {row['new']}"
+                        f"   (frame {row['old_frame']} -> {row['new_frame']})"
+                    )
+                report += (
+                    "\n  only declared shot changes move; in-shot beats keep their values, and "
+                    "every\n  quote of a moved stamp (summary / shot line / soundscape) is "
+                    "rewritten together."
+                )
+                recheck = validate_prompt(
+                    out_prompt,
+                    total_seconds=info["total_seconds"],
+                    requested_cuts=list(info["actual_cuts"]),
+                    canvas_mp=canvas_mp,
+                    chunk_frames=plan_chunk,
+                    overlap_frames=0,
+                    segment_frames=list(info["cut_frames"]),
+                )
+                late = recheck.get("errors") or []
+                if late:
+                    report += (
+                        "\n  WARNING: after the shift the declared times no longer sit within 1 "
+                        "frame of the plan's cuts — lower `prompt_shift_frames`, or write the "
+                        "prompt to land exactly on the plan:\n    - "
+                        + "\n    - ".join(str(e) for e in late[:MAX_LISTED])
+                    )
         else:
             out_prompt = auto_prompt(info, "", "")
             report = report + (
