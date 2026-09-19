@@ -244,6 +244,23 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                     options=list(AUDIO_POLICIES),
                     default="joint_av_preserve_input",
                 ),
+                io.Int.Input(
+                    "cut_offset_frames",
+                    default=-10,
+                    min=-68,
+                    max=68,
+                    step=1,
+                    tooltip=(
+                        "★ 切点偏移（帧）＝ **实测画面突变帧位 − 切点帧位**（手动路线专用）。\n"
+                        "**负值 = 模型比切点提前起转**（实测常见 −10：8s 片 92−102、"
+                        "10s 片 109−119）；正值 = 偏晚。\n"
+                        "报告据此给出每个切点「模型实际转镜的帧」＝ 切点 + 本值，"
+                        "写作时把上一镜的动作收在那一帧。\n"
+                        "**只影响报告标注，不改画面**（分割点 ≠ 剪辑点）。\n"
+                        "自动版不用这个 —— `#40` 的 `auto_seam_hunt` 会在 latent 上自己量，"
+                        "并用 `#56` 的 `seam_tolerance_frames` 核对。"
+                    ),
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -251,6 +268,10 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                 io.String.Output("cut_report"),
             ],
         )
+
+    # NOTE: the offset knob lives here (hand-written route), not on the auto
+    # node: auto mode has #40 hunt the model's real change in the latent, so a
+    # hand-filled number would just be a second, competing source of truth.
 
     @classmethod
     def execute(
@@ -270,6 +291,7 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
         release_policy: str,
         anchor_strength: float,
         second_pass_audio_policy: str,
+        cut_offset_frames: int,
     ):
         slots = [cut_1, cut_2, cut_3, cut_4][:CUT_SLOTS]
         cuts = cuts_from_inputs(slots)
@@ -346,6 +368,28 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
         )
 
         report = format_report(info, "\n".join(notes))
+
+        # Where the model actually turns is not something this node can know - it
+        # only sees the prompt.  The number below is the measured offset between
+        # the planned cut and the picture change, so the action of the previous
+        # shot can be written to resolve at the frame the model really turns on
+        # (the auto route gets the same information from #40's auto_seam_hunt).
+        offset = int(cut_offset_frames)
+        if info["cut_frames"] and offset:
+            report += "\n\n=== 模型实际转镜帧（切点 + 偏移）==="
+            report += (
+                f"\n  偏移 = {offset:+d} 帧（= 实测突变帧 − 切点帧；负 = 模型提前起转）"
+            )
+            for c in info["cut_frames"]:
+                turn = max(0, min(int(info["total_frames"]), int(c) + offset))
+                report += (
+                    f"\n    cut f{int(c)} ({int(c) / FPS:.3f}s)"
+                    f"  ->  model turns at f{turn} ({turn / FPS:.3f}s)"
+                )
+            report += "\n  （只影响本报告标注，不改画面；自动版请看 #40 的 auto_seam_hunt）"
+        elif info["cut_frames"]:
+            report += "\n\n=== 模型实际转镜帧 ===\n  （cut_offset_frames = 0，不标注）"
+
         cuts_csv = ",".join(f"{value:.3f}" for value in info["actual_cuts"])
         return io.NodeOutput(plan, cuts_csv, report)
 
