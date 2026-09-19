@@ -481,18 +481,18 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     ),
                 ),
                 io.Int.Input(
-                    "cut_lead_frames",
-                    default=10,
+                    "cut_offset_frames",
+                    default=-10,
                     min=-68,
                     max=68,
                     step=1,
                     tooltip=(
-                        "★ 切点提前量（帧）= **切点帧位 − 实测画面突变帧位**。\n"
-                        "正值 = 模型比切点**提前**起转（实测两片都是 10：8s 片 102−92、"
-                        "10s 片 119−109）；负值 = 模型偏晚。\n"
-                        "用途：报告给出每个切点「模型实际转镜的帧」= 切点 − 本值，"
+                        "★ 切点偏移（帧）＝ **实测画面突变帧位 − 切点帧位**。\n"
+                        "**负值 = 模型比切点提前起转**（实测两片都是 −10：8s 片 92−102、"
+                        "10s 片 109−119）；正值 = 模型偏晚。\n"
+                        "用途：报告给出每个切点「模型实际转镜的帧」＝ 切点 + 本值，"
                         "把上一镜的动作收在那一帧，切点处就不会显得切早/切晚。\n"
-                        "填 0 = 不补偿。**可填负数**（帧数单位，随内容/时长变，自己量了改）。"
+                        "填 0 = 不补偿。帧数单位，随内容/时长变，自己量了改。"
                     ),
                 ),
             ],
@@ -531,7 +531,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         anchor_strength: float,
         second_pass_audio_policy: str,
         second_pass_sigma0: float,
-        cut_lead_frames: int,
+        cut_offset_frames: int,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -582,31 +582,31 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         )
 
         # The model does not turn exactly on the cut: it starts turning a few
-        # frames early (measured lead = cut − observed change = 10 frames on both
-        # an 8 s and a 10 s clip).  So the previous shot's action has to resolve at
-        # cut − lead, not at the cut itself, or the edit reads as cutting late.
+        # frames early — measured as observed change frame − cut frame = -10 on
+        # both an 8 s and a 10 s clip.  So the previous shot's action has to
+        # resolve at cut + offset, not at the cut itself, or the edit reads as
+        # cutting late.
         report += "\n\n=== ACTION BEATS (write the action to these frames, not to the cut) ==="
         cuts = list(info["cut_frames"])
-        lead = int(cut_lead_frames)
-        if cuts and lead:
+        offset = int(cut_offset_frames)
+        if cuts and offset:
             report += (
-                f"\n  cut lead = {lead:+d} frame(s)   "
-                "(cut frame − observed change frame; positive = the model turns EARLY,"
-                " negative = it turns late)"
+                f"\n  cut offset = {offset:+d} frame(s)   "
+                "(observed change frame − cut frame; negative = the model turns EARLY)"
                 "\n  the model actually turns at these frames — resolve the previous shot's"
                 " action by then:"
             )
             for c in cuts:
-                turn = max(0, min(int(info["total_frames"]), int(c) - lead))
+                turn = max(0, min(int(info["total_frames"]), int(c) + offset))
                 report += (
                     f"\n    cut f{int(c)} ({int(c) / FPS:.3f}s)"
                     f"  ->  model turns at f{turn} ({turn / FPS:.3f}s)"
                 )
         elif cuts:
-            report += "\n  (cut_lead_frames = 0 — no compensation, actions may read as cutting late)"
+            report += "\n  (cut_offset_frames = 0 — no compensation, actions may read as cutting late)"
         else:
             report += "\n  (single window, no cut)"
-        report += "\n  lead is editable on this node (`cut_lead_frames`, frames, may be negative)"
+        report += "\n  offset is editable on this node (`cut_offset_frames`, frames, may be negative)"
 
         incoming = (prompt or "").strip()
         if incoming:
