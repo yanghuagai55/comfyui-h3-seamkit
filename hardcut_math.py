@@ -524,6 +524,12 @@ def auto_plan(
         longest = max(lengths)  # 每一段（含末段）都要 ≤ chunk
         if longest > chunk_frames:
             continue
+        # The executor builds windows out of 17-frame blocks, so a tail shorter
+        # than one block cannot be sampled.  Planning it here would only move the
+        # failure into the upscale node (and it is what makes a tiny chunk_step
+        # like 1 unusable, which is the honest answer).
+        if lengths[-1] < FRAME_GRID:
+            continue
         load = longest * canvas_mp
         if load >= LOAD_FAIL:
             continue
@@ -554,7 +560,13 @@ def auto_plan(
     raise ValueError(
         f"切不出来：{total_seconds_actual:.2f}s（{total_frames} 帧）在「每段 ≤ "
         f"{chunk_frames} 帧 = {max_segment_seconds:.3f}s（chunk_step {int(chunk_step)}）"
-        f"且负载 SAFE」下，{max_segments} 段内无解。加大 chunk_step，或降画布 MP。"
+        f"、尾段 ≥ {FRAME_GRID} 帧、负载 SAFE」下，{max_segments} 段内无解。"
+        "加大 chunk_step，或降画布 MP。"
+        + (
+            "（chunk_step 太小时，末段总会剩下不足一个 17 帧块，执行器建不出窗口。）"
+            if int(chunk_step) * FRAME_GRID < 3 * FRAME_GRID
+            else ""
+        )
     )
 
 

@@ -248,7 +248,9 @@ so the model would not cut where the executor cuts.
 | `second_width` / `second_height` | 二采画布 → 接二采条件节点 |
 | `length` | 17n+5 帧数 → 接两个条件节点的 `length`（取代 `ComfyMathExpression`） |
 
-切分由节点内部算（筛选顺序：段数最少 → 段长方差最小 → 负载 SAFE，最多 10 段），切不出来直接报错。
+切分由节点内部算（筛选顺序：段数最少 → 段长方差最小 → 每段 ≤ `chunk_step×17` 帧、**尾段 ≥ 17 帧**、
+负载 SAFE，最多 10 段），切不出来直接报错。**尾段下限和执行器一致**，所以自动版算出的方案一定能喂进
+`MiniMaxH3HardCutUpscale`。
 ⚠️ **这是节点挑方案的筛选规则，不是 LLM 写镜头的规则** —— 喂给 LLM 只需一句「每段不超过
 `chunk_step × 0.708` 秒」。
 
