@@ -468,6 +468,34 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     options=list(AUDIO_POLICIES),
                     default="joint_av_preserve_input",
                 ),
+                io.Float.Input(
+                    "second_pass_sigma0",
+                    default=0.30,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip=(
+                        "二采 denoise (σ₀) — 从本节点的 `sigma0` 输出口接到 BasicScheduler 的 "
+                        "`denoise`。**接缝幅度 ∝ σ₀**：调小它，段边界那道缝会更淡（代价是"
+                        "二采引入的细节变少）。本机实测 0.30 能用，可试 0.20~0.25。"
+                    ),
+                ),
+                io.Int.Input(
+                    "cut_lead_frames",
+                    default=10,
+                    min=0,
+                    max=68,
+                    step=1,
+                    tooltip=(
+                        "★ 偏移补偿（帧）：**切点帧位 − 实测画面突变帧位**。\n"
+                        "含义：模型不会正好在切点转镜，而是**提前**起转 —— 提前量 = 本值。\n"
+                        "实测证据：8 秒片 cut=102 → 突变在 92；10 秒片 cut=119 → 突变在 109，"
+                        "**两片都是 −10**（帧数单位，可自己改）。\n"
+                        "用途：报告里给出每个切点的「动作收尾帧」，写作时把上一镜的动作"
+                        "卡在那个帧上收尾，切点处就不会显得切早/切晚。"
+                        "填 0 = 不补偿。"
+                    ),
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -480,6 +508,10 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                 io.Int.Output(
                     "length",
                     tooltip="Clip length in frames, on the 17n+5 grid — feed both conditioning nodes.",
+                ),
+                io.Float.Output(
+                    "sigma0",
+                    tooltip="Raw passthrough of second_pass_sigma0 → wire into BasicScheduler.denoise.",
                 ),
             ],
         )
@@ -499,6 +531,8 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         release_policy: str,
         anchor_strength: float,
         second_pass_audio_policy: str,
+        second_pass_sigma0: float,
+        cut_lead_frames: int,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -543,8 +577,35 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         report += (
             f"\ncanvas        : first {first_w}x{first_h} ({first_megapixels:g} MP)  ->  "
             f"second {second_w}x{second_h} ({canvas_mp:.3f} MP)\n"
-            f"clip length   : {info['total_frames']} frames (17n+5) -> `length` output"
+            f"clip length   : {info['total_frames']} frames (17n+5) -> `length` output\n"
+            f"sigma0        : {second_pass_sigma0:.2f}  ->  wire the `sigma0` output into "
+            "BasicScheduler.denoise (seam strength scales with it)"
         )
+
+        # The model does not turn exactly on the cut: it starts turning a few
+        # frames early (measured: -10 frames on both an 8 s and a 10 s clip).
+        # So the action of the previous shot has to RESOLVE at cut - lead, not at
+        # the cut itself, or the edit reads as cutting late.
+        report += "\n\n=== ACTION BEATS (write the action to these frames, not to the cut) ==="
+        cuts = list(info["cut_frames"])
+        lead = max(0, int(cut_lead_frames))
+        if cuts and lead:
+            report += (
+                f"\n  the model starts turning ~{lead} frame(s) BEFORE each cut "
+                "(cut frame − observed change frame)."
+                "\n  resolve the previous shot's action by these frames:"
+            )
+            for c in cuts:
+                beat = max(0, int(c) - lead)
+                report += (
+                    f"\n    cut f{int(c)} ({int(c) / FPS:.3f}s)"
+                    f"  ->  resolve by f{beat} ({beat / FPS:.3f}s)"
+                )
+        elif cuts:
+            report += "\n  (cut_lead_frames = 0 — no compensation, actions may read as cutting late)"
+        else:
+            report += "\n  (single window, no cut)"
+        report += f"\n  lead value is editable on this node (`cut_lead_frames`, frames)"
 
         incoming = (prompt or "").strip()
         if incoming:
@@ -584,6 +645,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
             second_w,
             second_h,
             info["total_frames"],
+            float(second_pass_sigma0),
             ui={"text": (report,)},
         )
 
