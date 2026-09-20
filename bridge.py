@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-hardcut contributors
 """Bridge to the upstream MiniMax-H3 two-pass upscale node pack.
 
 The generated plan must be byte-compatible with what the pack's own LowSigma

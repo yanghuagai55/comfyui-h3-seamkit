@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-hardcut contributors
 """Pixel-domain seam repair nodes (V2): blend / fuse / dissolve on IMAGE batches.
 
 These live AFTER the AV decoder (#16 `frames` IMAGE output) and before the

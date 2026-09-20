@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-hardcut contributors
 """All-in-one seam repair node.
 
 Enable it to repair (it runs the redraw model internally), bypass it for a

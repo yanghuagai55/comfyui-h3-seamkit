@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-hardcut contributors
 """Hard-cut nodes for MiniMax H3 two-pass chunked upscale.
 
 Node 1 (`MiniMaxH3HardCutPlan`) turns a duration plus up to four cut times into

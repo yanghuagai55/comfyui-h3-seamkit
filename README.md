@@ -662,6 +662,8 @@ D:\comfyui\comfyenv\python.exe toolsnalyze_cut.py "<成片.mp4>" --cuts 4.958,8
 
 配套说明：
 
+- **所有源文件都带 SPDX 头**（`# SPDX-License-Identifier: GPL-3.0-or-later`），
+  与根目录 `LICENSE` 全文配套。往仓库提 PR 即视为以同一许可授权。
 - 本仓库**不包含**任何上游源码副本。所有上游能力都是运行时按模块名解析调用的；
   `bridge.py` 里的 `T8_H3_CHUNKED_TWO_PASS_PLAN`、`t8.minimax_h3.chunked_two_pass.low_sigma.v3`
   等字符串是**上游的公开契约标识**，必须逐字节保持一致，不属于本项目的原创内容。

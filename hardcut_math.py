@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-hardcut contributors
 """Hard-cut planning math for MiniMax H3 two-pass chunked upscale.
 
 Pure Python, no torch / numpy dependency — safe to run standalone:

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-hardcut contributors
 """Minimal MiniMax H3 two-pass upscale executor: hard cut + UNEQUAL window lengths.
 
 We reuse the verified "atomic" pieces from the upstream pack (the learned 3D
