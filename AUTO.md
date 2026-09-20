@@ -200,7 +200,7 @@ disagree, so the model would not cut where the executor cuts.
 
 | | `MiniMaxH3HardCutPlan`（手写） | `MiniMaxH3HardCutAuto`（自动） |
 |---|---|---|
-| 切点 | 自己填 `cut_1~cut_4`（秒）或 `cut_frames`（帧，可不等长） | 自动算（段数最少 + 方差最小） |
+| 切点 | 自己填 `cut_1~cut_4`（**17 帧块数 n**：6 = 102 帧；-1 = 不切） | 自动算（段数最少 + 方差最小） |
 | 提示词 | 手动抄时间戳 | 自动生成带时间戳的骨架 |
 | 校验 | 另接 `MiniMaxH3HardCutValidate` | 内置 |
 | 想要**精确控制**切点 | ✅ 用这个 | — |

@@ -38,7 +38,7 @@ D:\comfyui\comfyenv\python.exe D:\comfyui\ComfyUI\custom_nodes\comfyui-h3-seamki
 
 **方法 B — 在 ComfyUI 里**
 
-`#48 MiniMaxH3HardCutPlan` 的 `cut_1`~`cut_4` 随便填 → 运行 → 看 `#42` 的 `cut_report`。
+`#48 MiniMaxH3HardCutPlan` 的 `cut_1`~`cut_4` 填 n（17 帧块数）→ 运行 → 看 `#42` 的 `cut_report`。
 
 **看懂菜单**：
 
@@ -149,7 +149,7 @@ D:\comfyui\comfyenv\python.exe D:\comfyui\ComfyUI\custom_nodes\comfyui-h3-seamki
 | 参数 | 填什么 |
 |---|---|
 | `total_seconds` | 片长（1–15） |
-| `cut_1` ~ `cut_4` | 第 1 步挑的切点，每槽一个数；**用不上的槽填 `-1`（= 不切）**。例：8 秒单切 = `cut_1=4.25` 其余 `-1`；15 秒 4 段 = `4.25 / 8.5 / 12.75 / -1` |
+| `cut_1` ~ `cut_4` | 切点 = **n × 17 帧**（`n = 6` → 102 帧 = 4.25s）；**用不上的槽填 `-1`（= 不切）**。例：8 秒单切 = `6 / -1 / -1 / -1`；15 秒 4 段 = `6 / 12 / 18 / -1` |
 | `chunk_step` | 默认 `0`（用切点槽推出的窗口长度）。想手动调窗口：**每 ±1 = ±17 帧**，报告里的 `chunk ladder` 逐档列出「会切几刀、切在哪、负载多少」 |
 | `canvas_megapixels` | 你实际用的二采画布（如 `1.5`），只为估算负载 |
 | `target_width` / `target_height` | **接 `#36 ResolutionSelector`**（别手填） |
@@ -240,7 +240,7 @@ load estimate : 102f x 1.500MP = 153.0  (SAFE)    ← 不是 SAFE 就降画布�
 
 跑之前逐条过一遍：
 
-- [ ] `#48` 的 `cut_1`~`cut_4` = 第 1 步挑的切点（用不上的槽填 `-1`），`chunk_step` 默认 `0`
+- [ ] `#48` 的 `cut_1`~`cut_4` = 切点（n × 17 帧；用不上的槽填 `-1`），`chunk_step` 默认 `0`
 - [ ] **`#49` 节点上的报告 `status` 是 `OK`** ← 不是 OK 就别跑，节点会抛错
 - [ ] `#49` 报告里没有 `[E...]` 开头的行（`[W...]` 警告可以先忍着）
 - [ ] `#49 plan` 已接线（报告里不该出现 `no plan was supplied`）

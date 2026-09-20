@@ -101,6 +101,13 @@ _CUT_TOOLTIP = (
     "the closest achievable time is reported instead of failing."
 )
 
+_CUT_N_TOOLTIP = (
+    "切点：第 n 个 17 帧块 —— 实际切在 n x 17 帧处。\n"
+    "例：6 -> 102f (4.25s)；12 -> 204f (8.5s)；18 -> 306f (12.75s)。\n"
+    "四个槽填不同的 n 就是不等长分段（如 6 / 12 / 18）。\n"
+    "**-1 = 不切**（该槽留空）。填 n 而不是秒：永远是 17 的倍数，天然合法。"
+)
+
 
 def _split_shots(text: str) -> list[str]:
     return [part.strip() for part in _SHOT_SPLIT.split(text or "") if part.strip()]
@@ -154,48 +161,37 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                     step=0.5,
                     tooltip="Clip length in seconds. Snapped to the 17n+5 frame grid.",
                 ),
-                io.Float.Input(
+                io.Int.Input(
                     "cut_1",
-                    default=NO_CUT,
-                    min=-1.0,
-                    max=MAX_SECONDS,
-                    step=0.01,
-                    tooltip=_CUT_TOOLTIP,
+                    default=-1,
+                    min=-1,
+                    max=256,
+                    step=1,
+                    tooltip=_CUT_N_TOOLTIP,
                 ),
-                io.Float.Input(
+                io.Int.Input(
                     "cut_2",
-                    default=NO_CUT,
-                    min=-1.0,
-                    max=MAX_SECONDS,
-                    step=0.01,
-                    tooltip=_CUT_TOOLTIP,
+                    default=-1,
+                    min=-1,
+                    max=256,
+                    step=1,
+                    tooltip=_CUT_N_TOOLTIP,
                 ),
-                io.Float.Input(
+                io.Int.Input(
                     "cut_3",
-                    default=NO_CUT,
-                    min=-1.0,
-                    max=MAX_SECONDS,
-                    step=0.01,
-                    tooltip=_CUT_TOOLTIP,
+                    default=-1,
+                    min=-1,
+                    max=256,
+                    step=1,
+                    tooltip=_CUT_N_TOOLTIP,
                 ),
-                io.Float.Input(
+                io.Int.Input(
                     "cut_4",
-                    default=NO_CUT,
-                    min=-1.0,
-                    max=MAX_SECONDS,
-                    step=0.01,
-                    tooltip=_CUT_TOOLTIP,
-                ),
-                io.String.Input(
-                    "cut_frames",
-                    default="",
-                    tooltip=(
-                        "Explicit cut FRAMES, comma separated (e.g. '68' or '68,136'). "
-                        "When non-empty it overrides cut_1..cut_4 and produces UNEQUAL "
-                        "window lengths - the first shot can be 68 frames, the next 124. "
-                        "Each frame snaps to the 17-frame grid (70 -> 68). Leave empty "
-                        "for equal-length windows via cut_1..cut_4."
-                    ),
+                    default=-1,
+                    min=-1,
+                    max=256,
+                    step=1,
+                    tooltip=_CUT_N_TOOLTIP,
                 ),
                 io.Int.Input(
                     "chunk_step",
@@ -281,11 +277,10 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
     def execute(
         cls,
         total_seconds: float,
-        cut_1: float,
-        cut_2: float,
-        cut_3: float,
-        cut_4: float,
-        cut_frames: str,
+        cut_1: int,
+        cut_2: int,
+        cut_3: int,
+        cut_4: int,
         chunk_step: int,
         canvas_megapixels: float,
         model_name: str,
@@ -297,12 +292,13 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
         second_pass_audio_policy: str,
         cut_offset_frames: int,
     ):
+        # cut slots are 17-frame BLOCK COUNTS: n x 17 = the cut frame.
+        # -1 (or anything < 1) means "no cut in this slot".  Different n
+        # values give unequal segments for free, and every value is on the
+        # 17-frame grid by construction so nothing needs snapping.
         slots = [cut_1, cut_2, cut_3, cut_4][:CUT_SLOTS]
-        cuts = cuts_from_inputs(slots)
-        seg_frames = (
-            [float(t) for t in (cut_frames or "").replace(";", ",").split(",") if t.strip()]
-            or None
-        )
+        seg_frames = [float(int(n) * FRAME_GRID) for n in slots if int(n) > 0] or None
+        cuts = []
         info = plan_hard_cut(
             total_seconds, cuts, canvas_megapixels, chunk_step, seg_frames
         )
