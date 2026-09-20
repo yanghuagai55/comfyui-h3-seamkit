@@ -20,12 +20,21 @@ from .nodes_repair import (
 )
 
 
-def detect_turn_frame(frames, near, win=17):
+def detect_turn_frame(frames, near, win=17, shoulder=0.7):
     """Pixel-domain turn detector: strongest frame-to-frame change near `near`.
 
-    Returns (frame, score) where the change sits between frame-1 and frame -
-    i.e. `frame` is the first frame of the new shot.  Runs on a 4x spatial
-    subsample; cheap enough to call on every run.
+    Convention (matches how frames are numbered everywhere): frame `i` covers
+    [i/24, (i+1)/24).  |f[i] - f[i-1]| is the change ACROSS the boundary
+    i-1|i, so the first frame of the new shot is `i` - that is where the cut
+    "starts", and the redraw is inserted starting at that frame.
+
+    A turn is usually smeared over a transition frame: entering it (i-1|i)
+    and leaving it (i|i+1) both spike, and the raw argmax often lands on the
+    ENTRY (one frame early).  Back-shoulder takeover: when the next boundary
+    is at least `shoulder` as strong, take it - that one is the first frame
+    of the new shot.
+
+    Returns (frame, score); `frame` is the new shot's first frame.
     """
     total = int(frames.shape[0])
     lo = max(1, int(near) - int(win))
@@ -33,9 +42,13 @@ def detect_turn_frame(frames, near, win=17):
     if hi <= lo:
         return int(near), 0.0
     f = frames[:, ::4, ::4, :]
-    diffs = (f[1:] - f[:-1]).abs().mean(dim=(1, 2, 3))
+    diffs = (f[1:] - f[:-1]).abs().mean(dim=(1, 2, 3))   # diffs[i-1] = boundary i-1|i
     best = max(range(lo, hi + 1), key=lambda i: float(diffs[i - 1]))
-    return int(best), float(diffs[best - 1])
+    score = float(diffs[best - 1])
+    if best + 1 <= hi and float(diffs[best]) >= float(shoulder) * score:
+        best = best + 1          # the transition's exit = first new-shot frame
+        score = float(diffs[best - 1])
+    return int(best), score
 
 
 def _redraw(model, clip, vae, ref_slice, prompt, width, height, length, steps, seed):
@@ -106,8 +119,10 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                                        "**edge** = 图像处理自动对齐 —— 在切点附近 ±17 帧做帧差检测，\n"
                                        "把插入位置对准真实的转镜帧（像素域 hunt）"),
                 io.Int.Input("fuse_offset", default=0, min=-17, max=17, step=1,
-                             tooltip="manual 模式：插入位置 = 切点 + 此偏移（帧）。\n"
-                                     "−1 = 把重绘片段往前放一帧；0 = 正好在切点"),
+                             tooltip="插入位置微调（帧），**两种模式都生效**：\n"
+                                     "manual：插入位置 = 切点 + 偏移；\n"
+                                     "edge：插入位置 = 检测到的转镜帧 + 偏移；\n"
+                                     "−1 = 把重绘片段整体往前放一帧"),
                 io.Float.Input("fuse_min", default=0.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("fuse_max", default=1.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("blend_strength", default=0.0, min=0.0, max=0.5, step=0.01,
@@ -190,12 +205,16 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
         log.append(f"redraw: {int(redrawed.shape[0])} frames, {int(steps)} steps, seed {int(seed)}")
 
         # 4. where to insert: manual (cut + offset) or edge detection (the real
-        #    turn frame near the cut, found by frame-difference)
+        #    turn frame near the cut, found by frame-difference).
+        #    fuse_offset applies in BOTH modes - edge gives the base position,
+        #    the offset then nudges it.
         if insert_mode == "edge":
             detected, score = detect_turn_frame(frames, int(cut))
-            insert_at = int(detected)
-            log.append(f"insert: EDGE detection -> frame {insert_at} "
-                       f"(delta {score:.2f}, searched cut {cut} +/- 17)")
+            insert_at = max(0, int(detected) + int(fuse_offset))
+            log.append(f"insert: EDGE -> turn frame {detected} (delta {score:.2f}, "
+                       f"searched cut {cut} +/- 17, back-shoulder takeover)"
+                       + (f" + offset {int(fuse_offset)} = {insert_at}"
+                          if int(fuse_offset) else f" = frame {insert_at}"))
         else:
             insert_at = max(0, int(cut) + int(fuse_offset))
             log.append(f"insert: manual -> cut {cut} + offset {int(fuse_offset)} = frame {insert_at}")
