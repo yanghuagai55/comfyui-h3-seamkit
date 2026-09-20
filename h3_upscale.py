@@ -263,6 +263,11 @@ def _latent_change_profile(video, win: int = 2) -> list:
 
 def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     """First-pass latent -> the tokens where the model changed shots (no VAE).
+    [DEPRECATED - kept for reference, the executor no longer calls this.]
+    A fixed-ratio threshold never fires on the real turn in a fight (every
+    token moves); superseded by `_latent_change_profile`, which scores each
+    token locally AND against the whole clip and then snaps the peak onto
+    the exclusive-frame grid.  Do not wire this back in without re-measuring.
 
     The upscaler never sees the prompt, so where the model actually cut is only
     observable in the latent we were handed.  Diffing the token axis and scoring
@@ -622,10 +627,13 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     tooltip=(
                         "自动找切镜、把窗口边界挪到它前面（**不用 VAE，直接在 latent 上算**）。\n"
                         "二采看不到提示词，模型究竟在哪一帧换镜头只有 latent 知道。\n"
-                        "开启后：在时间轴找 latent 的突变（局部邻域法，剧烈动作也不会被淹），\n"
-                        "把窗口边界放在**突变所在的那个 token** 上 —— 缝与画面切换重合，被切镜盖住，"
-                        "剪辑由模型自己在窗口内完成。\n"
-                        "会覆盖 plan 里的 segment_frames；报告里给出检测到的 token 与最终边界。"
+                        "开启后：在时间轴找 latent 的突变：每个 token 同时按**自身邻域**与**全片基准**打分，\n"
+                        "取全片基准最高者 —— 转镜自己的肩峰会抬高邻域中位数，只看局部反而会把它压下去，\n"
+                        "结果被两格之外安静区的偶然波动抢走（实测：计划 68、真转镜 ~66，却选中 85）。\n"
+                        "再把该突变**吸附到最近的独占帧（17k）**上：窗口起点必须是独占帧，\n"
+                        "否则第二个窗口首 token 会崩（实测同 seed：起点 68 正常 / 起点 69 崩）。\n"
+                        "报告给出 measured_turn_frame（测得转镜帧）与 boundary_frame（最终边界）。\n"
+                        "会覆盖 plan 里的 segment_frames。"
                     ),
                 ),
                 io.Int.Input(
