@@ -109,8 +109,6 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                                tooltip="auto = 用 report 解析切点；manual = 用手填值"),
                 io.Int.Input("manual_cut_frame", default=69, min=1,
                              tooltip="手动切点帧（manual 生效）"),
-                io.Int.Input("manual_redraw_start", default=68, min=0,
-                             tooltip="手动切片/重绘起点帧（manual 生效）"),
                 io.Combo.Input("fuse_side", options=["after", "before"], default="after",
                                tooltip="重绘片段融合权重方向：after = 贴切点最强、沿帧递减"),
                 io.Combo.Input("insert_mode", options=["manual", "edge"], default="manual",
@@ -147,7 +145,7 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
     @classmethod
     def execute(cls, model=None, clip=None, vae=None, images=None, report="",
                 prompt="", redraw_frames=5, steps=4, seed=0, source_mode="auto",
-                manual_cut_frame=69, manual_redraw_start=68,
+                manual_cut_frame=69, manual_redraw_start=68,  # ignored (slice follows insert_at)
                 insert_mode="manual", fuse_offset=0, fuse_side="after",
                 fuse_min=0.0, fuse_max=1.0,
                 blend_strength=0.0, blend_mode="both",
@@ -185,29 +183,9 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
             redraw = max(0, redraw - offset)
             log.append(f"shifted by -{offset} for the partial load")
 
-        # 3. redraw: the slice only provides the content reference; where the
-        #    result gets INSERTED is decided below (manual offset or detection)
-        n = int(redraw_frames)
-        if model is None or clip is None or vae is None:
-            raise ValueError("SeamRepair: wire model / clip / vae to enable the redraw")
-        s = max(0, min(redraw, max(0, total - 1)))
-        ref_slice = frames[s:s + n]
-        if int(ref_slice.shape[0]) < 5:
-            raise ValueError(
-                f"SeamRepair: redraw slice has only {int(ref_slice.shape[0])} frame(s) "
-                f"(start {s}) - H3 needs at least 5"
-            )
-        height, width = int(ref_slice.shape[1]), int(ref_slice.shape[2])
-        log.append(f"slice (content reference): frames {s}..{s + int(ref_slice.shape[0]) - 1} "
-                   f"@ {width}x{height}")
-        redrawed = _redraw(model, clip, vae, ref_slice, prompt, width, height,
-                           int(ref_slice.shape[0]), int(steps), int(seed))
-        log.append(f"redraw: {int(redrawed.shape[0])} frames, {int(steps)} steps, seed {int(seed)}")
-
-        # 4. where to insert: manual (cut + offset) or edge detection (the real
-        #    turn frame near the cut, found by frame-difference).
-        #    fuse_offset applies in BOTH modes - edge gives the base position,
-        #    the offset then nudges it.
+        # 3. WHERE to insert first (manual cut+offset, or the real turn frame
+        #    found by frame-difference near the cut).  fuse_offset applies to
+        #    both modes.
         if insert_mode == "edge":
             detected, score = detect_turn_frame(frames, int(cut))
             insert_at = max(0, int(detected) + int(fuse_offset))
@@ -218,12 +196,42 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
         else:
             insert_at = max(0, int(cut) + int(fuse_offset))
             log.append(f"insert: manual -> cut {cut} + offset {int(fuse_offset)} = frame {insert_at}")
+
+        # 4. the content reference is taken STARTING AT THE INSERT POSITION:
+        #    the redraw then shows exactly the frames it is going to replace,
+        #    so content and position stay aligned.  (Measured failure mode:
+        #    slicing around the *declared* cut while inserting at the detected
+        #    turn shifted the piece by ~10 frames.)
+        n = int(redraw_frames)
+        if model is None or clip is None or vae is None:
+            raise ValueError("SeamRepair: wire model / clip / vae to enable the redraw")
+        s = max(0, min(int(insert_at), max(0, total - n)))
+        ref_slice = frames[s:s + n]
+        if int(ref_slice.shape[0]) < 5:
+            raise ValueError(
+                f"SeamRepair: redraw slice has only {int(ref_slice.shape[0])} frame(s) "
+                f"(start {s}) - H3 needs at least 5"
+            )
+        height, width = int(ref_slice.shape[1]), int(ref_slice.shape[2])
+        log.append(f"slice (content reference): frames {s}..{s + int(ref_slice.shape[0]) - 1} "
+                   f"@ {width}x{height} (taken around the insert position)")
+        redrawed = _redraw(model, clip, vae, ref_slice, prompt, width, height,
+                           int(ref_slice.shape[0]), int(steps), int(seed))
+        log.append(f"redraw: {int(redrawed.shape[0])} frames, {int(steps)} steps, seed {int(seed)}")
+
+        # 5. fuse at the insert position
         out = fuse_frames(frames, redrawed, int(insert_at), fuse_side,
                           float(fuse_min), float(fuse_max))
         log.append(f"fuse: {min(int(redrawed.shape[0]), total - int(insert_at))} frame(s) "
                    f"at {insert_at}, side={fuse_side}")
         if int(out.shape[0]) != total:
             log.append(f"WARN frame count changed: {total} -> {int(out.shape[0])}")
+        # console/log diagnostics: lets the numbers be read without wiring the report
+        print(f"[SeamRepair] mode={insert_mode} source={source_mode} "
+              f"cut={cut} slice={s} insert_at={insert_at} "
+              f"frames={total}->{int(out.shape[0])} bridge={int(redrawed.shape[0])}"
+              + (f" detected={detected}(delta {score:.2f})"
+                 if insert_mode == "edge" else f" offset={int(fuse_offset)}"), flush=True)
 
         # 5. seam blend
         seam = max(0, int(cut) - 1)
