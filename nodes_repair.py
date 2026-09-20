@@ -515,6 +515,94 @@ class MiniMaxH3SeamRepair(io.ComfyNode):
         return io.NodeOutput(out, ref_slice, report_out)
 
 
+SCHEDULERS = ["simple", "beta", "normal", "sgm_uniform", "karras",
+              "exponential", "ddim_uniform"]
+SAMPLERS = ["res_multistep", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_sde",
+            "uni_pc", "heun", "ddim"]
+
+
+class MiniMaxH3RedrawBridge(io.ComfyNode):
+    """The redraw branch in one node: reference conditioning + sampling + decode.
+
+    Four wires in (model / clip / vae / ref_slice) and one out (images) - the
+    guider, scheduler, sampler, noise and decode are all created inside and
+    are not meant to be tuned per run.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3RedrawBridge",
+            display_name="MiniMax H3 Redraw Bridge (One Node)",
+            category=CATEGORY,
+            inputs=[
+                io.Model.Input("model", tooltip="LoRA 链尾的 MODEL（与主片同源）"),
+                io.Clip.Input("clip", tooltip="Qwen3-VL 文本编码器"),
+                io.Vae.Input("vae", tooltip="video VAE（参考与解码共用）"),
+                io.Image.Input("ref_slice", optional=True,
+                               tooltip="参考片段（来自 SeamRepair 的 ref_slice，5 帧）"),
+                io.String.Input(
+                    "prompt", multiline=True,
+                    default="Redraw the content of the reference video clip: the same "
+                            "subjects keep their action going, motion stays smooth and "
+                            "continuous with no cuts, matching the clip frame by frame.",
+                ),
+                io.Int.Input("width", default=1664, min=64, max=4096, step=32),
+                io.Int.Input("height", default=928, min=64, max=4096, step=32),
+                io.Int.Input("length", default=5, min=5, max=39, step=1,
+                             tooltip="输出帧数（合法值 5/22/39 由模型侧再吸附）"),
+                io.Combo.Input("ref_image_size", options=["match", "max"], default="match"),
+                io.Int.Input("steps", default=4, min=1, max=60, tooltip="= 主片步数（Turbo 则 4）"),
+                io.Combo.Input("scheduler", options=SCHEDULERS, default="simple"),
+                io.Combo.Input("sampler_name", options=SAMPLERS, default="res_multistep"),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.01),
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFF,
+                             tooltip="固定种子，便于对比；改它就换一次重绘"),
+            ],
+            outputs=[
+                io.Image.Output("images", tooltip="重绘帧 → SeamRepair.bridge"),
+                io.String.Output("report"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, model, clip, vae, ref_slice=None, prompt="", width=1664, height=928,
+                length=5, ref_image_size="match", steps=4, scheduler="simple",
+                sampler_name="res_multistep", denoise=1.0, seed=0):
+        from comfy_extras.nodes_custom_sampler import (
+            BasicGuider, BasicScheduler, KSamplerSelect, RandomNoise,
+            SamplerCustomAdvanced,
+        )
+        from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+        from nodes import VAEDecode
+
+        if ref_slice is None:
+            raise ValueError(
+                "RedrawBridge: ref_slice is empty - wire it from SeamRepair.ref_slice "
+                "(or point SeamRepair.video_path at a clip)"
+            )
+        cond = MiniMaxH3ReferenceToVideo.execute(
+            clip=clip, prompt=prompt, width=int(width), height=int(height),
+            length=int(length), ref_image_size=ref_image_size, vae=vae,
+            audio_vae=None, ref_images={},
+            ref_videos={"ref_video_0": ref_slice}, ref_video_audios={}, ref_audios={},
+        )
+        positive, latent = cond[0], cond[1]
+        noise = RandomNoise.execute(int(seed))[0]
+        guider = BasicGuider.execute(model, positive)[0]
+        sigmas = BasicScheduler.execute(model, scheduler, int(steps), float(denoise))[0]
+        sampler = KSamplerSelect.execute(sampler_name)[0]
+        out_latent, _denoised = SamplerCustomAdvanced.execute(
+            noise, guider, sampler, sigmas, latent)[0:2]
+        images = VAEDecode().decode(vae, out_latent)[0]
+        report = json.dumps(
+            {"frames": int(images.shape[0]), "size": [int(width), int(height)],
+             "steps": int(steps), "seed": int(seed), "sampler": sampler_name,
+             "scheduler": scheduler}, ensure_ascii=False, indent=1)
+        return io.NodeOutput(images, report)
+
+
 class MiniMaxH3RepairExtension(ComfyExtension):
     async def get_node_list(self):
         return [
