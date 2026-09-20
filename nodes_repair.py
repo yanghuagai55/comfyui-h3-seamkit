@@ -10,10 +10,17 @@ video save, operating on the decoded frame sequence directly:
                             node passes the main frames through untouched)
 * `MiniMaxH3SeamDissolve` - replace a corrupted span with a linear dissolve
                             between its healthy neighbours
+* `MiniMaxH3InfoBuffer`   - stash the main frames + both reports between the
+                            render chain and the repair branch; parses the
+                            #40 report for the cut/redraw frames (auto) or
+                            takes hand-filled values (manual mode); the
+                            images always pass through untouched
 
 All of them preserve frame count - the audio track wired into the video
 save node is never affected.
 """
+
+import json
 
 import torch
 
@@ -25,6 +32,34 @@ CATEGORY = "h3_hardcut/repair"
 # --------------------------------------------------------------------------
 # pure kernels (unit-testable without ComfyUI)
 # --------------------------------------------------------------------------
+
+def parse_boundary(report_str):
+    """Extract the window boundary frame from a #40 report (JSON string).
+
+    Priority: seam_hunt.aligned[0].boundary_frame (hunt moved the cut) ->
+    segments[0].frames[1] (the planned boundary).  Returns
+    (boundary_frame or None, source_tag or None).
+    """
+    if not report_str:
+        return None, None
+    try:
+        data = json.loads(report_str)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    aligned = (data.get("seam_hunt") or {}).get("aligned") or []
+    for entry in aligned:
+        bf = entry.get("boundary_frame")
+        if bf is not None:
+            return int(bf), "hunt"
+    segs = data.get("segments") or []
+    if segs:
+        frames = segs[0].get("frames") or []
+        if len(frames) >= 2:
+            return int(frames[1]), "plan"
+    return None, None
+
 
 def blend_pair(a: torch.Tensor, b: torch.Tensor, strength: float, mode: str):
     """The seam pop spread across the two frames around it."""
@@ -195,6 +230,80 @@ class MiniMaxH3SeamDissolve(io.ComfyNode):
                 f"inside 0..{images.shape[0] - 1}"
             )
         return io.NodeOutput(dissolve_span(images, s, e))
+
+
+class MiniMaxH3InfoBuffer(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3InfoBuffer",
+            display_name="MiniMax H3 Info Buffer (repair)",
+            category="h3_hardcut/repair",
+            inputs=[
+                io.Image.Input(
+                    "images",
+                    tooltip="主片帧序列（#16 frames）——原样直通，供下游修复节点使用",
+                ),
+                io.String.Input(
+                    "report_upscale", optional=True, default="",
+                    tooltip="#40 的 report（JSON）——auto 模式从这里解析切点/边界帧",
+                ),
+                io.String.Input(
+                    "report_auto", optional=True, default="",
+                    tooltip="#56 的 report——备用解析源（优先级低于 #40）",
+                ),
+                io.Combo.Input(
+                    "source_mode", options=["auto", "manual"], default="auto",
+                    tooltip="auto = 从 report 自动解析切点与重绘起点，下面的手填值不生效；\n"
+                            "manual = 用手填值（视频起点、切点都可手选）。\n"
+                            "auto 解析不到时自动回退手填值并在 report 里注明",
+                ),
+                io.Int.Input(
+                    "manual_cut_frame", default=69, min=1,
+                    tooltip="手动切点帧（manual 模式生效）——缝在它与前一帧之间",
+                ),
+                io.Int.Input(
+                    "manual_redraw_start", default=68, min=0,
+                    tooltip="手动重绘起点帧（manual 模式生效）——桥段切片/覆盖从这帧开始",
+                ),
+            ],
+            outputs=[
+                io.Image.Output("images", tooltip="主片帧序列原样直通"),
+                io.Int.Output("cut_frame", tooltip="切点帧（缝在 cut_frame-1 与 cut_frame 之间）"),
+                io.Int.Output("seam_frame", tooltip="= cut_frame-1，接 SeamBlend.seam_frame"),
+                io.Int.Output("redraw_start", tooltip="重绘切片起点，接 ImageFromBatch.batch_index"),
+                io.String.Output("report", tooltip="暂存的解析结果（JSON）"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, images, report_upscale="", report_auto="", source_mode="auto",
+                manual_cut_frame=69, manual_redraw_start=68):
+        cut, src_name = None, None
+        for name, rep in (("upscale", report_upscale), ("auto", report_auto)):
+            cut, src_name = parse_boundary(rep)
+            if cut is not None:
+                src_name = f"{name}/{src_name}"
+                break
+        manual = source_mode == "manual"
+        cut_final = int(manual_cut_frame)
+        redraw = int(manual_redraw_start)
+        note = None
+        if manual:
+            note = "manual mode: hand-filled values in effect"
+        elif cut is not None:
+            cut_final = cut
+            redraw = cut - 1  # redraw span starts one frame before the seam
+            note = f"auto: parsed from {src_name}"
+        else:
+            note = "auto found no boundary in either report - fell back to hand-filled values"
+        report_out = json.dumps(
+            {"cut_frame": cut_final, "redraw_start": redraw,
+             "source": note, "manual_mode": manual},
+            ensure_ascii=False,
+        )
+        return io.NodeOutput(images, cut_final, cut_final - 1, redraw, report_out)
 
 
 class MiniMaxH3RepairExtension(ComfyExtension):

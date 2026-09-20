@@ -58,6 +58,7 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3SeamBlend,
             MiniMaxH3SeamFuse,
             MiniMaxH3SeamDissolve,
+            MiniMaxH3InfoBuffer,
         ]
 
 
