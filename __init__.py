@@ -38,6 +38,7 @@ from .nodes import (
 )
 from .h3_upscale import MiniMaxH3HardCutUpscale
 from .nodes_repair import (
+    MiniMaxH3InfoBuffer,
     MiniMaxH3RepairExtension,
     MiniMaxH3SeamBlend,
     MiniMaxH3SeamDissolve,
