@@ -304,9 +304,7 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
 FLAT_RATIO = 1.1    # below this a tolerance window counts as featureless
 
 
-def _align_to_profile(
-    profile, planned, tolerance: int, video_tokens: int, side: str = "before"
-):
+def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
     """Per planned cut: the strongest latent change in the window, then SNAP it
     onto the exclusive-frame grid the window start requires.
 
@@ -358,20 +356,6 @@ def _align_to_profile(
         peak_frame = frame_of(peak_idx)
         top = [[frame_of(i), round(float(gr), 2)] for i, _lr, gr in window[:3]]
         note = None
-
-        if side == "after":
-            later = sorted(
-                (pair for pair in window if frame_of(pair[0]) > peak_frame),
-                key=lambda x: -x[2],
-            )
-            if later and later[0][2] >= FLAT_RATIO:
-                peak_idx, peak_local, peak_ratio = later[0]
-                peak_frame = frame_of(peak_idx)
-                note = ("side=after: boundary moved past the turn onto the next "
-                        "strong change inside the new shot")
-            else:
-                note = ("side=after: nothing stronger after the turn within "
-                        "tolerance - kept the before-side boundary")
 
         if peak_ratio < FLAT_RATIO:
             aligned.append({
@@ -436,7 +420,6 @@ def execute(
     cfg: float = 1.0,
     auto_seam_hunt: bool = False,
     auto_seam_sensitivity: int = 20,
-    seam_side: str = "before",
 ):
     core = _core()
     learned = _learned()
@@ -488,7 +471,7 @@ def execute(
         # latent's behaviour near the cut is visible at last.
         profile = _latent_change_profile(video)
         aligned, boundary_tokens = _align_to_profile(
-            profile, planned, tolerance, int(video.shape[2]), side=seam_side
+            profile, planned, tolerance, int(video.shape[2])
         )
         if boundary_tokens:
             boundary_tokens.sort()
@@ -649,20 +632,6 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "内容上会把真转镜漏掉、反而抓到动作重击。现改为：在每个计划切点的"
                         "容差窗内直接取 latent 变化最强的 token 作为边界 —— 无阈值。"
                         "低于 1.1 倍视为平坦，保持原计划边界。"
-                    ),
-                ),
-                io.Combo.Input(
-                    "seam_side",
-                    options=["before", "after"],
-                    default="before",
-                    tooltip=(
-                        "窗口边界放在镜头切换的哪一侧（都只允许独占帧 = 17 的倍数，"
-                        "组首起点实测会崩 4 帧，永不采纳）。\n"
-                        "**before**（默认）：边界放在突变前肩 —— 缝落在旧镜头结尾，\n"
-                        "比视觉转镜早约 1 帧，画面最稳。\n"
-                        "**after**：边界放在突变后（新镜头内）最近的强变化独占帧 ——\n"
-                        "缝藏进新镜头内部的内容变化里；容差内找不到强变化则自动退回 before\n"
-                        "（报告里有 note 说明）。"
                     ),
                 ),
             ],
