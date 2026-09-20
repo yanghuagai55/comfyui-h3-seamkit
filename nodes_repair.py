@@ -141,13 +141,14 @@ def fuse_frames(
 def dissolve_span(
     frames: torch.Tensor, start: int, end: int
 ) -> torch.Tensor:
-    """Replace frames start..end with a linear dissolve from frame start-1
-    to frame end+1 (both must be inside the clip)."""
+    """Replace frames in [start, end) - HALF OPEN, like every other frame range
+    here.  The dissolve runs from frame start-1 (kept) to frame end (kept);
+    frames start..end-1 are replaced."""
     out = frames.clone()
     left = out[start - 1]
-    right = out[end + 1]
-    n = end - start + 2
-    for j, fi in enumerate(range(start, end + 1)):
+    right = out[end]
+    n = end - start + 1
+    for j, fi in enumerate(range(start, end)):
         alpha = (j + 1) / n
         out[fi] = (1.0 - alpha) * left + alpha * right
     return out

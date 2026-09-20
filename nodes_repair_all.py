@@ -108,7 +108,8 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                 io.Combo.Input("source_mode", options=["auto", "manual"], default="auto",
                                tooltip="auto = 用 report 解析切点；manual = 用手填值"),
                 io.Int.Input("manual_cut_frame", default=69, min=1,
-                             tooltip="手动切点帧（manual 生效）"),
+                             tooltip="手动切点帧（manual 生效）——帧号 0 基，指该帧的开头\n"
+                                     "（= 上一帧的末尾）；重绘覆盖 [切点, 切点+n) 左闭右开"),
                 io.Combo.Input("fuse_side", options=["after", "before"], default="after",
                                tooltip="重绘片段融合权重方向：after = 贴切点最强、沿帧递减"),
                 io.Combo.Input("insert_mode", options=["manual", "edge"], default="manual",
@@ -127,11 +128,13 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                                tooltip="缝磨平强度（0 = 关；0.3 ≈ 跳变降 40%）"),
                 io.Combo.Input("blend_mode", options=["both", "prev", "next"], default="both"),
                 io.Int.Input("dissolve_start", default=0, min=0,
-                             tooltip="崩帧叠化区间起点（0 = 关）"),
-                io.Int.Input("dissolve_end", default=0, min=0),
+                             tooltip="叠化区间起点（0 = 关）——帧号 0 基，区间 [start, end) 左闭右开"),
+                io.Int.Input("dissolve_end", default=0, min=0,
+                             tooltip="叠化区间末帧（不含）——锚点取 end 帧本身"),
                 io.String.Input("video_path", default="",
                                 tooltip="★ 测试用：填一个成片路径即从它加载帧（images 可留空）"),
-                io.Int.Input("video_start", default=0, min=0),
+                io.Int.Input("video_start", default=0, min=0,
+                             tooltip="从第几帧开始取（帧号 0 基，含该帧）"),
                 io.Int.Input("video_frames", default=0, min=0, tooltip="0 = 全部"),
             ],
             outputs=[
@@ -245,9 +248,9 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
 
         # 6. dissolve
         ds, de = int(dissolve_start), int(dissolve_end)
-        if ds > 0 and de > ds and de < out.shape[0] - 1:
+        if ds > 0 and de > ds and de < out.shape[0]:
             out = dissolve_span(out, ds, de)
-            log.append(f"dissolve: frames {ds}..{de}")
+            log.append(f"dissolve: frames [{ds}, {de}) half-open")
         elif ds > 0:
             log.append("dissolve: span invalid - skipped")
 
