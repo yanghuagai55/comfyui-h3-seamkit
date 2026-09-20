@@ -281,8 +281,19 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     return sorted(kept)
 
 
-def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
+def _align_to_profile(
+    profile, planned, tolerance: int, video_tokens: int, side: str = "before"
+):
     """Per planned cut: the strongest latent change within `tolerance` frames.
+
+    `side` picks which side of the visible turn the window boundary sits on:
+    **before** (default) takes the strongest exclusive-frame candidate
+    regardless of side - in practice the front shoulder of the turn, so the
+    seam lands just before the shot change; **after** keeps only candidates
+    AT or AFTER the strongest one, so the seam lands on the next strong
+    change inside the new shot.  Both sides are exclusive frames only -
+    shared-group heads corrupt the window (measured).  If `after` finds
+    nothing within tolerance the cut falls back to `before` with a note.
 
     Returns `(aligned, boundary_tokens)`.  `aligned` carries the per-cut report
     including the top candidates, so the latent's behaviour near the cut is
@@ -324,7 +335,30 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
                 })
             continue
         cands.sort(key=lambda x: -x[1])
-        best_idx, best_ratio = cands[0]
+        front_idx, front_ratio = cands[0]
+        best_idx, best_ratio = front_idx, front_ratio
+        after_note = None
+        if side == "after":
+            later = sorted(
+                (
+                    pair
+                    for pair in cands
+                    if core.frames_for_tokens(int(pair[0]) + 1)
+                    > core.frames_for_tokens(int(front_idx) + 1)
+                ),
+                key=lambda x: -x[1],
+            )
+            if later and later[0][1] >= 1.1:
+                best_idx, best_ratio = later[0]
+                after_note = (
+                    "side=after: boundary moved past the turn onto the next "
+                    "strong exclusive-frame change inside the new shot"
+                )
+            else:
+                after_note = (
+                    "side=after: no strong exclusive-frame candidate after the "
+                    "turn within tolerance - kept the before-side boundary"
+                )
         top = [
             [core.frames_for_tokens(int(i) + 1), round(float(r), 2)]
             for i, r in cands[:3]
@@ -339,6 +373,37 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
             continue
         token = int(best_idx) + 1
         frame = core.frames_for_tokens(token)
+        # Shoulder takeover (user-requested): a smeared turn fires on BOTH
+        # sides of its transition token - the strongest diff sits on the FRONT
+        # shoulder while the visible shot change sits on the BACK one.  When
+        # the next boundary is nearly as strong, prefer it so the seam lands
+        # on the first new-shot frame.  If that boundary is a shared-group
+        # head, warn loudly: the upscaler corrupted such a window start once
+        # (4 frames) and the repair is a pixel-domain frame replacement.
+        note = None
+        for idx, r in cands:
+            if int(idx) != int(best_idx) + 1:
+                continue
+            nxt = core.frames_for_tokens(int(idx) + 1)
+            if (r >= SHOULDER_TAKEOVER * best_ratio
+                    and 0 < nxt - frame <= FRAME_GRID
+                    and abs(nxt - cut) <= tolerance):
+                token, frame = int(idx) + 1, nxt
+                if frame % FRAME_GRID:
+                    note = (
+                        "shoulder takeover: boundary moved to the back shoulder "
+                        f"(frame {frame}, shared-group head) - the seam lands on "
+                        "the first new-shot frame, but this window start has "
+                        "corrupted before; expect to replace its frames "
+                        "(repair_seam.py --replace)"
+                    )
+                else:
+                    note = (
+                        "shoulder takeover: boundary moved to the back shoulder "
+                        "(exclusive frame) - the seam lands on the first "
+                        "new-shot frame"
+                    )
+            break
         if token not in boundary_tokens:
             boundary_tokens.append(token)
         aligned.append({
@@ -349,6 +414,8 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
             "ratio": round(float(best_ratio), 2),
             "top_candidates": top,
         })
+        if after_note:
+            aligned[-1]["note"] = after_note
     return aligned, boundary_tokens
 
 
@@ -364,6 +431,7 @@ def execute(
     cfg: float = 1.0,
     auto_seam_hunt: bool = False,
     auto_seam_sensitivity: int = 20,
+    seam_side: str = "before",
 ):
     core = _core()
     learned = _learned()
@@ -415,7 +483,7 @@ def execute(
         # latent's behaviour near the cut is visible at last.
         profile = _latent_change_profile(video)
         aligned, boundary_tokens = _align_to_profile(
-            profile, planned, tolerance, int(video.shape[2])
+            profile, planned, tolerance, int(video.shape[2]), side=seam_side
         )
         if boundary_tokens:
             boundary_tokens.sort()
@@ -573,6 +641,20 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "内容上会把真转镜漏掉、反而抓到动作重击。现改为：在每个计划切点的"
                         "容差窗内直接取 latent 变化最强的 token 作为边界 —— 无阈值。"
                         "低于 1.1 倍视为平坦，保持原计划边界。"
+                    ),
+                ),
+                io.Combo.Input(
+                    "seam_side",
+                    options=["before", "after"],
+                    default="before",
+                    tooltip=(
+                        "窗口边界放在镜头切换的哪一侧（都只允许独占帧 = 17 的倍数，"
+                        "组首起点实测会崩 4 帧，永不采纳）。\n"
+                        "**before**（默认）：边界放在突变前肩 —— 缝落在旧镜头结尾，\n"
+                        "比视觉转镜早约 1 帧，画面最稳。\n"
+                        "**after**：边界放在突变后（新镜头内）最近的强变化独占帧 ——\n"
+                        "缝藏进新镜头内部的内容变化里；容差内找不到强变化则自动退回 before\n"
+                        "（报告里有 note 说明）。"
                     ),
                 ),
             ],

@@ -116,6 +116,11 @@ def main():
                     help="S:patch.mp4 - overwrite frames S..S+n-1 with the "
                          "frames of patch.mp4 (e.g. an H3 ref2v bridge clip); "
                          "repeatable, comma separated")
+    ap.add_argument("--dissolve", default="",
+                    help="S:E,... - replace corrupted frames S..E with a "
+                         "linear dissolve from frame S-1 to frame E+1.  "
+                         "Zero-generation fix: the span reads as a dissolve "
+                         "cut, which is legitimate film grammar.")
     ap.add_argument("--locate", action="store_true", help="detect candidates only")
     ap.add_argument("--k", type=float, default=4.0, help="locate threshold (x median)")
     ap.add_argument("--strength", type=float, default=0.3,
@@ -132,17 +137,39 @@ def main():
     print(f"frames={len(frames)}  diff median={np.median(diffs):.2f}  "
           f"diff max={diffs.max():.2f}")
 
-    if args.locate or not args.seams:
+    if args.locate or not (args.seams or args.dissolve or args.replace):
         cands = locate(diffs, args.k)
         print("candidates (pop between S and S+1, x median):")
         for i, ratio in cands:
             print(f"  S={i:<5} diff={diffs[i]:7.2f}  ({ratio}x)")
-        if not args.seams:
-            print("give --seams to repair; nothing written")
+        if not (args.seams or args.dissolve or args.replace):
+            print("give --seams / --dissolve / --replace to repair; nothing written")
             return
 
     seams = [int(s) for s in args.seams.replace(";", ",").split(",") if s.strip()]
     strength = min(0.5, max(0.0, args.strength))
+    dissolve_fixed = 0
+
+    if args.dissolve:
+        for spec in args.dissolve.replace(";", ",").split(","):
+            if ":" not in spec:
+                print(f"skip {spec!r}: expected S:E")
+                continue
+            s_str, e_str = spec.split(":", 1)
+            s, e = int(s_str), int(e_str)
+            if not (0 < s <= e < len(frames) - 1):
+                print(f"skip dissolve {s}:{e}: anchors would fall outside the clip")
+                continue
+            left = frames[s - 1].astype(np.float32)
+            right = frames[e + 1].astype(np.float32)
+            steps = e - s + 2
+            for j, fi in enumerate(range(s, e + 1)):
+                alpha = (j + 1) / steps
+                frames[fi] = ((1.0 - alpha) * left + alpha * right).astype(np.uint8)
+            print(f"dissolved frames {s}..{e}: {e - s + 1} frames replaced by a "
+                  f"linear blend of f{s - 1} -> f{e + 1} "
+                  f"(alpha {1 / steps:.2f} .. {(steps - 1) / steps:.2f})")
+            dissolve_fixed += 1
 
     if args.replace:
         total = len(frames)
@@ -203,7 +230,7 @@ def main():
         ).mean())
         print(f"seam S={s}: jump {before:.2f} -> {after:.2f} ({after / before:.0%})")
         fixed += 1
-    if not fixed:
+    if not (fixed or dissolve_fixed):
         return
 
     base, ext = os.path.splitext(args.video)
