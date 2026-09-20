@@ -297,13 +297,37 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
     core = _core()
     aligned, boundary_tokens = [], []
     for cut in planned:
-        cands = [
-            (idx, r)
-            for idx, r in profile
-            if 0 < int(idx) + 1 < int(video_tokens)
-            and abs(core.frames_for_tokens(int(idx) + 1) - cut) <= tolerance
-        ]
+        # Window starts MUST be exclusive frames (multiples of 17).  Measured
+        # 2026-09-19/20, same seed+prompt: start 68 (exclusive) -> clean output;
+        # start 69 (shared-group head) -> the whole second window corrupted.
+        # A turn lives inside token CONTENT, so a shared-group token must never
+        # be the first thing a window re-anchors on.  Non-exclusive candidates
+        # are reported but never adopted.
+        cands = []
+        blocked = []
+        for idx, r in profile:
+            if not (0 < int(idx) + 1 < int(video_tokens)):
+                continue
+            fr = core.frames_for_tokens(int(idx) + 1)
+            if abs(fr - cut) > tolerance:
+                continue
+            (cands if fr % FRAME_GRID == 0 else blocked).append((idx, r))
         if not cands:
+            if blocked:
+                top = [
+                    [core.frames_for_tokens(int(i) + 1), round(float(r), 2)]
+                    for i, r in sorted(blocked, key=lambda x: -x[1])[:3]
+                ]
+                aligned.append({
+                    "planned_cut": cut,
+                    "moved": False,
+                    "note": (
+                        "strongest latent change near the cut sits on a "
+                        "shared-group start (corrupted a window once) - "
+                        "exclusive-frame starts only, keeping the planned cut"
+                    ),
+                    "top_candidates": top,
+                })
             continue
         cands.sort(key=lambda x: -x[1])
         best_idx, best_ratio = cands[0]
