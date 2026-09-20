@@ -81,7 +81,7 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="MiniMaxH3SeamRepair",
+            node_id="MiniMaxH3SeamRepairAll",
             display_name="MiniMax H3 Seam Repair (All-in-One)",
             category=CATEGORY,
             inputs=[

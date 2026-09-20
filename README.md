@@ -1,12 +1,90 @@
 # comfyui-h3-hardcut
 
-**把分块二采的"接缝"变成剪辑点。**
+**把 MiniMax H3 分块二采的「接缝」，变成一次有意识的剪辑。**
+
+分块二采在段与段之间用 `overlap` 做混合，而两段是各自独立采样的 —— 内容必然分歧，
+观感就是**重影 / 突然发糊**。本插件把 overlap 设为 **0**：每个窗口独立采样、首尾直接相接，
+于是接合处是一次**硬切**而不是溶解；再让提示词**在同一帧要求模型换镜头**，
+硬切就成了合法的剪辑语法 —— 缝不再是缺陷。
+
+副作用是好的：每段更短，**峰值显存更低**。RTX 4060 Laptop 8GB 上，1.5MP 画布可以跑 15 秒
+（8 秒单窗在 1.0MP 就已经到负载上限）。
+
+> **依赖上游**：[comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)
+> （GPL-3.0-or-later）。本插件在运行时调用它的放大器 / 采样 / 条件重锚，plan 契约与它保持逐字段兼容。
+> **许可**：**GPL-3.0-or-later**（与上游一致，理由见 [许可](#许可)）。
+> **安装**：除 ComfyUI 与 torch 外无额外 pip 依赖。
 
 | 文档 | 用途 |
 |---|---|
 | **`MANUAL.md`** | ★ **作业手册** —— 跨模型协作全流程（定切点 → 喂 LLM → 抄回 ComfyUI）+ 可复制的 LLM 约束块 |
+| **`AUTO.md`** | 自动版节点 `MiniMaxH3HardCutAuto` 的使用与排查 |
 | `templates/hardcut-prompt-template.md` | 提示词模板（六段骨架 + 硬切改写实例 + 常见错误） |
-| `refs\H3-硬切分镜提示词工程.md` | 原理与一手依据（源码层面为什么 overlap=0 就是硬切） |
+| `templates/auto-prompt-template.md` | 纯 LLM 用的模板（只要一句约束就能写镜头） |
+
+## 目录
+
+- [安装](#安装)
+- [节点一览](#节点一览)
+- [最短上手路径](#最短上手路径)
+- [新手快速入门](#新手快速入门先看这里)
+- [切点语义与参数](#参数一图流秒-vs-帧这是你问的重点)
+- [节点详解](#节点)
+- [接缝修复工具链](#接缝修复工具链)
+- [命令行工具](#命令行工具)
+- [实测数据与已知限制](#实测负载锚点rtx-4060-laptop-8gb)
+- [许可](#许可)
+
+---
+
+## 安装
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/<你的账号>/comfyui-h3-hardcut.git
+```
+
+前置条件（缺一不可）：
+
+| 依赖 | 说明 |
+|---|---|
+| ComfyUI | 用 `comfy_api.latest`（V3 节点注册），需要较新的 ComfyUI |
+| `comfyui-minimax-h3-audio-T8` | **必须**。本插件在运行时按模块名后缀定位它的放大器 / 采样 / plan 构建器 |
+| MiniMax H3 模型 | 底模 + Qwen3-VL 文本编码器 + video VAE + 3D latent upscaler，按上游说明安装 |
+
+装完**重启 ComfyUI**。若上游没装，`MiniMaxH3HardCutUpscale` 会直接报
+`upstream H3 upscale pack not loaded in this process`；plan 构建器找不到时会自动回退到
+内置 plan，并在 `cut_report` 里打一行 WARNING（此时仍可跑，但契约同步不再有保证）。
+
+## 节点一览
+
+| 节点 | 分类 | 干什么 |
+|---|---|---|
+| `MiniMaxH3HardCutAuto` ★ | `MiniMax H3/HardCut` | 填时长 + 档位 + 两块 MP，自动挑切点、生成时间戳、算画布、校验提示词 |
+| `MiniMaxH3HardCutPlan` | 同上 | 手填切点（秒或帧）→ 执行器用的 plan + 报告 |
+| `MiniMaxH3HardCutValidate` ★ | 同上 | 提示词体检：与 plan 不一致就抛错拦停 |
+| `MiniMaxH3HardCutShotPrompt` | 同上 | 镜头描述 → 官方 R2V 模板的 `detailed_description` |
+| `MiniMaxH3HardCutUpscale` ★ | 同上 | **二采执行器**，支持不等长分段 + 自动找真实转镜帧 |
+| `MiniMaxH3InfoBuffer` | `h3_hardcut/repair` | 暂存主片帧 + 解析 report（重绘/修复的 coordinate 换算） |
+| `MiniMaxH3SeamRepairAll` ★ | `h3_hardcut/repair` | 全包：切片 → 重绘 → 融合 → 磨平 → 叠化，一个节点做完 |
+| `MiniMaxH3RedrawBridge` | `h3_hardcut/repair` | 只做"重绘桥段"这一支 |
+| `MiniMaxH3SeamFuse` | `h3_hardcut/repair` | 把桥段按权重渐变贴回主片 |
+| `MiniMaxH3SeamBlend` | `h3_hardcut/repair` | 缝两侧两帧互相靠拢（磨平跳变） |
+| `MiniMaxH3SeamDissolve` | `h3_hardcut/repair` | 一段崩坏帧用两端做锚点叠化替换 |
+
+> 规划类与执行类是可独立使用的**主链路**；`repair` 类是**救急工具**，
+> 主链路跑得好的时候它们全部 bypass 即可，不影响出片。
+
+## 最短上手路径
+
+1. 装好上游 T8 包并确认它能跑通分块二采。
+2. 把工作流里的 `MiniMaxH3ChunkedTwoPassLowSigmaPlanT8Advanced` 换成 **`MiniMaxH3HardCutAuto`**
+   （或手填党用 `MiniMaxH3HardCutPlan`）。
+3. 把 `MiniMaxH3ChunkedTwoPassUpscaleT8Advanced` 换成 **`MiniMaxH3HardCutUpscale`**
+   （同名同型输入，连线自动保留）。
+4. 提示词按切点写好 `[Shot N] At MM:SS.mmm, …`，跑之前看校验器报告 `status: OK`。
+
+想先不碰 ComfyUI 就验证参数？跳到 [命令行工具](#命令行工具)。
 
 ---
 
@@ -306,6 +384,132 @@ so the model would not cut where the executor cuts.
 
 ---
 
+## 接缝修复工具链
+
+主链路跑得好时这一节可以跳过（修复节点全部 bypass 即直通）。
+**只有当缝还能看出来** —— 跳变、几帧糊掉、人物边缘融化 —— 才需要它。
+
+### 先分清两种"缝"
+
+| 现象 | 判据 | 治法 |
+|---|---|---|
+| **位置错位**：缝两侧不是同一镜 | 像素域逐帧 diff 出现尖峰，且**不在**你声明的切点上 | 让边界对齐真实转镜帧（`auto_seam_hunt`） |
+| **强度跳变**：两侧同镜，但清晰度/色调不一致 | 该帧 `lap`（拉普拉斯能量）显著高于邻域 | `blend_strength=0.3`，或降 `second_pass_sigma0`（0.30 → 0.22） |
+
+⚠️ **量 `lap` 时必须排除 17 的倍数的帧**。H3 的时间压缩是 **1+4+4+4+4 token**：
+块首帧独占一个 token（最锐），其后 4 帧共享一个（被平均）。实测 14 条成片**全部**有这个
+17 帧周期（块首 1.8–2.1× 其余帧），**未硬切的对照片也有**（1.25×）。
+这是架构固有特征，不是接缝，也不是 SageAttention / int8 的锅（量化误差是随机的，产生不了周期）。
+
+### 让边界自动对齐真实转镜帧
+
+执行器 `MiniMaxH3HardCutUpscale` 自带：
+
+| 参数 | 说明 |
+|---|---|
+| `auto_seam_hunt` | 在 latent 域找真实转镜帧：**全窗口取最强峰 → snap 到最近的独占帧（17k）** |
+| `seam_side` | `before` / `after`：峰落在转镜两侧时的取舍（见下方"固有两难"） |
+| `auto_seam_sensitivity` | **已停用**，调它无效 |
+
+report 关键字段：`measured_turn_frame`（测得的转镜帧）/ `boundary_frame`（最终采用的边界）。
+
+**为什么是"全窗口取峰再吸附"，而不是"只在 17 倍数帧里取峰"**：转镜是信号，
+独占帧只是**窗口起点**的约束。旧实现只在 17 倍数里 argmax，实测把边界从 68 判到了 85（差 17 帧）。
+
+**两个硬约束（改不了）**：
+
+1. **窗口起点必须是独占帧 17k**。起点落在共享组首（如 69）会让整段生成崩坏 ——
+   同 seed 对比实测：68 干净 / 69 崩。曾经"只差 1 帧"的那版成片就是这么来的，画面是废的。
+2. **边界精度下限约 2 帧**。latent 时间粒度是 4 帧/token，帧 66 附近的合法边界只有 64 和 68，
+   而 64 属共享组首（不能用作起点）→ 只能取 68，距 66 恰好 2 帧。**这是架构精度，不是 bug。**
+
+**固有两难**：当转镜恰好落在"独占帧的下一帧"（如 69 = 68+1）时 ——
+取前肩 68 差 1 帧（缝在旧镜内，轻度可见），取后肩 85 差 16 帧（缝落在更静的段，重度可见）。
+此时 `seam_side` 无法保证"缝落在转镜面上"，只能二选一。
+
+### 修复节点怎么串
+
+```
+主片帧 (#16) ──► MiniMaxH3InfoBuffer ──► MiniMaxH3SeamFuse ──► MiniMaxH3SeamBlend ──► 保存
+      #40 report ──► InfoBuffer (auto 解析切点)      ▲
+                         桥段（可选） ────────────────┘
+```
+
+- **`MiniMaxH3InfoBuffer`**：主片帧直通 + 从 `#40` report 解析出 cut / seam / redraw 帧号；
+  填 `video_path` 可以**只 bypass 解码节点**、几秒钟验证修复效果，生成链一条都不跑。
+- **`MiniMaxH3SeamFuse`**：把桥段按权重渐变贴回主片。`bridge` 是 optional —— 不接（桥段组 bypass）就直通主片。
+- **`MiniMaxH3SeamBlend`**：`strength=0` 直通；`0.3` ≈ 峰值跳变降 40%（实测）。
+- **`MiniMaxH3SeamDissolve`**：崩坏区间用两端做锚点叠化替换（帧数不变）。
+- **`MiniMaxH3SeamRepairAll`** ★：上面几步 + 重绘打包进一个节点，推荐直接用它。
+
+### `MiniMaxH3SeamRepairAll`（全包）
+
+| 输入 | 说明 |
+|---|---|
+| `model` / `clip` / `vae` | 重绘用，与主片同源（LoRA 链尾的 MODEL） |
+| `images` | 主片帧；**留空 + 填 `video_path`** 可直接拿本地成片试 |
+| `report` | `#40` 的 report —— `auto` 模式据此取切点 |
+| `prompt` | 重绘提示词（描述参考片段里正在发生的事） |
+| `redraw_frames` | 重绘帧数 5–39（切片长度与生成长度共用）。**H3 的 R2V 至少 5 帧** |
+| `steps` / `seed` | 步数取主片同值（Turbo 则 4）；固定种子便于对比 |
+| `source_mode` | `auto`（用 report）/ `manual`（手填 `manual_cut_frame`） |
+| `insert_mode` | `manual`（切点 + 偏移）/ `edge`（像素域自动检测真实转镜帧，±17 帧搜索） |
+| `fuse_offset` | 插入位置微调（帧），**两种模式都生效**；`−1` = 整体往前放一帧 |
+| `fuse_side` / `fuse_min` / `fuse_max` | 融合权重方向（after = 贴切点最强递减）与范围 |
+| `blend_strength` / `blend_mode` | 缝磨平 |
+| `dissolve_start` / `dissolve_end` | 叠化区间，`[start, end)` 左闭右开，0 = 关 |
+
+输出 `images`（修好的整片）/ `redraw`（本次重绘的 N 帧，供对比）/ `report`。
+
+**帧语义（全插件统一）**：帧号 **0 基**，区间一律**左闭右开**。
+「边界帧 68」= 该帧开头 = 缝落在 `67|68` 之间。内容切片跟随**插入位置**走，
+不是围绕声明的切点 —— 早期版本两者脱节，实测整段偏移 10 帧。
+
+---
+
+## 命令行工具
+
+`tools/` 下的脚本全部**不需要 ComfyUI 在跑**，装了 `av` / `numpy` / `cv2` 就能用
+（ComfyUI 环境自带）。本机示例用 `D:\comfyui\comfyenv\python.exe`，换成你自己的 python 即可。
+
+| 脚本 | 干什么 |
+|---|---|
+| `hardcut_math.py` | **零依赖**纯计算：帧网格、切点求解、chunk 阶梯、负载估算、提示词校验 |
+| `tools/analyze_cut.py` | **成片体检**：量出画面实际在第几帧换镜，与理论切点差几帧 |
+| `tools/repair_seam.py` | **像素域修复**：`--locate` / `--replace` / `--blend` / `--dissolve` / `--fuse` |
+| `tools/check_widgets.py` | **体检工作流**：查本包节点的 `widgets_values` 是否与 schema 对得上 |
+
+```bash
+# 量实际转镜帧（--sheet 导出逐帧接触表方便肉眼复核）
+python tools/analyze_cut.py "成片.mp4" --cuts 4.958,8.500
+
+# 像素域找缝 / 修缝
+python tools/repair_seam.py "成片.mp4" --locate
+python tools/repair_seam.py "成片.mp4" --seams 67 --strength 0.3 --out 修好的.mp4
+
+# 体检工作流（扫 user/default/workflows 下全部）
+python tools/check_widgets.py
+```
+
+### ★ `check_widgets.py` —— 槽位错位是沉默杀手
+
+ComfyUI 的 `widgets_values` 是**按位置**赋值的。改了节点 `define_schema`（删/加一个参数）之后，
+工作流里**旧的那个值还留着** → 从那一槽起**整体错位一位**，节点照跑、不报错，值全歪。
+
+判据：`widgets_values_named` 里出现**类型不可能**的值 —— COMBO 拿到数字、INT 拿到字符串。
+
+```bash
+python tools/check_widgets.py            # 扫全部工作流
+python tools/check_widgets.py 某.json --verbose
+python tools/check_widgets.py 某.json --fix    # 自动删残留槽位（会先 .bak）
+python tools/check_widgets.py --offline        # 不连 /object_info，用内置 schema
+```
+
+⚠️ 只对**本包**节点报警：第三方包的 `upload`、`ref_images.*`、被连线覆盖的 widget
+**全是假阳性**，别去修。**"多出的槽位"才危险，"少于 schema"普遍正常。**
+
+---
+
 ## 接入现有工作流（6 步）
 
 1. 界面里删掉旧的 `MiniMaxH3ChunkedTwoPassLowSigmaPlanT8Advanced`（原 `#37`）。
@@ -434,7 +638,45 @@ D:\comfyui\comfyenv\python.exe toolsnalyze_cut.py "<成片.mp4>" --cuts 4.958,8
 |---|---|
 | `hardcut_math.py` | 纯计算：帧网格、切点求解、chunk 阶梯、可达方案枚举、负载估算、**提示词校验**。可独立运行（`--check` / `--step`）。 |
 | `bridge.py` | 定位并调用上游的 plan 构建器；含 fallback plan。 |
-| `nodes.py` | 三个 ComfyUI 节点（Plan / Validate / ShotPrompt）。 |
+| `h3_upscale.py` | `MiniMaxH3HardCutUpscale` —— 自写分块层，运行时复用上游的放大器 / 采样 / 条件重锚。 |
+| `nodes.py` | 规划类节点（Plan / Validate / ShotPrompt / Auto）。 |
+| `nodes_repair.py` | 修复类节点（InfoBuffer / SeamBlend / SeamFuse / SeamDissolve / RedrawBridge）。 |
+| `nodes_repair_all.py` | `MiniMaxH3SeamRepairAll` —— 全包修复节点。 |
+| `tools/` | 命令行工具：成片体检、像素域修复、工作流槽位体检。 |
 | `__init__.py` | `comfy_entrypoint`（V3 注册，与上游同机制）。 |
 | `MANUAL.md` | **跨模型作业手册**：定切点 → 喂 LLM → 校验 → 跑。 |
-| `templates/hardcut-prompt-template.md` | 提示词骨架 + 实例 + 常见错误表。 |
+| `AUTO.md` | 自动版节点的使用与排查。 |
+| `templates/` | 提示词骨架 + 实例 + 常见错误表。 |
+
+---
+
+## 许可
+
+**GPL-3.0-or-later**（`LICENSE` 内为 GPLv3 全文）。
+
+理由不是"随手选的"：本插件在**同一个 Python 进程内** import 并调用上游
+[comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8) 的模块
+（`chunked_two_pass_upscale_advanced`、`learned_latent_upscale_advanced`、`sampling`），
+并且 plan 的字段契约与它逐字段对齐。上游是 **GPL-3.0-or-later**，这种程度的耦合
+按 FSF 对 Python 模块 import 的立场构成衍生作品，因此本仓库沿用同一许可。
+
+配套说明：
+
+- 本仓库**不包含**任何上游源码副本。所有上游能力都是运行时按模块名解析调用的；
+  `bridge.py` 里的 `T8_H3_CHUNKED_TWO_PASS_PLAN`、`t8.minimax_h3.chunked_two_pass.low_sigma.v3`
+  等字符串是**上游的公开契约标识**，必须逐字节保持一致，不属于本项目的原创内容。
+- 上游缺失时，plan 构建会回退到 `bridge.py` 里的内置 fallback（会打 WARNING），
+  执行器则直接报错 —— **执行器不回退**，因为它必须调用上游的放大器与采样。
+- 模型权重不在本仓库内。MiniMax H3 及其衍生模型遵循 **MiniMax H3 Community License
+  Agreement**，请自行阅读你所用模型的完整协议与 Acceptable Use Policy。
+- 若你希望以更宽松的许可（MIT / Apache-2.0）发布，唯一干净的做法是**断开 import**：
+  只通过 ComfyUI 连线传递数据、不调用上游 Python 函数。代价是失去不等长分段执行器
+  与放大器复用，需要自己实现整套 H3 二采链路 —— 通常不划算。
+
+## 致谢
+
+- **T8mars / comfyui-minimax-h3-audio-T8** —— 分块二采、3D latent 放大器、音频条件与
+  整套 H3 节点生态都来自这个包。本插件只是站在它上面改了"分段"这一层。
+- **MiniMax / Comfy-Org** —— H3 模型与 ComfyUI 集成。
+- 所有实测数字都来自本机 RTX 4060 Laptop 8GB + torch 2.14.0+cu130 的真实跑片，
+  换卡请重新量锚点。

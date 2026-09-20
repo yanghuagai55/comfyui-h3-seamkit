@@ -1,0 +1,18 @@
+[project]
+name = "comfyui-h3-hardcut"
+version = "0.1.0"
+description = "Hard-cut planning and seam repair for MiniMax H3 chunked two-pass upscale in ComfyUI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/<your-account>/comfyui-h3-hardcut"
+"Upstream pack" = "https://github.com/T8mars/comfyui-minimax-h3-audio-T8"
+
+# 发布到 ComfyUI Registry 时才需要下面这段；PublisherId 换成你自己的 registry 账号 id。
+# [tool.comfy]
+# PublisherId = "<your-publisher-id>"
+# DisplayName = "MiniMax H3 Hard Cut"
