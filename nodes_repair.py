@@ -431,7 +431,6 @@ class MiniMaxH3SeamRepair(io.ComfyNode):
             ],
             outputs=[
                 io.Image.Output("images", tooltip="修复后的帧序列 → 视频保存节点"),
-                io.Image.Output("ref_slice", tooltip="给桥段的参考切片 → ReferenceToVideo.ref_videos"),
                 io.String.Output("report", tooltip="本次都做了什么（解析 + 各步状态）"),
             ],
             is_experimental=True,
@@ -474,14 +473,7 @@ class MiniMaxH3SeamRepair(io.ComfyNode):
             redraw = max(0, redraw - offset)
             steps.append(f"shifted by -{offset} for the partial load")
 
-        # 3. reference slice for the redraw branch
-        n_ref = int(redraw_frames)
-        s = max(0, min(int(redraw), max(0, int(frames.shape[0]) - 1)))
-        ref_slice = frames[s:s + n_ref]
-        if int(ref_slice.shape[0]) < n_ref:
-            steps.append(f"WARN ref_slice short: {int(ref_slice.shape[0])}/{n_ref} frames")
-
-        # 4. fuse the bridge in
+        # 3. fuse the bridge in
         out = frames
         if bridge is not None and bridge.numel() > 0:
             n = min(int(bridge.shape[0]), int(frames.shape[0]) - int(cut))
@@ -510,9 +502,9 @@ class MiniMaxH3SeamRepair(io.ComfyNode):
             steps.append("dissolve: span invalid - skipped")
 
         report_out = json.dumps(
-            {"cut_frame": int(cut), "seam_frame": seam, "redraw_start": s,
+            {"cut_frame": int(cut), "seam_frame": seam, "redraw_start": int(redraw),
              "steps": steps}, ensure_ascii=False, indent=1)
-        return io.NodeOutput(out, ref_slice, report_out)
+        return io.NodeOutput(out, report_out)
 
 
 SCHEDULERS = ["simple", "beta", "normal", "sgm_uniform", "karras",
@@ -522,11 +514,11 @@ SAMPLERS = ["res_multistep", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_2m_s
 
 
 class MiniMaxH3RedrawBridge(io.ComfyNode):
-    """The redraw branch in one node: reference conditioning + sampling + decode.
+    """The redraw branch in one node: slice -> reference conditioning -> sample.
 
-    Four wires in (model / clip / vae / ref_slice) and one out (images) - the
-    guider, scheduler, sampler, noise and decode are all created inside and
-    are not meant to be tuned per run.
+    Takes the main frames directly (NOT from SeamRepair - that would close a
+    cycle: SeamRepair needs this node's output on its bridge input).  The
+    slice start comes from the same report, parsed here independently.
     """
 
     @classmethod
@@ -539,8 +531,15 @@ class MiniMaxH3RedrawBridge(io.ComfyNode):
                 io.Model.Input("model", tooltip="LoRA 链尾的 MODEL（与主片同源）"),
                 io.Clip.Input("clip", tooltip="Qwen3-VL 文本编码器"),
                 io.Vae.Input("vae", tooltip="video VAE（参考与解码共用）"),
-                io.Image.Input("ref_slice", optional=True,
-                               tooltip="参考片段（来自 SeamRepair 的 ref_slice，5 帧）"),
+                io.Image.Input("images", tooltip="主片帧（与 SeamRepair 同源：#16 frames）"),
+                io.String.Input("report", optional=True, default="",
+                                tooltip="#40 的 report——auto 模式据此取切片起点"),
+                io.Combo.Input("source_mode", options=["auto", "manual"], default="auto",
+                               tooltip="auto = 用 report 解析的切点；manual = 用下面手填值"),
+                io.Int.Input("manual_redraw_start", default=68, min=0,
+                             tooltip="手动切片起点（manual 生效）"),
+                io.Int.Input("redraw_frames", default=5, min=5, max=39,
+                             tooltip="参考切片长度（H3 锚定合法值 5/22/39）"),
                 io.String.Input(
                     "prompt", multiline=True,
                     default="Redraw the content of the reference video clip: the same "
@@ -567,9 +566,10 @@ class MiniMaxH3RedrawBridge(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, clip, vae, ref_slice=None, prompt="", width=1664, height=928,
-                length=5, ref_image_size="match", steps=4, scheduler="simple",
-                sampler_name="res_multistep", denoise=1.0, seed=0):
+    def execute(cls, model, clip, vae, images, report="", source_mode="auto",
+                manual_redraw_start=68, redraw_frames=5, prompt="", width=1664,
+                height=928, length=5, ref_image_size="match", steps=4,
+                scheduler="simple", sampler_name="res_multistep", denoise=1.0, seed=0):
         from comfy_extras.nodes_custom_sampler import (
             BasicGuider, BasicScheduler, KSamplerSelect, RandomNoise,
             SamplerCustomAdvanced,
@@ -577,11 +577,24 @@ class MiniMaxH3RedrawBridge(io.ComfyNode):
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
         from nodes import VAEDecode
 
-        if ref_slice is None:
+        # slice start: same rules as SeamRepair (parsed or hand-filled)
+        parsed, tag = parse_boundary(report)
+        manual = source_mode == "manual"
+        if manual or parsed is None:
+            start = int(manual_redraw_start)
+            how = "manual" if manual else "manual (auto found nothing)"
+        else:
+            start = max(0, parsed - 1)
+            how = f"auto from {tag} (cut {parsed})"
+        n_want = int(redraw_frames)
+        s = max(0, min(start, max(0, int(images.shape[0]) - 1)))
+        ref_slice = images[s:s + n_want]
+        if int(ref_slice.shape[0]) < 5:
             raise ValueError(
-                "RedrawBridge: ref_slice is empty - wire it from SeamRepair.ref_slice "
-                "(or point SeamRepair.video_path at a clip)"
+                f"RedrawBridge: ref slice has only {int(ref_slice.shape[0])} frame(s) "
+                f"(start {s}) - H3 reference videos need at least 5"
             )
+
         cond = MiniMaxH3ReferenceToVideo.execute(
             clip=clip, prompt=prompt, width=int(width), height=int(height),
             length=int(length), ref_image_size=ref_image_size, vae=vae,
@@ -595,12 +608,13 @@ class MiniMaxH3RedrawBridge(io.ComfyNode):
         sampler = KSamplerSelect.execute(sampler_name)[0]
         out_latent, _denoised = SamplerCustomAdvanced.execute(
             noise, guider, sampler, sigmas, latent)[0:2]
-        images = VAEDecode().decode(vae, out_latent)[0]
-        report = json.dumps(
-            {"frames": int(images.shape[0]), "size": [int(width), int(height)],
+        out_images = VAEDecode().decode(vae, out_latent)[0]
+        report_out = json.dumps(
+            {"frames": int(out_images.shape[0]), "slice": [s, s + int(ref_slice.shape[0])],
+             "slice_from": how, "size": [int(width), int(height)],
              "steps": int(steps), "seed": int(seed), "sampler": sampler_name,
              "scheduler": scheduler}, ensure_ascii=False, indent=1)
-        return io.NodeOutput(images, report)
+        return io.NodeOutput(out_images, report_out)
 
 
 class MiniMaxH3RepairExtension(ComfyExtension):
