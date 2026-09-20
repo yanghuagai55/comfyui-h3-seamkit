@@ -61,6 +61,39 @@ def parse_boundary(report_str):
     return None, None
 
 
+def load_video_frames(path: str, start: int = 0, max_frames: int = 0):
+    """Decode a video file into a ComfyUI IMAGE batch [B, H, W, C] float 0-1.
+
+    Used by the InfoBuffer's manual mode: point it at an existing clip and the
+    whole repair chain runs in seconds instead of re-generating the video.
+    """
+    import numpy as np
+
+    try:
+        import av  # PyAV
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "PyAV is required to load a video in the InfoBuffer (pip install av)"
+        ) from exc
+
+    frames = []
+    with av.open(path) as container:
+        if not container.streams.video:
+            raise ValueError(f"{path} has no video stream")
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for index, frame in enumerate(container.decode(stream)):
+            if index < int(start):
+                continue
+            if max_frames and len(frames) >= int(max_frames):
+                break
+            frames.append(frame.to_ndarray(format="rgb24"))
+    if not frames:
+        raise ValueError(f"no frames decoded from {path} (start={start})")
+    batch = np.stack(frames).astype(np.float32) / 255.0
+    return torch.from_numpy(batch)
+
+
 def blend_pair(a: torch.Tensor, b: torch.Tensor, strength: float, mode: str):
     """The seam pop spread across the two frames around it."""
     if mode == "prev":  # only the earlier frame leans forward
@@ -241,8 +274,10 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
             category="h3_hardcut/repair",
             inputs=[
                 io.Image.Input(
-                    "images",
-                    tooltip="主片帧序列（#16 frames）——原样直通，供下游修复节点使用",
+                    "images", optional=True,
+                    tooltip="主片帧序列（#16 frames）——原样直通。**未连接时改用下面的\n"
+                            "video_path 从磁盘视频加载**（快速验证：只 bypass #16 即可，\n"
+                            "生成链整条不跑，几秒出修复片）",
                 ),
                 io.String.Input(
                     "report_upscale", optional=True, default="",
@@ -266,6 +301,21 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
                     "manual_redraw_start", default=68, min=0,
                     tooltip="手动重绘起点帧（manual 模式生效）——桥段切片/覆盖从这帧开始",
                 ),
+                io.String.Input(
+                    "video_path", default="",
+                    tooltip="★ 快速验证用：填一个成片视频的完整路径（如\n"
+                            "D:\\共享\\MiniMaxH3\\exp_4v10a_00043.mp4），\n"
+                            "本节点就从这个文件加载帧序列，不再要上游的 #16 输出。\n"
+                            "配合「只 bypass #16」几秒就能走完修复链看效果",
+                ),
+                io.Int.Input(
+                    "video_start", default=0, min=0,
+                    tooltip="从视频的第几帧开始取（0 = 从头）",
+                ),
+                io.Int.Input(
+                    "video_frames", default=0, min=0,
+                    tooltip="取多少帧（0 = 全部）",
+                ),
             ],
             outputs=[
                 io.Image.Output("images", tooltip="主片帧序列原样直通"),
@@ -278,8 +328,21 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images, report_upscale="", report_auto="", source_mode="auto",
-                manual_cut_frame=69, manual_redraw_start=68):
+    def execute(cls, images=None, report_upscale="", report_auto="", source_mode="auto",
+                manual_cut_frame=69, manual_redraw_start=68,
+                video_path="", video_start=0, video_frames=0):
+        path = (video_path or "").strip()
+        if path:
+            out_images = load_video_frames(path, int(video_start), int(video_frames))
+            src_side = f"frames loaded from {path} ({int(out_images.shape[0])})"
+        elif images is not None:
+            out_images = images
+            src_side = "frames passed through from upstream (#16)"
+        else:
+            raise ValueError(
+                "InfoBuffer: no frames coming in - connect the decoder or set "
+                "video_path to an existing clip"
+            )
         cut, src_name = None, None
         for name, rep in (("upscale", report_upscale), ("auto", report_auto)):
             cut, src_name = parse_boundary(rep)
@@ -300,10 +363,11 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
             note = "auto found no boundary in either report - fell back to hand-filled values"
         report_out = json.dumps(
             {"cut_frame": cut_final, "redraw_start": redraw,
-             "source": note, "manual_mode": manual},
+             "frames": int(out_images.shape[0]), "frames_source": src_side,
+             "cut_source": note, "manual_mode": manual},
             ensure_ascii=False,
         )
-        return io.NodeOutput(images, cut_final, cut_final - 1, redraw, report_out)
+        return io.NodeOutput(out_images, cut_final, cut_final - 1, redraw, report_out)
 
 
 class MiniMaxH3RepairExtension(ComfyExtension):
