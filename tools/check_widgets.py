@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 comfyui-h3-hardcut contributors
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """widgets_values sanity check for every node in a ComfyUI workflow.
 
 Why this exists (2026-09-20, cost: one afternoon):

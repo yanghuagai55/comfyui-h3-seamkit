@@ -1,6 +1,6 @@
 # 硬切作业手册（跨模型协作流程）
 
-> 适用：`comfyui-h3-hardcut` + MiniMax H3 双采分块
+> 适用：`comfyui-h3-seamkit` + MiniMax H3 双采分块
 > 提示词模板：`templates/hardcut-prompt-template.md`
 > 原理与依据：`refs\H3-硬切分镜提示词工程.md`
 
@@ -30,7 +30,7 @@
 **方法 A — 命令行（最快）**
 
 ```bash
-D:\comfyui\comfyenv\python.exe D:\comfyui\ComfyUI\custom_nodes\comfyui-h3-hardcut\hardcut_math.py 8 4.25 --mp 1.5
+D:\comfyui\comfyenv\python.exe D:\comfyui\ComfyUI\custom_nodes\comfyui-h3-seamkit\hardcut_math.py 8 4.25 --mp 1.5
 ```
 
 第一个参数 = 时长，第二个 = 你**想要**切在哪（可以随便填，它会给菜单）。

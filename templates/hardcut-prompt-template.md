@@ -1,4 +1,4 @@
-# H3 硬切提示词模板（comfyui-h3-hardcut 专用）
+# H3 硬切提示词模板（comfyui-h3-seamkit 专用）
 
 > 配合节点 `MiniMaxH3HardCutPlan` + `MiniMaxH3HardCutShotPrompt`
 > 母本：`refs\H3-R2V提示词模板-官方.md`（MiniMax 官方 R2V 指南）
@@ -53,7 +53,7 @@ non_diegetic_music:
 **② 切点推荐 17 帧的整数倍**（`0.708s × k` = 独占帧，模型能放最干净的转镜）。更细的 **token 边界**（1-4 帧粒度，如 115 帧 = 00:04.792）也合法——"提前切"就靠它。17 倍数档由 `hardcut_math.py` 枚举：
 
 ```bash
-D:\comfyui\comfyenv\python.exe ...\comfyui-h3-hardcut\hardcut_math.py 8 4.25 --mp 1.5
+D:\comfyui\comfyenv\python.exe ...\comfyui-h3-seamkit\hardcut_math.py 8 4.25 --mp 1.5
 ```
 
 **②b 不等长分段（按帧切点）** —— `#48` 的 `cut_frames` 填帧，段长可以不相等：

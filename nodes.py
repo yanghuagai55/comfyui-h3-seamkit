@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 comfyui-h3-hardcut contributors
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """Hard-cut nodes for MiniMax H3 two-pass chunked upscale.
 
 Node 1 (`MiniMaxH3HardCutPlan`) turns a duration plus up to four cut times into
@@ -88,7 +88,7 @@ def aspect_options() -> list[str]:
 def default_aspect() -> str:
     return _DEFAULT_ASPECT if _DEFAULT_ASPECT in aspect_ratios() else aspect_options()[0]
 
-CATEGORY = "MiniMax H3/HardCut"
+CATEGORY = "MiniMax H3/SeamKit"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
 NO_CUT = -1.0
 

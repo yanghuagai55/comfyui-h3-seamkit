@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 comfyui-h3-hardcut contributors
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """Minimal MiniMax H3 two-pass upscale executor: hard cut + UNEQUAL window lengths.
 
 We reuse the verified "atomic" pieces from the upstream pack (the learned 3D
@@ -27,7 +27,7 @@ from comfy_api.latest import io
 from .bridge import PLAN_TYPE_STRING, find_upstream_module
 from .hardcut_math import FPS, FRAME_GRID
 
-CATEGORY = "MiniMax H3/HardCut"
+CATEGORY = "MiniMax H3/SeamKit"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
 
 PLAN_SCHEMA_LOW_SIGMA_V3 = "t8.minimax_h3.chunked_two_pass.low_sigma.v3"

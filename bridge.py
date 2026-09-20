@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 comfyui-h3-hardcut contributors
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """Bridge to the upstream MiniMax-H3 two-pass upscale node pack.
 
 The generated plan must be byte-compatible with what the pack's own LowSigma
@@ -117,7 +117,7 @@ def build_hardcut_plan(
     )
 
     hardcut = {
-        "writer": "comfyui-h3-hardcut",
+        "writer": "comfyui-h3-seamkit",
         "overlap_policy": "zero_overlap_independent_windows_hard_cut",
     }
     if geometry:

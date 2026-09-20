@@ -1,4 +1,4 @@
-# comfyui-h3-hardcut
+# comfyui-h3-seamkit
 
 **把 MiniMax H3 分块二采的「接缝」，变成一次有意识的剪辑。**
 
@@ -41,7 +41,7 @@
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/<你的账号>/comfyui-h3-hardcut.git
+git clone https://github.com/<你的账号>/comfyui-h3-seamkit.git
 ```
 
 前置条件（缺一不可）：
@@ -60,17 +60,17 @@ git clone https://github.com/<你的账号>/comfyui-h3-hardcut.git
 
 | 节点 | 分类 | 干什么 |
 |---|---|---|
-| `MiniMaxH3HardCutAuto` ★ | `MiniMax H3/HardCut` | 填时长 + 档位 + 两块 MP，自动挑切点、生成时间戳、算画布、校验提示词 |
+| `MiniMaxH3HardCutAuto` ★ | `MiniMax H3/SeamKit` | 填时长 + 档位 + 两块 MP，自动挑切点、生成时间戳、算画布、校验提示词 |
 | `MiniMaxH3HardCutPlan` | 同上 | 手填切点（秒或帧）→ 执行器用的 plan + 报告 |
 | `MiniMaxH3HardCutValidate` ★ | 同上 | 提示词体检：与 plan 不一致就抛错拦停 |
 | `MiniMaxH3HardCutShotPrompt` | 同上 | 镜头描述 → 官方 R2V 模板的 `detailed_description` |
 | `MiniMaxH3HardCutUpscale` ★ | 同上 | **二采执行器**，支持不等长分段 + 自动找真实转镜帧 |
-| `MiniMaxH3InfoBuffer` | `h3_hardcut/repair` | 暂存主片帧 + 解析 report（重绘/修复的 coordinate 换算） |
-| `MiniMaxH3SeamRepairAll` ★ | `h3_hardcut/repair` | 全包：切片 → 重绘 → 融合 → 磨平 → 叠化，一个节点做完 |
-| `MiniMaxH3RedrawBridge` | `h3_hardcut/repair` | 只做"重绘桥段"这一支 |
-| `MiniMaxH3SeamFuse` | `h3_hardcut/repair` | 把桥段按权重渐变贴回主片 |
-| `MiniMaxH3SeamBlend` | `h3_hardcut/repair` | 缝两侧两帧互相靠拢（磨平跳变） |
-| `MiniMaxH3SeamDissolve` | `h3_hardcut/repair` | 一段崩坏帧用两端做锚点叠化替换 |
+| `MiniMaxH3InfoBuffer` | `h3_seamkit/repair` | 暂存主片帧 + 解析 report（重绘/修复的 coordinate 换算） |
+| `MiniMaxH3SeamRepairAll` ★ | `h3_seamkit/repair` | 全包：切片 → 重绘 → 融合 → 磨平 → 叠化，一个节点做完 |
+| `MiniMaxH3RedrawBridge` | `h3_seamkit/repair` | 只做"重绘桥段"这一支 |
+| `MiniMaxH3SeamFuse` | `h3_seamkit/repair` | 把桥段按权重渐变贴回主片 |
+| `MiniMaxH3SeamBlend` | `h3_seamkit/repair` | 缝两侧两帧互相靠拢（磨平跳变） |
+| `MiniMaxH3SeamDissolve` | `h3_seamkit/repair` | 一段崩坏帧用两端做锚点叠化替换 |
 
 > 规划类与执行类是可独立使用的**主链路**；`repair` 类是**救急工具**，
 > 主链路跑得好的时候它们全部 bypass 即可，不影响出片。

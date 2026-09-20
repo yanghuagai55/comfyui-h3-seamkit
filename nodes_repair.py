@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 comfyui-h3-hardcut contributors
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """Pixel-domain seam repair nodes (V2): blend / fuse / dissolve on IMAGE batches.
 
 These live AFTER the AV decoder (#16 `frames` IMAGE output) and before the
@@ -28,7 +28,7 @@ import torch
 
 from comfy_api.latest import io, ComfyExtension
 
-CATEGORY = "h3_hardcut/repair"
+CATEGORY = "h3_seamkit/repair"
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +166,7 @@ class MiniMaxH3SeamBlend(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3SeamBlend",
             display_name="MiniMax H3 Seam Blend (repair)",
-            category="h3_hardcut/repair",
+            category="h3_seamkit/repair",
             inputs=[
                 io.Image.Input("images", tooltip="解码后的整片帧序列（#16 frames）"),
                 io.Int.Input(
@@ -206,7 +206,7 @@ class MiniMaxH3SeamFuse(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3SeamFuse",
             display_name="MiniMax H3 Bridge Fuse (repair)",
-            category="h3_hardcut/repair",
+            category="h3_seamkit/repair",
             inputs=[
                 io.Image.Input("images", tooltip="解码后的整片帧序列（#16 frames）"),
                 io.Image.Input(
@@ -244,7 +244,7 @@ class MiniMaxH3SeamDissolve(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3SeamDissolve",
             display_name="MiniMax H3 Seam Dissolve (repair)",
-            category="h3_hardcut/repair",
+            category="h3_seamkit/repair",
             inputs=[
                 io.Image.Input("images", tooltip="解码后的整片帧序列（#16 frames）"),
                 io.Int.Input(
@@ -274,7 +274,7 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3InfoBuffer",
             display_name="MiniMax H3 Info Buffer (repair)",
-            category="h3_hardcut/repair",
+            category="h3_seamkit/repair",
             inputs=[
                 io.Image.Input(
                     "images", optional=True,
@@ -400,7 +400,7 @@ class MiniMaxH3SeamRepair(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3SeamRepair",
             display_name="MiniMax H3 Seam Repair (One Node)",
-            category="h3_hardcut/repair",
+            category="h3_seamkit/repair",
             inputs=[
                 io.Image.Input("images", optional=True,
                                tooltip="主片帧（#16 frames）。留着快速验证：只 bypass #16 + 填 video_path"),

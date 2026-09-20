@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 comfyui-h3-hardcut contributors
-"""comfyui-h3-hardcut
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
+"""comfyui-h3-seamkit
 
 Hard-cut planning for MiniMax H3 chunked two-pass upscale.
 

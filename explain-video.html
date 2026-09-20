@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>硬切，不是硬糊 — comfyui-h3-hardcut 图解</title>
+<title>硬切，不是硬糊 — comfyui-h3-seamkit 图解</title>
 <style>
   :root{
     --bg:#151210; --panel:#1e1a16; --line:#332b23;
@@ -80,7 +80,7 @@
 <div class="player">
   <div class="stage">
     <div class="bar" id="bar"></div>
-    <div class="chip" id="chip">comfyui-h3-hardcut</div>
+    <div class="chip" id="chip">comfyui-h3-seamkit</div>
     <div id="scenes"></div>
     <div class="cap"><h2 id="h2"></h2><p id="p"></p></div>
   </div>
@@ -240,9 +240,9 @@ const SCENES = [
 
 { dur:8000, h:'开源：GPL-3.0，clone 即用', p:'它建在 T8 的 MiniMax H3 节点包之上，克隆到 custom_nodes，重启就能跑。',
   svg:`
-  <text class="t-big" x="530" y="150" text-anchor="middle">comfyui-h3-hardcut</text>
+  <text class="t-big" x="530" y="150" text-anchor="middle">comfyui-h3-seamkit</text>
   <rect x="140" y="200" width="780" height="54" rx="8" fill="#0f0d0c" stroke="#3a3129"/>
-  <text class="t-mono" x="162" y="234" fill="${GOLD}">git clone …/comfyui-h3-hardcut.git   ComfyUI/custom_nodes/</text>
+  <text class="t-mono" x="162" y="234" fill="${GOLD}">git clone …/comfyui-h3-seamkit.git   ComfyUI/custom_nodes/</text>
   <g class="fade d2">
     <rect x="140" y="282" width="380" height="96" rx="10" fill="#1b1714" stroke="#4a3f36"/>
     <text class="t-dim" x="162" y="318">前置</text>
@@ -294,7 +294,7 @@ function paint(){
   sceneEls.forEach((el,k)=>el.classList.toggle('on',k===i));
   dotEls.forEach((el,k)=>el.classList.toggle('on',k===i));
   const s=SCENES[i]; h2.textContent=s.h; p.textContent=s.p;
-  chip.textContent=`${i+1} / ${SCENES.length}　·　comfyui-h3-hardcut`;
+  chip.textContent=`${i+1} / ${SCENES.length}　·　comfyui-h3-seamkit`;
   bar.style.width='0%';
 }
 function tick(ts){

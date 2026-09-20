@@ -1,6 +1,6 @@
 # 自动硬切节点 · MiniMaxH3HardCutAuto
 
-> 来源：插件 `comfyui-h3-hardcut`（`hardcut_math.py` 的 `auto_plan` / `resolution_for`）
+> 来源：插件 `comfyui-h3-seamkit`（`hardcut_math.py` 的 `auto_plan` / `resolution_for`）
 > 提示词规范：`refs\H3-R2V提示词模板-官方.md`　·　负载锚点实测：RTX 4060 Laptop 8GB，二采 1664×928（1.544MP）
 
 > **一个节点顶替「规划 + 校验 + 拼时间戳 + 两块画布 + 帧数表达式」。**

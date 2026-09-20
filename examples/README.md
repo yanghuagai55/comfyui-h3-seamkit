@@ -7,7 +7,7 @@
 
 ## 导入
 
-1. 把 `comfyui-h3-hardcut` 放进 `ComfyUI/custom_nodes/`，**重启 ComfyUI**
+1. 把 `comfyui-h3-seamkit` 放进 `ComfyUI/custom_nodes/`，**重启 ComfyUI**
 2. 把 `硬切自动版.json` 拖进画布（或放进 `ComfyUI/user/default/workflows/`）
 3. 照画布上 `★ 怎么用` 便签跑；提示词模板见 [`templates/hardcut-prompt-template.md`](../templates/hardcut-prompt-template.md)
 
