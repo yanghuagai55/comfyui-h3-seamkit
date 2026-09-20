@@ -179,7 +179,18 @@ def main():
                 continue
             s_str, patch_path = spec.split(":", 1)
             s = int(s_str)
-            patch = read_frames(patch_path.strip())
+            patch_path = patch_path.strip()
+            ext = os.path.splitext(patch_path)[1].lower()
+            if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                img = cv2.imread(patch_path)
+                if img is None:
+                    print(f"skip S={s}: cannot read {patch_path}")
+                    continue
+                patch = [img]
+                kind = "single image"
+            else:
+                patch = read_frames(patch_path)
+                kind = f"{len(patch)} frames"
             h, w = frames[0].shape[:2]
             if patch[0].shape[:2] != (h, w):
                 print(f"skip S={s}: patch size {patch[0].shape[1]}x"
@@ -191,7 +202,7 @@ def main():
             for j, pf in enumerate(patch):
                 frames[s + j] = pf
             print(f"replaced frames {s}..{s + len(patch) - 1} "
-                  f"({len(patch)} frames from {os.path.basename(patch_path.strip())})")
+                  f"({kind} from {os.path.basename(patch_path)})")
         base, ext = os.path.splitext(args.video)
         out = args.out or f"{base}_repaired{ext or '.mp4'}"
         tmp = out + ".tmp.mp4"
