@@ -121,6 +121,21 @@ def main():
                          "linear dissolve from frame S-1 to frame E+1.  "
                          "Zero-generation fix: the span reads as a dissolve "
                          "cut, which is legitimate film grammar.")
+    ap.add_argument("--fuse", default="",
+                    help="S:E:patch.mp4 - blend the patch frames into frames "
+                         "S..E with a strength ramp instead of a hard replace. "
+                         "Use it to feather a generated bridge into the main "
+                         "clip when both versions show the same content.")
+    ap.add_argument("--fuse-side", choices=["after", "before"], default="after",
+                    help="after (default): patch weight is STRONGEST at frame "
+                         "S (right after the hard cut) and fades toward E - "
+                         "'five frames after the cut, strength high to low'. "
+                         "before: mirrored - weight rises toward E (strongest "
+                         "on the side facing the shot change).")
+    ap.add_argument("--fuse-min", type=float, default=0.0,
+                    help="patch weight at the weak end of the ramp")
+    ap.add_argument("--fuse-max", type=float, default=1.0,
+                    help="patch weight at the strong end of the ramp")
     ap.add_argument("--locate", action="store_true", help="detect candidates only")
     ap.add_argument("--k", type=float, default=4.0, help="locate threshold (x median)")
     ap.add_argument("--strength", type=float, default=0.3,
@@ -137,17 +152,20 @@ def main():
     print(f"frames={len(frames)}  diff median={np.median(diffs):.2f}  "
           f"diff max={diffs.max():.2f}")
 
-    if args.locate or not (args.seams or args.dissolve or args.replace):
+    if args.locate or not (args.seams or args.dissolve or args.replace
+                           or args.fuse):
         cands = locate(diffs, args.k)
         print("candidates (pop between S and S+1, x median):")
         for i, ratio in cands:
             print(f"  S={i:<5} diff={diffs[i]:7.2f}  ({ratio}x)")
-        if not (args.seams or args.dissolve or args.replace):
-            print("give --seams / --dissolve / --replace to repair; nothing written")
+        if not (args.seams or args.dissolve or args.replace or args.fuse):
+            print("give --seams / --dissolve / --replace / --fuse to repair; "
+                  "nothing written")
             return
 
     seams = [int(s) for s in args.seams.replace(";", ",").split(",") if s.strip()]
     strength = min(0.5, max(0.0, args.strength))
+    fixed = 0
     dissolve_fixed = 0
 
     if args.dissolve:
@@ -170,6 +188,45 @@ def main():
                   f"linear blend of f{s - 1} -> f{e + 1} "
                   f"(alpha {1 / steps:.2f} .. {(steps - 1) / steps:.2f})")
             dissolve_fixed += 1
+
+    if args.fuse:
+        fmin = min(1.0, max(0.0, args.fuse_min))
+        fmax = min(1.0, max(fmin, args.fuse_max))
+        for spec in args.fuse.replace(";", ",").split(","):
+            parts = spec.split(":", 2)  # maxsplit: Windows drive letters live in paths
+            if len(parts) != 3:
+                print(f"skip {spec!r}: expected S:E:patch.mp4")
+                continue
+            s, e = int(parts[0]), int(parts[1])
+            patch_path = parts[2].strip()
+            ext = os.path.splitext(patch_path)[1].lower()
+            if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                img = cv2.imread(patch_path)
+                patch = [img] if img is not None else []
+            else:
+                patch = read_frames(patch_path)
+            n_span = e - s + 1
+            if not patch or len(patch) != n_span:
+                print(f"skip fuse {s}:{e}: patch has {len(patch)} frames, "
+                      f"span needs {n_span}")
+                continue
+            h, w = frames[0].shape[:2]
+            if patch[0].shape[:2] != (h, w):
+                print(f"skip fuse {s}:{e}: patch size mismatch")
+                continue
+            if s < 1 or e >= len(frames) - 1:
+                print(f"skip fuse {s}:{e}: ramp anchors fall outside the clip")
+                continue
+            for j, fi in enumerate(range(s, e + 1)):
+                t = j / (n_span - 1) if n_span > 1 else 1.0
+                wp = (fmax - (fmax - fmin) * t) if args.fuse_side == "after" \
+                    else (fmin + (fmax - fmin) * t)
+                pf = patch[j].astype(np.float32)
+                mf = frames[fi].astype(np.float32)
+                frames[fi] = ((1.0 - wp) * mf + wp * pf).astype(np.uint8)
+            print(f"fused frames {s}..{e} ({args.fuse_side}, patch weight "
+                  f"{fmax:.2f} -> {fmin:.2f}): frame count untouched")
+            fixed += 1
 
     if args.replace:
         total = len(frames)
@@ -227,7 +284,6 @@ def main():
               f"{'OK' if n == total else 'FRAME COUNT MISMATCH'}")
         return
 
-    fixed = 0
     for s in seams:
         if not (0 <= s < len(frames) - 1):
             print(f"skip S={s}: outside 0..{len(frames) - 2}")
