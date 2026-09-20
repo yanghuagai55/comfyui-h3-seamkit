@@ -1016,25 +1016,6 @@ def format_report(plan: dict, note: str = "") -> str:
     lines.append(
         f"canvas ceiling: <= {plan['max_canvas_mp']:.3f} MP keeps this plan in the safe band"
     )
-    # H3 packs 4 frames per latent token (FRAME_PER_TOKEN = 1,4,4,4,4): the
-    # first frame of a group owns a token, the next three share one.  A cut
-    # that lands inside a group puts a fresh group head (full detail) right
-    # after a shared frame (softer) - measured as a one-frame sharpness step,
-    # i.e. a visible flicker.  17n % 4 == 0 iff n % 4 == 0, so n in {4,8,12}
-    # is aligned.  Only the CUT FRAMES matter; the tail length does not.
-    bad = [c for c in (plan.get("cut_frames") or []) if int(c) % 4]
-    if bad:
-        aligned = [k * FRAME_GRID for k in (4, 8, 12) if k * FRAME_GRID not in (plan.get("cut_frames") or [])]
-        lines.append(
-            f"token grid    : cut frame(s) {', '.join(f'{c}f' for c in bad)} are NOT multiples of 4 - "
-            "the seam sits inside a 4-frame token group (sharpness step -> flicker). "
-            f"Aligned cuts: {', '.join(f'{c}f (n={c // FRAME_GRID})' for c in aligned)}"
-        )
-    else:
-        lines.append(
-            "token grid    : every cut frame is a multiple of 4 - the seams land on "
-            "4-frame token-group boundaries (no sharpness step)"
-        )
     if not is_frames:
         lines.append("")
         lines += _ladder_lines(plan)
