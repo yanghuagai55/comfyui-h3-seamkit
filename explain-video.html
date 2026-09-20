@@ -26,11 +26,12 @@
   }
   .bar{position:absolute;top:0;left:0;height:3px;background:var(--hot);width:0;z-index:5;transition:width .1s linear}
   .chip{
-    position:absolute;top:14px;left:18px;z-index:4;font-size:13px;letter-spacing:.08em;
+    position:absolute;top:14px;right:18px;z-index:4;font-size:13px;letter-spacing:.08em;
     color:var(--dim);background:rgba(0,0,0,.35);border:1px solid var(--line);
     padding:4px 10px;border-radius:999px;
   }
-  .scene{position:absolute;inset:0;opacity:0;pointer-events:none;transition:opacity .45s ease}
+  /* 画面上部 74% 装图解，下部留给旁白，互不遮挡 */
+  .scene{position:absolute;left:0;right:0;top:0;height:74%;opacity:0;pointer-events:none;transition:opacity .45s ease}
   .scene.on{opacity:1}
   .scene svg{width:100%;height:100%;display:block}
   .cap{
@@ -260,7 +261,11 @@ const SCENES = [
 /* ---------- 渲染 ---------- */
 const wrap=document.getElementById('scenes'), dots=document.getElementById('dots');
 SCENES.forEach((s,i)=>{
-  const d=document.createElement('div'); d.className='scene'; d.innerHTML=s.svg; wrap.appendChild(d);
+  const d=document.createElement('div'); d.className='scene';
+  /* 关键：片段是裸 SVG 子元素，必须包一层 <svg> 才能进 SVG 命名空间，
+     否则浏览器会按未知 HTML 元素做行内排版，全部元素挤成一团 */
+  d.innerHTML='<svg viewBox="0 0 1080 500" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">'+s.svg+'</svg>';
+  wrap.appendChild(d);
   const dot=document.createElement('div'); dot.className='dot'; dot.onclick=()=>go(i); dots.appendChild(dot);
 });
 const sceneEls=[...document.querySelectorAll('.scene')];
