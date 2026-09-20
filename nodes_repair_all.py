@@ -20,6 +20,24 @@ from .nodes_repair import (
 )
 
 
+def detect_turn_frame(frames, near, win=17):
+    """Pixel-domain turn detector: strongest frame-to-frame change near `near`.
+
+    Returns (frame, score) where the change sits between frame-1 and frame -
+    i.e. `frame` is the first frame of the new shot.  Runs on a 4x spatial
+    subsample; cheap enough to call on every run.
+    """
+    total = int(frames.shape[0])
+    lo = max(1, int(near) - int(win))
+    hi = min(total - 1, int(near) + int(win))
+    if hi <= lo:
+        return int(near), 0.0
+    f = frames[:, ::4, ::4, :]
+    diffs = (f[1:] - f[:-1]).abs().mean(dim=(1, 2, 3))
+    best = max(range(lo, hi + 1), key=lambda i: float(diffs[i - 1]))
+    return int(best), float(diffs[best - 1])
+
+
 def _redraw(model, clip, vae, ref_slice, prompt, width, height, length, steps, seed):
     """Reference conditioning -> sample -> decode, using the official classes."""
     from comfy_extras.nodes_custom_sampler import (
@@ -82,10 +100,14 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                              tooltip="手动切片/重绘起点帧（manual 生效）"),
                 io.Combo.Input("fuse_side", options=["after", "before"], default="after",
                                tooltip="重绘片段融合权重方向：after = 贴切点最强、沿帧递减"),
+                io.Combo.Input("insert_mode", options=["manual", "edge"], default="manual",
+                               tooltip="插入位置怎么定：\n"
+                                       "**manual** = 切点 + fuse_offset（你自己调）；\n"
+                                       "**edge** = 图像处理自动对齐 —— 在切点附近 ±17 帧做帧差检测，\n"
+                                       "把插入位置对准真实的转镜帧（像素域 hunt）"),
                 io.Int.Input("fuse_offset", default=0, min=-17, max=17, step=1,
-                             tooltip="整段重绘片段的**整体位移**（帧）：切片与插入位置**同步移动**，\n"
-                                     "重绘内容始终与它替换的帧对齐。默认 0 = 切片起点（切点-1）；\n"
-                                     "片段整体偏后时填负数（如 -1）把整段往前挪一帧"),
+                             tooltip="manual 模式：插入位置 = 切点 + 此偏移（帧）。\n"
+                                     "−1 = 把重绘片段往前放一帧；0 = 正好在切点"),
                 io.Float.Input("fuse_min", default=0.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("fuse_max", default=1.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("blend_strength", default=0.0, min=0.0, max=0.5, step=0.01,
@@ -101,6 +123,7 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
             ],
             outputs=[
                 io.Image.Output("images", tooltip="修复后的帧序列 → 视频保存节点"),
+                io.Image.Output("redraw", tooltip="本次重绘的 N 帧（单独输出，供预览/保存对比）"),
                 io.String.Output("report", tooltip="本次都做了什么"),
             ],
             is_experimental=True,
@@ -110,7 +133,8 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
     def execute(cls, model=None, clip=None, vae=None, images=None, report="",
                 prompt="", redraw_frames=5, steps=4, seed=0, source_mode="auto",
                 manual_cut_frame=69, manual_redraw_start=68,
-                fuse_side="after", fuse_offset=0, fuse_min=0.0, fuse_max=1.0,
+                insert_mode="manual", fuse_offset=0, fuse_side="after",
+                fuse_min=0.0, fuse_max=1.0,
                 blend_strength=0.0, blend_mode="both",
                 dissolve_start=0, dissolve_end=0,
                 video_path="", video_start=0, video_frames=0):
@@ -146,14 +170,12 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
             redraw = max(0, redraw - offset)
             log.append(f"shifted by -{offset} for the partial load")
 
-        # 3. redraw
+        # 3. redraw: the slice only provides the content reference; where the
+        #    result gets INSERTED is decided below (manual offset or detection)
         n = int(redraw_frames)
         if model is None or clip is None or vae is None:
             raise ValueError("SeamRepair: wire model / clip / vae to enable the redraw")
-        # fuse_offset moves the WHOLE piece: the slice (what the model redraws)
-        # and the insert position move together, so the redrawn content stays
-        # aligned with the frames it replaces.
-        s = max(0, min(redraw + int(fuse_offset), max(0, total - 1)))
+        s = max(0, min(redraw, max(0, total - 1)))
         ref_slice = frames[s:s + n]
         if int(ref_slice.shape[0]) < 5:
             raise ValueError(
@@ -161,20 +183,26 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                 f"(start {s}) - H3 needs at least 5"
             )
         height, width = int(ref_slice.shape[1]), int(ref_slice.shape[2])
-        log.append(f"slice: frames {s}..{s + int(ref_slice.shape[0]) - 1} "
-                   f"@ {width}x{height} (auto size)"
-                   + (f" [offset {int(fuse_offset):+d}]" if int(fuse_offset) else ""))
+        log.append(f"slice (content reference): frames {s}..{s + int(ref_slice.shape[0]) - 1} "
+                   f"@ {width}x{height}")
         redrawed = _redraw(model, clip, vae, ref_slice, prompt, width, height,
                            int(ref_slice.shape[0]), int(steps), int(seed))
         log.append(f"redraw: {int(redrawed.shape[0])} frames, {int(steps)} steps, seed {int(seed)}")
 
-        # 4. fuse at the very same place the slice came from
-        insert_at = s
+        # 4. where to insert: manual (cut + offset) or edge detection (the real
+        #    turn frame near the cut, found by frame-difference)
+        if insert_mode == "edge":
+            detected, score = detect_turn_frame(frames, int(cut))
+            insert_at = int(detected)
+            log.append(f"insert: EDGE detection -> frame {insert_at} "
+                       f"(delta {score:.2f}, searched cut {cut} +/- 17)")
+        else:
+            insert_at = max(0, int(cut) + int(fuse_offset))
+            log.append(f"insert: manual -> cut {cut} + offset {int(fuse_offset)} = frame {insert_at}")
         out = fuse_frames(frames, redrawed, int(insert_at), fuse_side,
                           float(fuse_min), float(fuse_max))
-        log.append(f"fuse: insert at frame {insert_at} (slice start, content-aligned), "
-                   f"{min(int(redrawed.shape[0]), total - int(insert_at))} frame(s), "
-                   f"side={fuse_side}")
+        log.append(f"fuse: {min(int(redrawed.shape[0]), total - int(insert_at))} frame(s) "
+                   f"at {insert_at}, side={fuse_side}")
         if int(out.shape[0]) != total:
             log.append(f"WARN frame count changed: {total} -> {int(out.shape[0])}")
 
@@ -199,10 +227,11 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
         report_out = json.dumps(
             {"frames_in": total, "frames_out": int(out.shape[0]),
              "bridge_frames": int(redrawed.shape[0]),
-             "cut_frame": int(cut), "slice_start": s, "fuse_at": insert_at,
+             "cut_frame": int(cut), "slice_start": s,
+             "insert_mode": insert_mode, "fuse_at": insert_at,
              "redraw_frames": n, "size": [width, height], "steps": log},
             ensure_ascii=False, indent=1)
-        return io.NodeOutput(out, report_out)
+        return io.NodeOutput(out, redrawed, report_out)
 
 
 class MiniMaxH3RepairAllExtension(ComfyExtension):
