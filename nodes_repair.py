@@ -380,6 +380,141 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
         return io.NodeOutput(out_images, cut_final, cut_final - 1, redraw, report_out)
 
 
+class MiniMaxH3SeamRepair(io.ComfyNode):
+    """One node for the whole repair chain: slice -> fuse -> blend -> dissolve.
+
+    Wiring is deliberately minimal:
+      images  <- decoder frames (optional when video_path is set)
+      bridge  <- the redraw branch's decoded frames (optional)
+      report  <- the upscale report (optional; parsed for the cut frame)
+      images  -> video save
+      ref_slice -> the redraw branch's ref_videos (5-frame slice)
+    Everything else (cut/seam/redraw frames, offsets, ramps) is computed here.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3SeamRepair",
+            display_name="MiniMax H3 Seam Repair (One Node)",
+            category="h3_hardcut/repair",
+            inputs=[
+                io.Image.Input("images", optional=True,
+                               tooltip="主片帧（#16 frames）。留着快速验证：只 bypass #16 + 填 video_path"),
+                io.Image.Input("bridge", optional=True,
+                               tooltip="桥段重绘分支解码后的帧（#69）。桥段组 bypass 时缺参 = 自动跳过融合"),
+                io.String.Input("report", optional=True, default="",
+                                tooltip="#40 的 report（JSON）——auto 模式解析切点"),
+                io.Combo.Input("source_mode", options=["auto", "manual"], default="auto",
+                               tooltip="auto = 从 report 解析切点/重绘起点；manual = 用下面手填值"),
+                io.Int.Input("manual_cut_frame", default=69, min=1,
+                             tooltip="手动切点帧（manual 生效）——缝在它与前一帧之间"),
+                io.Int.Input("manual_redraw_start", default=68, min=0,
+                             tooltip="手动重绘/切片起点帧（manual 生效）"),
+                io.Int.Input("redraw_frames", default=5, min=5, max=39,
+                             tooltip="给桥段的参考切片长度（H3 锚定合法长度 5/22/39）"),
+                io.Combo.Input("fuse_side", options=["after", "before"], default="after",
+                               tooltip="桥段融合权重方向：after = 贴切点最强、沿帧递减"),
+                io.Float.Input("fuse_min", default=0.0, min=0.0, max=1.0, step=0.01),
+                io.Float.Input("fuse_max", default=1.0, min=0.0, max=1.0, step=0.01),
+                io.Float.Input("blend_strength", default=0.0, min=0.0, max=0.5, step=0.01,
+                               tooltip="缝磨平强度（0 = 关；0.3 ≈ 跳变降 40%）"),
+                io.Combo.Input("blend_mode", options=["both", "prev", "next"], default="both"),
+                io.Int.Input("dissolve_start", default=0, min=0,
+                             tooltip="崩帧叠化区间起点（0 = 关）"),
+                io.Int.Input("dissolve_end", default=0, min=0,
+                             tooltip="崩帧叠化区间末帧"),
+                io.String.Input("video_path", default="",
+                                tooltip="★ 快速验证：填成片路径即从它加载帧（配合只 bypass #16）"),
+                io.Int.Input("video_start", default=0, min=0),
+                io.Int.Input("video_frames", default=0, min=0, tooltip="0 = 全部"),
+            ],
+            outputs=[
+                io.Image.Output("images", tooltip="修复后的帧序列 → 视频保存节点"),
+                io.Image.Output("ref_slice", tooltip="给桥段的参考切片 → ReferenceToVideo.ref_videos"),
+                io.String.Output("report", tooltip="本次都做了什么（解析 + 各步状态）"),
+            ],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, images=None, bridge=None, report="", source_mode="auto",
+                manual_cut_frame=69, manual_redraw_start=68, redraw_frames=5,
+                fuse_side="after", fuse_min=0.0, fuse_max=1.0,
+                blend_strength=0.0, blend_mode="both",
+                dissolve_start=0, dissolve_end=0,
+                video_path="", video_start=0, video_frames=0):
+        steps = []
+        # 1. frame source
+        path = (video_path or "").strip()
+        offset = 0
+        if path:
+            offset = max(0, int(video_start))
+            frames = load_video_frames(path, offset, int(video_frames))
+            steps.append(f"frames from {path} ({int(frames.shape[0])}, offset {offset})")
+        elif images is not None:
+            frames = images
+            steps.append(f"frames from upstream ({int(frames.shape[0])})")
+        else:
+            raise ValueError("SeamRepair: no frames - wire the decoder or set video_path")
+
+        # 2. cut / redraw frames
+        parsed, src_tag = parse_boundary(report)
+        manual = source_mode == "manual"
+        if manual or parsed is None:
+            cut = int(manual_cut_frame)
+            redraw = int(manual_redraw_start)
+            steps.append("cut/redraw: " + ("manual" if manual else "manual (auto found nothing)"))
+        else:
+            cut = parsed
+            redraw = parsed - 1
+            steps.append(f"cut/redraw: auto from {src_tag} (cut {cut})")
+        if offset:
+            cut = max(0, cut - offset)
+            redraw = max(0, redraw - offset)
+            steps.append(f"shifted by -{offset} for the partial load")
+
+        # 3. reference slice for the redraw branch
+        n_ref = int(redraw_frames)
+        s = max(0, min(int(redraw), max(0, int(frames.shape[0]) - 1)))
+        ref_slice = frames[s:s + n_ref]
+        if int(ref_slice.shape[0]) < n_ref:
+            steps.append(f"WARN ref_slice short: {int(ref_slice.shape[0])}/{n_ref} frames")
+
+        # 4. fuse the bridge in
+        out = frames
+        if bridge is not None and bridge.numel() > 0:
+            n = min(int(bridge.shape[0]), int(frames.shape[0]) - int(cut))
+            out = fuse_frames(frames, bridge, int(cut), fuse_side,
+                              float(fuse_min), float(fuse_max))
+            steps.append(f"fuse: {n} frame(s) from the bridge, side={fuse_side}")
+        else:
+            steps.append("fuse: skipped (no bridge - bridge group bypassed)")
+
+        # 5. seam blend
+        seam = max(0, int(cut) - 1)
+        if float(blend_strength) > 0 and seam < out.shape[0] - 1:
+            a, b = blend_pair(out[seam], out[seam + 1], float(blend_strength), blend_mode)
+            out = out.clone()
+            out[seam], out[seam + 1] = a, b
+            steps.append(f"blend: seam {seam}|{seam + 1} at {float(blend_strength):.2f}")
+        else:
+            steps.append("blend: off")
+
+        # 6. dissolve a corrupted span
+        ds, de = int(dissolve_start), int(dissolve_end)
+        if ds > 0 and de > ds and de < out.shape[0] - 1:
+            out = dissolve_span(out, ds, de)
+            steps.append(f"dissolve: frames {ds}..{de}")
+        elif ds > 0:
+            steps.append("dissolve: span invalid - skipped")
+
+        report_out = json.dumps(
+            {"cut_frame": int(cut), "seam_frame": seam, "redraw_start": s,
+             "steps": steps}, ensure_ascii=False, indent=1)
+        return io.NodeOutput(out, ref_slice, report_out)
+
+
 class MiniMaxH3RepairExtension(ComfyExtension):
     async def get_node_list(self):
         return [
