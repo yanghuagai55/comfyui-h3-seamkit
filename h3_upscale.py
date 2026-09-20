@@ -226,27 +226,40 @@ def _sample_fullframe(
 
 
 def _latent_change_profile(video, win: int = 2) -> list:
-    """Every token boundary scored against its own neighbourhood - NO threshold.
+    """Every token boundary scored TWICE - no threshold anywhere.
 
-    `[(token_index, ratio), ...]` for all boundaries; the change sits between
-    that token and the next one.  Kept threshold-free because the caller knows
-    where to look (the planned cuts) and busy footage never clears a fixed
-    ratio anyway.
+    `[(token_index, local_ratio, global_ratio), ...]` for all boundaries; the
+    change sits between that token and the next one.
+
+    * `local_ratio`  = d[i] / median(d[i-win : i+win+1]) - does this boundary
+      stand out from ITS OWN neighbourhood (the original score).
+    * `global_ratio` = d[i] / median(d) - the whole clip is the baseline.
+
+    Measured 2026-09-20 (planned cut 68, seam landed on 85 = 17 frames off;
+    report top_candidates `[[85, 2.04], [68, 1.68], [51, 1.62]]`): the LOCAL
+    score is actively misleading AT a turn, because a smeared turn raises the
+    median of the very neighbourhood it sits in - the turn's own score drops,
+    while a quiet stretch two grids away wins on a tiny wobble.  The global
+    score has no such blind spot (same clip in the pixel domain: turn 2.72x
+    median, quiet stretch 1.25x).  Callers therefore RANK by `global_ratio`
+    and keep `local_ratio` only to describe how eventful the window is.
     """
     v = video.detach().float()
     if v.ndim != 5 or v.shape[2] < 3:
         return []
     d = (v[:, :, 1:] - v[:, :, :-1]).abs().mean(dim=(0, 1, 3, 4))
     n = int(d.numel())
+    gmed = float(d.median())
+    if gmed <= 0:
+        return []
     out = []
     for i in range(n):
         lo, hi = max(0, i - win), min(n, i + win + 1)
         med = float(d[lo:hi].median())
         if med <= 0:
             continue
-        out.append((i, float(d[i]) / med))
+        out.append((i, float(d[i]) / med, float(d[i]) / gmed))
     return out
-
 
 def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     """First-pass latent -> the tokens where the model changed shots (no VAE).
@@ -281,142 +294,127 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     return sorted(kept)
 
 
+FLAT_RATIO = 1.1    # below this a tolerance window counts as featureless
+
+
 def _align_to_profile(
     profile, planned, tolerance: int, video_tokens: int, side: str = "before"
 ):
-    """Per planned cut: the strongest latent change within `tolerance` frames.
+    """Per planned cut: the strongest latent change in the window, then SNAP it
+    onto the exclusive-frame grid the window start requires.
 
-    `side` picks which side of the visible turn the window boundary sits on:
-    **before** (default) takes the strongest exclusive-frame candidate
-    regardless of side - in practice the front shoulder of the turn, so the
-    seam lands just before the shot change; **after** keeps only candidates
-    AT or AFTER the strongest one, so the seam lands on the next strong
-    change inside the new shot.  Both sides are exclusive frames only -
-    shared-group heads corrupt the window (measured).  If `after` finds
-    nothing within tolerance the cut falls back to `before` with a note.
+    ★ Why snap instead of argmax over exclusive frames (measured 2026-09-20,
+    symptom: "the seam is ~16 frames off"): `_latent_change_profile`
+    normalises every token by its OWN +-2 neighbourhood, so the two shoulders
+    of a turn RAISE the median right where the turn is and LOWER that token's
+    score, while a quiet stretch two grids away scores high on a tiny wobble.
+    Choosing the best exclusive frame therefore walked away from the turn with
+    the plan as prior: planned 68, real turn ~66 -> chosen 85 with ratio 2.04
+    while the turn itself only scored 1.68.  The turn is the signal; the
+    exclusive frame is only a constraint on where the WINDOW may start.  So
+    find the peak anywhere in the window first, then snap THAT to the closest
+    multiple of FRAME_GRID.
 
-    Returns `(aligned, boundary_tokens)`.  `aligned` carries the per-cut report
-    including the top candidates, so the latent's behaviour near the cut is
+    Both sides only ever emit exclusive-frame boundaries - a shared-group head
+    corrupts the window (measured 2026-09-19/20, same seed: start 68 clean,
+    start 69 corrupted 4 frames).
+
+    Returns `(aligned, boundary_tokens)`; `aligned` carries the per-cut report
+    including the top candidates, so the latent's behaviour near the cut stays
     visible instead of a bare accept/reject.
     """
     core = _core()
+    total_frames = core.frames_for_tokens(int(video_tokens))
+
+    def frame_of(idx):
+        # the change sits between token `idx` and `idx+1`
+        return core.frames_for_tokens(int(idx) + 1)
+
+    def token_of(frame):
+        for t in range(1, int(video_tokens)):
+            if core.frames_for_tokens(t) == int(frame):
+                return t
+        return None
+
     aligned, boundary_tokens = [], []
     for cut in planned:
-        # Window starts MUST be exclusive frames (multiples of 17).  Measured
-        # 2026-09-19/20, same seed+prompt: start 68 (exclusive) -> clean output;
-        # start 69 (shared-group head) -> the whole second window corrupted.
-        # A turn lives inside token CONTENT, so a shared-group token must never
-        # be the first thing a window re-anchors on.  Non-exclusive candidates
-        # are reported but never adopted.
-        cands = []
-        blocked = []
-        for idx, r in profile:
-            if not (0 < int(idx) + 1 < int(video_tokens)):
-                continue
-            fr = core.frames_for_tokens(int(idx) + 1)
-            if abs(fr - cut) > tolerance:
-                continue
-            (cands if fr % FRAME_GRID == 0 else blocked).append((idx, r))
-        if not cands:
-            if blocked:
-                top = [
-                    [core.frames_for_tokens(int(i) + 1), round(float(r), 2)]
-                    for i, r in sorted(blocked, key=lambda x: -x[1])[:3]
-                ]
-                aligned.append({
-                    "planned_cut": cut,
-                    "moved": False,
-                    "note": (
-                        "strongest latent change near the cut sits on a "
-                        "shared-group start (corrupted a window once) - "
-                        "exclusive-frame starts only, keeping the planned cut"
-                    ),
-                    "top_candidates": top,
-                })
+        window = [
+            (idx, lr, gr) for idx, lr, gr in profile
+            if 0 < int(idx) + 1 < int(video_tokens)
+            and abs(frame_of(idx) - cut) <= tolerance
+        ]
+        if not window:
             continue
-        cands.sort(key=lambda x: -x[1])
-        front_idx, front_ratio = cands[0]
-        best_idx, best_ratio = front_idx, front_ratio
-        after_note = None
+        # rank by the GLOBAL score: the local one suppresses the turn itself
+        window.sort(key=lambda x: -x[2])
+        peak_idx, peak_local, peak_ratio = window[0]
+        peak_frame = frame_of(peak_idx)
+        top = [[frame_of(i), round(float(gr), 2)] for i, _lr, gr in window[:3]]
+        note = None
+
         if side == "after":
             later = sorted(
-                (
-                    pair
-                    for pair in cands
-                    if core.frames_for_tokens(int(pair[0]) + 1)
-                    > core.frames_for_tokens(int(front_idx) + 1)
-                ),
-                key=lambda x: -x[1],
+                (pair for pair in window if frame_of(pair[0]) > peak_frame),
+                key=lambda x: -x[2],
             )
-            if later and later[0][1] >= 1.1:
-                best_idx, best_ratio = later[0]
-                after_note = (
-                    "side=after: boundary moved past the turn onto the next "
-                    "strong exclusive-frame change inside the new shot"
-                )
+            if later and later[0][2] >= FLAT_RATIO:
+                peak_idx, peak_local, peak_ratio = later[0]
+                peak_frame = frame_of(peak_idx)
+                note = ("side=after: boundary moved past the turn onto the next "
+                        "strong change inside the new shot")
             else:
-                after_note = (
-                    "side=after: no strong exclusive-frame candidate after the "
-                    "turn within tolerance - kept the before-side boundary"
-                )
-        top = [
-            [core.frames_for_tokens(int(i) + 1), round(float(r), 2)]
-            for i, r in cands[:3]
-        ]
-        if best_ratio < 1.1:
+                note = ("side=after: nothing stronger after the turn within "
+                        "tolerance - kept the before-side boundary")
+
+        if peak_ratio < FLAT_RATIO:
             aligned.append({
                 "planned_cut": cut,
                 "moved": False,
-                "note": f"latent is flat near the cut (best ratio {best_ratio:.2f} < 1.1)",
+                "note": (f"latent is flat near the cut "
+                         f"(peak ratio {peak_ratio:.2f} < {FLAT_RATIO})"),
                 "top_candidates": top,
             })
             continue
-        token = int(best_idx) + 1
-        frame = core.frames_for_tokens(token)
-        # Shoulder takeover (user-requested): a smeared turn fires on BOTH
-        # sides of its transition token - the strongest diff sits on the FRONT
-        # shoulder while the visible shot change sits on the BACK one.  When
-        # the next boundary is nearly as strong, prefer it so the seam lands
-        # on the first new-shot frame.  If that boundary is a shared-group
-        # head, warn loudly: the upscaler corrupted such a window start once
-        # (4 frames) and the repair is a pixel-domain frame replacement.
-        note = None
-        for idx, r in cands:
-            if int(idx) != int(best_idx) + 1:
-                continue
-            nxt = core.frames_for_tokens(int(idx) + 1)
-            if (r >= SHOULDER_TAKEOVER * best_ratio
-                    and 0 < nxt - frame <= FRAME_GRID
-                    and abs(nxt - cut) <= tolerance):
-                token, frame = int(idx) + 1, nxt
-                if frame % FRAME_GRID:
-                    note = (
-                        "shoulder takeover: boundary moved to the back shoulder "
-                        f"(frame {frame}, shared-group head) - the seam lands on "
-                        "the first new-shot frame, but this window start has "
-                        "corrupted before; expect to replace its frames "
-                        "(repair_seam.py --replace)"
-                    )
-                else:
-                    note = (
-                        "shoulder takeover: boundary moved to the back shoulder "
-                        "(exclusive frame) - the seam lands on the first "
-                        "new-shot frame"
-                    )
-            break
+
+        # ★ snap the measured turn onto the exclusive-frame grid.  NEAREST wins:
+        # nudging the seam a frame or two towards the turn is harmless, walking
+        # to another grid point is what produced the 16-frame miss.
+        final_frame = peak_frame
+        if peak_frame % FRAME_GRID:
+            lo = (peak_frame // FRAME_GRID) * FRAME_GRID
+            hi = lo + FRAME_GRID
+            snapped = lo if (peak_frame - lo) <= (hi - peak_frame) else hi
+            snapped = max(FRAME_GRID, min(snapped, total_frames - FRAME_GRID))
+            if snapped != peak_frame:
+                note = "; ".join(x for x in (
+                    note,
+                    f"snapped the measured turn {peak_frame} -> {snapped} "
+                    f"(nearest exclusive frame)",
+                ) if x)
+                final_frame = snapped
+
+        token = token_of(final_frame)
+        if token is None:
+            # unreachable for multiples of FRAME_GRID - kept as a guard
+            token, final_frame = int(peak_idx) + 1, peak_frame
         if token not in boundary_tokens:
             boundary_tokens.append(token)
-        aligned.append({
+        entry = {
             "planned_cut": cut,
-            "moved": frame != cut,
+            "moved": final_frame != cut,
             "boundary_token": token,
-            "boundary_frame": frame,
-            "ratio": round(float(best_ratio), 2),
+            "boundary_frame": final_frame,
+            "ratio": round(float(peak_ratio), 2),
+            "local_ratio": round(float(peak_local), 2),
             "top_candidates": top,
-        })
-        if after_note:
-            aligned[-1]["note"] = after_note
+        }
+        if final_frame != peak_frame:
+            entry["measured_turn_frame"] = peak_frame
+        if note:
+            entry["note"] = note
+        aligned.append(entry)
     return aligned, boundary_tokens
+
 
 
 def execute(
