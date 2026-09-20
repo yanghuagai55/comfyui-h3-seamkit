@@ -42,8 +42,11 @@ MAX_SECONDS = 15.0       # requested ceiling for this helper
 MIN_TAIL_SECONDS = 2.0   # a trailing window shorter than this is not worth a cut
 
 # 8 GB empirical load anchors (frames x megapixels of the second-pass canvas)
-LOAD_PASS = 210.0        # known-good
-LOAD_FAIL = 236.2        # measured CUDA OOM
+# 2026-09-20 re-measured WITH the quality LoRAs enabled: 191 now OOMs, ~180 is
+# the practical ceiling.  (The older 210 / 236.2 anchors were measured on the
+# bare model - keep them in mind when you disable the LoRAs again.)
+LOAD_PASS = 180.0        # known-good with quality LoRAs on
+LOAD_FAIL = 191.0        # measured CUDA OOM with the LoRAs on
 
 
 # --------------------------------------------------------------------------
