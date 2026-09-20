@@ -37,6 +37,12 @@ from .nodes import (
     MiniMaxH3HardCutValidate,
 )
 from .h3_upscale import MiniMaxH3HardCutUpscale
+from .nodes_repair import (
+    MiniMaxH3RepairExtension,
+    MiniMaxH3SeamBlend,
+    MiniMaxH3SeamDissolve,
+    MiniMaxH3SeamFuse,
+)
 
 __all__ = ["comfy_entrypoint"]
 
@@ -49,6 +55,9 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3HardCutValidate,
             MiniMaxH3HardCutShotPrompt,
             MiniMaxH3HardCutUpscale,
+            MiniMaxH3SeamBlend,
+            MiniMaxH3SeamFuse,
+            MiniMaxH3SeamDissolve,
         ]
 
 
