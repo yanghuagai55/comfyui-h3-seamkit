@@ -152,7 +152,7 @@ class MiniMaxH3SeamBlend(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images: torch.Tensor, seam_frame: int, strength: float, mode: str):
+    def execute(cls, images: torch.Tensor, seam_frame=67, strength=0.0, mode="both"):
         if strength <= 0:
             return io.NodeOutput(images)
         s = int(seam_frame)
@@ -195,8 +195,8 @@ class MiniMaxH3SeamFuse(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images: torch.Tensor, bridge, start_frame: int, side: str,
-                fuse_min: float, fuse_max: float):
+    def execute(cls, images: torch.Tensor, bridge=None, start_frame=69, side="after",
+                fuse_min=0.0, fuse_max=1.0):
         out = fuse_frames(images, bridge, int(start_frame), side,
                           float(fuse_min), float(fuse_max))
         return io.NodeOutput(out)
