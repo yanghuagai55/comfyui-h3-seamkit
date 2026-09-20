@@ -332,9 +332,12 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
                 manual_cut_frame=69, manual_redraw_start=68,
                 video_path="", video_start=0, video_frames=0):
         path = (video_path or "").strip()
+        offset = 0
         if path:
-            out_images = load_video_frames(path, int(video_start), int(video_frames))
-            src_side = f"frames loaded from {path} ({int(out_images.shape[0])})"
+            offset = max(0, int(video_start))
+            out_images = load_video_frames(path, offset, int(video_frames))
+            src_side = (f"frames loaded from {path} "
+                        f"({int(out_images.shape[0])} frames, offset {offset})")
         elif images is not None:
             out_images = images
             src_side = "frames passed through from upstream (#16)"
@@ -361,6 +364,13 @@ class MiniMaxH3InfoBuffer(io.ComfyNode):
             note = f"auto: parsed from {src_name}"
         else:
             note = "auto found no boundary in either report - fell back to hand-filled values"
+        if offset:
+            # a partial load shifts the frame numbering: report the frames in
+            # the NEW sequence's coordinates, and say so, so downstream nodes
+            # (fuse start / blend seam / slice) line up with the loaded clip.
+            cut_final = max(0, cut_final - offset)
+            redraw = max(0, redraw - offset)
+            note = f"{note}; frame numbers shifted by -{offset} for the partial load"
         report_out = json.dumps(
             {"cut_frame": cut_final, "redraw_start": redraw,
              "frames": int(out_images.shape[0]), "frames_source": src_side,
