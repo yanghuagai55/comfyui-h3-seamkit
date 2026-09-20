@@ -82,6 +82,10 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                              tooltip="手动切片/重绘起点帧（manual 生效）"),
                 io.Combo.Input("fuse_side", options=["after", "before"], default="after",
                                tooltip="重绘片段融合权重方向：after = 贴切点最强、沿帧递减"),
+                io.Int.Input("fuse_offset", default=0, min=-17, max=17, step=1,
+                             tooltip="重绘片段的插入位置微调（帧）。默认 0 = 从切片起点\n"
+                                     "（切点-1）开始 —— 与参考片段逐帧对齐；片段整体偏后时填负数\n"
+                                     "（如 -1）往前挪"),
                 io.Float.Input("fuse_min", default=0.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("fuse_max", default=1.0, min=0.0, max=1.0, step=0.01),
                 io.Float.Input("blend_strength", default=0.0, min=0.0, max=0.5, step=0.01,
@@ -106,7 +110,7 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
     def execute(cls, model=None, clip=None, vae=None, images=None, report="",
                 prompt="", redraw_frames=5, steps=4, seed=0, source_mode="auto",
                 manual_cut_frame=69, manual_redraw_start=68,
-                fuse_side="after", fuse_min=0.0, fuse_max=1.0,
+                fuse_side="after", fuse_offset=0, fuse_min=0.0, fuse_max=1.0,
                 blend_strength=0.0, blend_mode="both",
                 dissolve_start=0, dissolve_end=0,
                 video_path="", video_start=0, video_frames=0):
@@ -160,10 +164,17 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
                            int(ref_slice.shape[0]), int(steps), int(seed))
         log.append(f"redraw: {int(redrawed.shape[0])} frames, {int(steps)} steps, seed {int(seed)}")
 
-        # 4. fuse
-        out = fuse_frames(frames, redrawed, int(cut), fuse_side,
+        # 4. fuse: the redraw's first frame lines up with the slice's first
+        #    frame, so the insert starts at the slice start (not at the cut);
+        #    fuse_offset nudges it further (+/- frames) when needed.
+        insert_at = max(0, s + int(fuse_offset))
+        out = fuse_frames(frames, redrawed, int(insert_at), fuse_side,
                           float(fuse_min), float(fuse_max))
-        log.append(f"fuse: {min(int(redrawed.shape[0]), total - int(cut))} frame(s), side={fuse_side}")
+        log.append(f"fuse: insert at frame {insert_at} (slice start {s} + offset "
+                   f"{int(fuse_offset)}), {min(int(redrawed.shape[0]), total - int(insert_at))} "
+                   f"frame(s), side={fuse_side}")
+        if int(out.shape[0]) != total:
+            log.append(f"WARN frame count changed: {total} -> {int(out.shape[0])}")
 
         # 5. seam blend
         seam = max(0, int(cut) - 1)
@@ -184,8 +195,11 @@ class MiniMaxH3SeamRepairAll(io.ComfyNode):
             log.append("dissolve: span invalid - skipped")
 
         report_out = json.dumps(
-            {"cut_frame": int(cut), "slice_start": s, "redraw_frames": n,
-             "size": [width, height], "steps": log}, ensure_ascii=False, indent=1)
+            {"frames_in": total, "frames_out": int(out.shape[0]),
+             "bridge_frames": int(redrawed.shape[0]),
+             "cut_frame": int(cut), "slice_start": s, "fuse_at": insert_at,
+             "redraw_frames": n, "size": [width, height], "steps": log},
+            ensure_ascii=False, indent=1)
         return io.NodeOutput(out, report_out)
 
 
