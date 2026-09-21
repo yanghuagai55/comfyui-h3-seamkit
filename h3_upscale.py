@@ -80,9 +80,98 @@ def _snap_boundary(frame: int, video_tokens: int, step: int = 1):
     return min(choices, key=lambda item: abs(item[1] - int(frame)))
 
 
+def find_calm_boundaries(
+    profile,
+    planned,
+    aligned,
+    frame_count: int,
+    *,
+    window: int = 34,
+    overlap_frames: int = 17,
+    deviation_threshold: int = 17,
+    min_sep: int = 34,
+    grid: int = FRAME_GRID,
+):
+    """Decide, per planned cut, WHERE to actually put the window boundary.
+
+    A cut whose hunt entry carries a boundary close to the plan is trustworthy
+    (the model really turns there) -> keep it and hard-cut (overlap 0).
+
+    Anything else (hunt rejected it, or it points far away) means we are about
+    to cut through continuous content, so instead of cutting at the plan we look
+    for the CALMEST exclusive frame within `window` of it: the token whose
+    global latent-change score is lowest, i.e. the least eventful moment.  The
+    boundary goes there and that seam gets `overlap_frames` of anchored prefix,
+    so the sampler continues from the previous window instead of starting cold.
+
+    Returns (boundaries, overlaps, notes) - one entry per planned cut - where
+    `boundaries` are frame numbers and `overlaps` the per-seam overlap in frames
+    (0 = hard cut).  Never returns an empty boundary: an unsearchable cut falls
+    back to its planned frame.
+    """
+    # global score per token; the profile rows are (idx, local, global)
+    score = {}
+    for row in profile or ():
+        try:
+            idx, _local, glob = int(row[0]), row[1], float(row[2])
+        except (TypeError, IndexError, ValueError):
+            continue
+        score[idx] = glob
+    entry_by_cut = {}
+    for e in aligned or ():
+        try:
+            entry_by_cut[int(e.get("planned_cut"))] = e
+        except (TypeError, ValueError):
+            continue
+
+    boundaries, overlaps, notes = [], [], []
+    for cut in planned:
+        cut = int(cut)
+        entry = entry_by_cut.get(cut) or {}
+        b = entry.get("boundary_frame")
+        if b is not None and abs(int(b) - cut) <= int(deviation_threshold):
+            boundaries.append(int(b))
+            overlaps.append(0)
+            notes.append(f"cut {cut}: hunt reliable (boundary {b}) -> hard cut")
+            continue
+
+        # candidates: exclusive frames inside the window, away from the others
+        lo, hi = max(grid, cut - int(window)), min(frame_count - grid, cut + int(window))
+        cands = [f for f in range(lo, hi + 1, grid) if f % grid == 0]
+        cands = [
+            f for f in cands
+            if all(abs(f - other) >= int(min_sep) for other in planned if int(other) != cut)
+        ]
+        if not cands:
+            boundaries.append(cut)
+            overlaps.append(0)
+            notes.append(f"cut {cut}: no calm candidate in window -> keep plan (hard cut)")
+            continue
+
+        def tok_of(frame):
+            # frames here are exclusive anchors: frame 17k starts token 5k
+            # (FRAME_PER_TOKEN=(1,4,4,4,4) puts a 1-frame token every 17 frames)
+            return int(frame) // int(grid) * 5
+
+        best = min(cands, key=lambda f: score.get(tok_of(f), float("inf")))
+        if score.get(tok_of(best), float("inf")) == float("inf"):
+            boundaries.append(cut)
+            overlaps.append(0)
+            notes.append(f"cut {cut}: profile has no score here -> keep plan (hard cut)")
+            continue
+        boundaries.append(int(best))
+        overlaps.append(int(overlap_frames))
+        notes.append(
+            f"cut {cut}: hunt unreliable (boundary {b}, ratio {entry.get('ratio')}) "
+            f"-> calm frame {best} (score {score.get(tok_of(best)):.2f}), "
+            f"overlap {int(overlap_frames)}f"
+        )
+    return boundaries, overlaps, notes
+
+
 def explicit_segments(
     video_tokens: int, total_frames: int, cut_frames, token_step: int = 1,
-    overlap_frames: int = 0,
+    overlap_frames: int = 0, overlap_per_cut=None,
 ) -> list:
     """Explicit cut-frame list -> UNEQUAL window bounds.
 
@@ -148,9 +237,13 @@ def explicit_segments(
     # pull every boundary back onto a multiple of 17.
     bounds = [0] + [fr for _f, _t, fr in snapped] + [int(total_frames)]
     segments = []
-    ov = max(0, int(overlap_frames))
+    ov_default = max(0, int(overlap_frames))
+    # per-seam overlap: one entry per cut (i.e. per interior boundary); a shorter
+    # list falls back to `overlap_frames`, a longer one is truncated
+    ov_list = [max(0, int(x)) for x in (overlap_per_cut or [])]
     for i in range(len(bounds) - 1):
         lo, hi = bounds[i], bounds[i + 1]
+        ov = ov_list[i - 1] if 0 < i <= len(ov_list) else ov_default
         # overlap: keep the cut (hi) where it is, pull this window's start back
         if i > 0 and ov:
             lo = max(0, lo - ov)
@@ -171,14 +264,14 @@ def explicit_segments(
                    if ov else "")
             )
         segments.append((start_token, start_frame, end_token, end_frame))
-    if ov and len(segments) > 1:
+    if ov_default and len(segments) > 1:
         # the sampler needs the start to land strictly inside the previous
         # window, i.e. overlap < shortest window length
         shortest = min(e - s for _st, s, _et, e in segments)
-        if ov >= shortest:
+        if ov_default >= shortest:
             raise ValueError(
-                f"overlap_frames={ov} must be smaller than the shortest window "
-                f"({shortest} frames)"
+                f"overlap_frames={ov_default} must be smaller than the shortest "
+                f"window ({shortest} frames)"
             )
     return segments
 
@@ -550,6 +643,25 @@ def execute(
         if seam_hunt_note:
             seam_hunt["note"] = seam_hunt_note
 
+    # ---- adaptive: if the hunt could not vouch for a cut, move that boundary to
+    # the CALMEST frame nearby and give that seam an anchored overlap, instead of
+    # cutting through continuous content.  Needs the hunt's profile, so it only
+    # runs when auto_seam_hunt is on.
+    calm_boundaries = None
+    calm_overlaps = None
+    if auto_seam_hunt and planned and isinstance(plan.get("hardcut"), dict):
+        _hc = plan["hardcut"]
+        if _hc.get("auto_calm_search"):
+            calm_boundaries, calm_overlaps, _calm_notes = find_calm_boundaries(
+                profile, planned, aligned, frame_count,
+                window=int(_hc.get("calm_search_window", 34)),
+                overlap_frames=int(_hc.get("calm_overlap_frames", 17)),
+                deviation_threshold=int(_hc.get("deviation_threshold", 17)),
+            )
+            segment_frames = calm_boundaries
+            for _n in _calm_notes:
+                print(f"[HardCut]   calm: {_n}", flush=True)
+
     # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
     # overlap tokens: when > 0 each window's START is pulled back so the sampler
     # can anchor its first token on the previous window (see anchor_conditioning
@@ -575,6 +687,7 @@ def execute(
         segments = explicit_segments(
             int(video.shape[2]), frame_count, segment_frames,
             overlap_frames=ov_tokens,
+            overlap_per_cut=calm_overlaps,
         )
     elif plan.get("temporal_strategy") == "full_clip_safe":
         segments = [(0, 0, int(video.shape[2]), frame_count)]
@@ -640,7 +753,11 @@ def execute(
 
     accumulated = None
     segment_reports = []
+    prev_end_frame = None
     for start_token, start_frame, end_token, end_frame in segments:
+        # how much this window re-reads from the published output: > 0 only when
+        # a seam asked for an anchored prefix (the calm search sets it per cut)
+        seg_overlap = max(0, (prev_end_frame or 0) - int(start_frame)) if prev_end_frame is not None else 0
         chunk_video = video[:, :, start_token:end_token].contiguous()
         audio_start = round(start_frame * core.FRAME_RESCALE)
         audio_end = min(audio.shape[-1], round(end_frame * core.FRAME_RESCALE))
@@ -659,7 +776,7 @@ def execute(
         # what was already generated instead of starting cold at a hard cut.
         # With overlap 0 there is nothing for it to anchor to - upstream raises
         # "previous chunk does not reach the next chunk anchor" - so it stays off.
-        if ov_tokens and accumulated is not None:
+        if seg_overlap and accumulated is not None:
             chunk_conditioning = core.anchor_conditioning(
                 chunk_conditioning,
                 accumulated,
@@ -693,15 +810,19 @@ def execute(
             chunk_noise_video,
             chunk_noise_audio,
         )
-        if ov_tokens:
+        if seg_overlap:
             # guarded overlap: the first `locked_overlap` tokens stay exactly as
             # the previous window published them, the remaining `transition`
             # tokens take this window's fresh sample, then the rest is appended.
             accumulated, _ov, _tr = core._append_video_guarded_overlap(
-                accumulated, sampled, start_token, locked_overlap
+                accumulated, sampled, start_token,
+                max(0, min(int(locked_overlap), seg_overlap)) if locked_overlap else seg_overlap,
             )
+            print(f"[HardCut]   window {len(segment_reports)}: anchored prefix "
+                  f"{seg_overlap} frames at {start_frame}", flush=True)
         else:
             accumulated = core._append_video(accumulated, sampled, start_token)
+        prev_end_frame = int(end_frame)
         segment_reports.append(
             {
                 "index": len(segment_reports),
@@ -717,6 +838,8 @@ def execute(
         "status": "completed",
         "segment_count": len(segments),
         "unequal_lengths": bool(segment_frames),
+        "calm_boundaries": list(calm_boundaries) if calm_boundaries else None,
+        "calm_overlaps": list(calm_overlaps) if calm_overlaps else None,
         "lengths": [r["length_frames"] for r in segment_reports],
         "segments": segment_reports,
     }
