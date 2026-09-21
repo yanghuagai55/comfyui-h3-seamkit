@@ -1179,6 +1179,7 @@ def validate_prompt(
     check_load: bool = True,
     chunk_frames: int | None = None,
     overlap_frames: int = 0,
+    overlap_anchored: bool = False,
     segment_frames: Iterable[float] | None = None,
 ) -> dict:
     """Check that a hand-written R2V prompt really describes the plan's hard cut.
@@ -1387,13 +1388,25 @@ def validate_prompt(
                     {"frame": f, "next_declared": p} for f, p in early
                 ]
             for frame in missing[:MAX_LISTED]:
-                errors.append(
-                    f"the executor cuts at frame {frame} ({timecode(frame)}) but the "
-                    "prompt declares no 'At MM:SS.mmm' there — a window boundary is a "
-                    "hard break (no context crosses it), so the model has to be told "
-                    "to change shot at that exact frame. Declared: "
+                _msg = (
+                    f"executor boundary frame {frame} ({timecode(frame)}) has no matching "
+                    "'At MM:SS.mmm' in the prompt. Declared: "
                     + (", ".join(timecode(p) for p in prompt_frames) or "(none)")
                 )
+                if overlap_anchored:
+                    # The seam is stitched with an anchored overlap, so the window
+                    # boundary no longer has to coincide with a model shot change:
+                    # the sampler continues from the previous window and the
+                    # boundary may sit in continuous content on purpose.
+                    warnings.append(
+                        _msg + "  — acceptable: overlap/calm-search is on, so the seam is "
+                        "anchored instead of relying on a model cut here."
+                    )
+                else:
+                    errors.append(
+                        _msg + "  — a window boundary is a hard break (no context crosses "
+                        "it), so the model has to be told to change shot at that exact frame."
+                    )
             extra = [
                 p for p in prompt_frames if not any(abs(p - t) <= 1 for t in truth)
             ]

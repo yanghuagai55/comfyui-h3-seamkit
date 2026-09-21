@@ -749,8 +749,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                 requested_cuts=list(info["actual_cuts"]),
                 canvas_mp=canvas_mp,
                 chunk_frames=plan_chunk,
-                overlap_frames=0,
+                overlap_frames=max(0, int(overlap_frames)),
                 segment_frames=list(info["cut_frames"]),
+                overlap_anchored=bool(auto_calm_search) or int(overlap_frames) > 0,
             )
             out_prompt = incoming
             errors = result.get("errors") or []
@@ -793,8 +794,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     requested_cuts=list(info["actual_cuts"]),
                     canvas_mp=canvas_mp,
                     chunk_frames=plan_chunk,
-                    overlap_frames=0,
+                    overlap_frames=max(0, int(overlap_frames)),
                     segment_frames=list(info["cut_frames"]),
+                    overlap_anchored=bool(auto_calm_search) or int(overlap_frames) > 0,
                 )
                 late = recheck.get("errors") or []
                 if late:
