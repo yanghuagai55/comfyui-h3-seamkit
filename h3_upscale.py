@@ -574,18 +574,21 @@ def execute(
             )
             for entry in seam_hunt.get("aligned") or []:
                 moved = entry.get("moved")
-                print(
-                    f"[HardCut]   cut planned={entry.get('planned_cut')} -> "
-                    f"boundary={entry.get('boundary_frame')} "
-                    f"(moved={moved}"
-                    + (
-                        f", measured={entry.get('measured_turn_frame')}"
-                        if entry.get("measured_turn_frame") is not None
-                        else ""
-                    )
-                    + f", ratio={entry.get('ratio')})",
-                    flush=True,
+                planned_cut = entry.get("planned_cut")
+                boundary = entry.get("boundary_frame")
+                if boundary is None:
+                    head = (f"[HardCut]   cut planned={planned_cut} -> boundary=None "
+                            f"(NOT accepted, moved={moved}")
+                else:
+                    offset = int(boundary) - int(planned_cut)
+                    head = (f"[HardCut]   cut planned={planned_cut} -> "
+                            f"boundary={boundary} (offset={offset:+d}f, moved={moved}")
+                tail = (
+                    (f", measured={entry.get('measured_turn_frame')}"
+                     if entry.get("measured_turn_frame") is not None else "")
+                    + f", ratio={entry.get('ratio')})"
                 )
+                print(head + tail, flush=True)
             if seam_hunt.get("note"):
                 print(f"[HardCut]   note: {seam_hunt['note']}", flush=True)
     except Exception as _log_exc:  # pragma: no cover - logging must never fail the run
