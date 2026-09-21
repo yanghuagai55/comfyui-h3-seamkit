@@ -129,7 +129,16 @@ def find_calm_boundaries(
         cut = int(cut)
         entry = entry_by_cut.get(cut) or {}
         b = entry.get("boundary_frame")
-        if b is not None and abs(int(b) - cut) <= int(deviation_threshold):
+        # refs to keep clear of: everything already emitted + the cuts still to
+        # come (so two seams can never collapse onto the same frame - that used
+        # to merge two windows and double the load)
+        pending_cuts = [int(c) for c in planned if int(c) != cut]
+        refs = boundaries + pending_cuts
+        if (
+            b is not None
+            and abs(int(b) - cut) <= int(deviation_threshold)
+            and all(abs(int(b) - int(o)) >= int(min_sep) for o in refs)
+        ):
             boundaries.append(int(b))
             overlaps.append(0)
             notes.append(f"cut {cut}: hunt reliable (boundary {b}) -> hard cut")
@@ -138,10 +147,7 @@ def find_calm_boundaries(
         # candidates: exclusive frames inside the window, away from the others
         lo, hi = max(grid, cut - int(window)), min(frame_count - grid, cut + int(window))
         cands = [f for f in range(lo, hi + 1, grid) if f % grid == 0]
-        cands = [
-            f for f in cands
-            if all(abs(f - other) >= int(min_sep) for other in planned if int(other) != cut)
-        ]
+        cands = [f for f in cands if all(abs(f - int(o)) >= int(min_sep) for o in refs)]
         if not cands:
             boundaries.append(cut)
             overlaps.append(0)
@@ -814,9 +820,14 @@ def execute(
             # guarded overlap: the first `locked_overlap` tokens stay exactly as
             # the previous window published them, the remaining `transition`
             # tokens take this window's fresh sample, then the rest is appended.
+            # upstream counts TOKENS here, we hold a frame count: 17 frames = 5
+            # tokens (a token covers 4 frames, plus one exclusive frame per block)
+            _locked_tokens = (
+                max(0, min(int(locked_overlap), seg_overlap)) if locked_overlap
+                else seg_overlap
+            ) * 5 // FRAME_GRID
             accumulated, _ov, _tr = core._append_video_guarded_overlap(
-                accumulated, sampled, start_token,
-                max(0, min(int(locked_overlap), seg_overlap)) if locked_overlap else seg_overlap,
+                accumulated, sampled, start_token, _locked_tokens
             )
             print(f"[HardCut]   window {len(segment_reports)}: anchored prefix "
                   f"{seg_overlap} frames at {start_frame}", flush=True)
