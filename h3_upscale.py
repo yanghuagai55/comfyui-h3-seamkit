@@ -539,15 +539,22 @@ def execute(
     try:
         lengths = [int(e) - int(s) for _st, s, _et, e in segments]
         longest = max(lengths) if lengths else 0
-        boundaries = (
-            list(seam_hunt.get("boundary_frames") or [])
-            if seam_hunt
-            else list(segment_frames or [])
+        # the FINAL boundaries are what the windows actually ended on: every
+        # segment's end frame except the last one.  Reporting only the hunt's
+        # accepted frames was misleading - a cut that fell back to its planned
+        # frame (because the anchor killed the latent change) showed up as
+        # "boundary=None" while the windows were split exactly on it.
+        boundaries = [int(e) for _st, _sf, _et, e in segments][:-1]
+        hunted = [int(f) for f in (seam_hunt or {}).get("boundary_frames") or []]
+        src_tag = ", ".join(
+            f"{b}{'' if b in hunted else '*'}" for b in boundaries
         )
         print(
             f"[HardCut] planned_cuts={planned or '-'} "
-            f"boundary_frames={boundaries or '-'} "
-            f"segments={len(segments)} lengths={lengths} longest={longest}f",
+            f"boundary_frames=[{src_tag or '-'}] "
+            f"segments={len(segments)} lengths={lengths} longest={longest}f"
+            + ("   (* = kept on the planned frame, hunt found no turn there)"
+               if any(b not in hunted for b in boundaries) else ""),
             flush=True,
         )
         if seam_hunt:
