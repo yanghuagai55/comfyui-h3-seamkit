@@ -117,8 +117,12 @@ updated["minimax_visual_cond_noise_aug"] = max(0.0, min(1.0, float(strength)))
 for cut in planned_cuts:
     entry = hunt_entry(cut)
 
-    # ① 可靠：检测到转镜，且离计划点不远 → 硬切（边界不动，overlap=0）
-    if entry.boundary is not None and |entry.boundary − cut| <= deviation_threshold:
+    # ① 可靠：hunt 的边界与【模型实际转镜】的残差在容忍内 → 硬切
+    #    ★ 判据是 |boundary − measured|，不是 |measured − cut|：
+    #      hunt 已经把边界吸附到独占帧网格上，所以"计划偏 15 帧"完全可能
+    #      吸附后只剩 2 帧残差（计划 187 / 实测 202 → 边界 204）。
+    #      只有"吸附后仍对不上"才算不可靠。
+    if entry.boundary is not None and |entry.boundary − entry.measured| <= seam_tolerance:
         emit(boundary = entry.boundary, overlap = 0)
         continue
 
@@ -161,7 +165,7 @@ for cut in planned_cuts:
 | 参数 | 位置 | 默认 | 说明 |
 |---|---|---|---|
 | `overlap_frames` | `#56` / `#48` | 0 | 全局段间重叠（帧；UI step=17 但**执行器不做倍数取整**，非倍数值经 token 边吸附（1–4 帧分辨率）生效；送到采样器前钳制到 `< chunk`） |
-| `seam_tolerance_frames` | `#56` | **17**（复用，未新增参数） | **一值两用**：① hunt 采纳半径（检测到的转镜离计划点超过它即判误检）② **平缓搜索的触发阈值**——模型实际转镜（`measured`）与计划切点的差超过它 → 该缝转 overlap（想更敏感就把它调到 3~4） |
+| `seam_tolerance_frames` | `#56` | **17**（复用，未新增参数） | **一值两用**：① hunt 采纳半径（检测到的转镜离计划点超过它即判误检）② **硬切 / overlap 的判据**——**hunt 吸附后的边界与模型实际转镜的残差**超过它 → 该缝转 overlap。注意它**不是**「实测与计划」的差：吸附本身会消掉大部分计划偏差（计划 187 / 实测 202 → 边界 204，残差仅 2）。想更敏感就调到 **3~4** |
 | `auto_calm_search` | `#56`（新增） | `false` | 启用自适应平缓搜索 |
 | `calm_search_window` | `#56`（新增） | 34 | 搜索半径（帧），`cut ± window` 内找最平缓的独占帧 |
 | `calm_overlap_frames` | `#56`（新增） | 17 | 平缓缝使用的 overlap |
@@ -266,5 +270,5 @@ for cut in planned_cuts:
 导致 `overlap_frames` 的接入静默失败而提交信息仍然声称完成。
 现在所有脚本化编辑一律断言「**旧文本消失 且 新文本出现**」，否则报错退出。
 
-**当前状态**：6 项原始单测 + 3 项反例回归 **全部通过**（见 §6.1）；
+**当前状态**：6 项原始单测 + 3 项反例回归 + 4 项残差判据 **全部通过**（见 §6.1）；
 成片级（视觉）验证仍为**开放项**（§7）。
