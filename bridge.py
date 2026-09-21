@@ -79,6 +79,7 @@ def build_hardcut_plan(
     target_height: int,
     chunk_frames: int,
     anchor_strength: float,
+    overlap_frames: int = 0,
     precision: str,
     release_policy: str,
     second_pass_audio_policy: str,
@@ -101,7 +102,7 @@ def build_hardcut_plan(
         target_width=int(target_width),
         target_height=int(target_height),
         temporal_chunk_frames=int(chunk_frames),
-        temporal_overlap_frames=0,
+        temporal_overlap_frames=max(0, int(overlap_frames)),
         anchor_strength=float(anchor_strength),
         tile_width=int(target_width),
         tile_height=int(target_height),
@@ -116,9 +117,13 @@ def build_hardcut_plan(
         second_pass_audio_policy=second_pass_audio_policy,
     )
 
+    _ov = max(0, int(overlap_frames))
     hardcut = {
         "writer": "comfyui-h3-seamkit",
-        "overlap_policy": "zero_overlap_independent_windows_hard_cut",
+        "overlap_policy": (
+            "zero_overlap_independent_windows_hard_cut" if not _ov
+            else f"guarded_overlap_anchored_prefix_{_ov}f"
+        ),
     }
     if geometry:
         hardcut["geometry"] = dict(geometry)
@@ -147,7 +152,7 @@ def _fallback_plan(**kw) -> dict[str, Any]:
         "target_width": width,
         "target_height": height,
         "temporal_chunk_frames": int(kw["temporal_chunk_frames"]),
-        "temporal_overlap_frames": 0,
+        "temporal_overlap_frames": max(0, int(kw.get("temporal_overlap_frames") or 0)),
         "anchor_strength": float(kw["anchor_strength"]),
         "tile_width": width,
         "tile_height": height,

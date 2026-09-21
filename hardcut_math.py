@@ -309,9 +309,15 @@ def enumerate_plans(
 # load estimate
 # --------------------------------------------------------------------------
 
-def estimate_load(segments: Sequence[tuple[int, int]], canvas_mp: float) -> dict:
-    """Second-pass peak load = longest window (frames) x canvas megapixels."""
-    longest = max(e - s for s, e in segments)
+def estimate_load(
+    segments: Sequence[tuple[int, int]], canvas_mp: float, overlap: int = 0
+) -> dict:
+    """Second-pass peak load = longest window (frames) x canvas megapixels.
+
+    With overlap > 0 every window also re-reads `overlap` frames of the one
+    before it, so the sampler's real work is longest + overlap frames.
+    """
+    longest = max(e - s for s, e in segments) + max(0, int(overlap))
     load = longest * float(canvas_mp)
     if load <= LOAD_PASS:
         verdict = "SAFE"
@@ -327,9 +333,9 @@ def estimate_load(segments: Sequence[tuple[int, int]], canvas_mp: float) -> dict
     }
 
 
-def max_canvas_mp(segments: Sequence[tuple[int, int]]) -> float:
+def max_canvas_mp(segments: Sequence[tuple[int, int]], overlap: int = 0) -> float:
     """Largest second-pass canvas that still fits the known-good load anchor."""
-    longest = max(e - s for s, e in segments)
+    longest = max(e - s for s, e in segments) + max(0, int(overlap))
     return LOAD_PASS / longest
 
 
@@ -816,12 +822,16 @@ def _manual_entry_lines(plan: dict) -> list[str]:
     chunk = plan["chunk"]
     total = plan["total_frames"]
     lines = ["--- MANUAL ENTRY (same values in the upscaler pack's own plan node) ---"]
+    _ov_manual = int(plan.get("temporal_overlap_frames") or 0)
     lines.append(
         f"  temporal_chunk_frames    = {chunk}"
         f"        (17 x {chunk // FRAME_GRID};  node range 17..3600, step 17)"
     )
     lines.append(
-        "  temporal_overlap_frames  = 0              (mandatory for a hard cut)"
+        f"  temporal_overlap_frames  = {_ov_manual}"
+        + ("   (zero = hard cut)"
+           if not _ov_manual else
+           "   (anchored prefix: each window starts back and pins its first token)")
     )
     lines.append(
         "  temporal_strategy        = guarded_overlap_exp   (this is what enables windowing)"

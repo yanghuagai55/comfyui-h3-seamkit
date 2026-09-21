@@ -261,6 +261,21 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                         "并用 `#56` 的 `seam_tolerance_frames` 核对。"
                     ),
                 ),
+                io.Int.Input(
+                    "overlap_frames",
+                    default=0,
+                    min=0,
+                    max=2048,
+                    step=17,
+                    tooltip=(
+                        "★ 段间重叠（帧，17 的倍数）。0 = 硬切（现在的行为）。\n"
+                        "> 0 时每段的**起点向前回看本值帧**，采样器把该段第一个 token "
+                        "锚在上一段已生成的结果上（强度 = anchor_strength），接缝因此"
+                        "不再是两条独立结果的硬拼。\n"
+                        "**送入采样器的值会被自动压到 < chunk**（一整个窗口就没内容可生成了）。\n"
+                        "负载按 (最长段 + 本值) 算：15s/1.5MP 下 **17 已经到 178.5，34 会爆**。"
+                    ),
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -291,6 +306,7 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
         anchor_strength: float,
         second_pass_audio_policy: str,
         cut_offset_frames: int,
+        overlap_frames: int = 0,
     ):
         # cut slots are 17-frame BLOCK COUNTS: n x 17 = the cut frame.
         # -1 (or anything < 1) means "no cut in this slot".  Different n
@@ -556,6 +572,21 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "会一起改，保持自洽。填 0 = 不改写。"
                     ),
                 ),
+                io.Int.Input(
+                    "overlap_frames",
+                    default=0,
+                    min=0,
+                    max=2048,
+                    step=17,
+                    tooltip=(
+                        "★ 段间重叠（帧，17 的倍数）。0 = 硬切（现在的行为）。\n"
+                        "> 0 时每段的**起点向前回看本值帧**，采样器把该段第一个 token "
+                        "锚在上一段已生成的结果上（强度 = anchor_strength），接缝因此"
+                        "不再是两条独立结果的硬拼。\n"
+                        "**送入采样器的值会被自动压到 < chunk**（一整个窗口就没内容可生成了）。\n"
+                        "负载按 (最长段 + 本值) 算：15s/1.5MP 下 **17 已经到 178.5，34 会爆**。"
+                    ),
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -594,6 +625,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         second_pass_sigma0: float,
         seam_tolerance_frames: int,
         prompt_shift_frames: int,
+        overlap_frames: int = 0,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
