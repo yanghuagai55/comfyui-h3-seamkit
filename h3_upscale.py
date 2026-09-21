@@ -301,7 +301,11 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
     return sorted(kept)
 
 
-FLAT_RATIO = 1.1    # below this a tolerance window counts as featureless
+# A weak global score means the window holds no real shot change - only a
+# wobble or a busy-motion stretch - so the cut stays where the plan put it.
+# Measured 2026-09-20 on a 15s render: real turns score 2.0-2.5, a false one
+# (motion peak mistaken for a turn) scored 1.49 and moved a cut 17 frames.
+FLAT_RATIO = 1.8     # below this a tolerance window counts as featureless
 
 
 def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
