@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 
 import torch
+import comfy.model_management
 
 import comfy.nested_tensor
 
@@ -699,6 +700,12 @@ def execute(
     # below).  The knob is free to set, but the value that actually reaches the
     # sampler is clamped below one full window - an overlap of a whole window
     # would leave nothing new to generate.
+    # Unequal windows + anchored prefixes give every segment a different shape,
+    # so PyTorch's caching allocator cannot reuse the previous block and the
+    # pool fragments upward run after run.  Releasing the cached blocks between
+    # segments keeps the footprint flat; the models stay loaded (this is
+    # soft_empty_cache, never unload_all_models).
+    _empty_between = bool((plan.get("hardcut") or {}).get("empty_cache_between_segments", True))
     ov_input = max(0, int(plan.get("temporal_overlap_frames", 0)))
     _chunk = int(plan.get("temporal_chunk_frames") or 0)
     ov_tokens = ov_input
@@ -859,6 +866,23 @@ def execute(
         else:
             accumulated = core._append_video(accumulated, sampled, start_token)
         prev_end_frame = int(end_frame)
+        try:
+            _free, _total = torch.cuda.mem_get_info()
+            print(
+                f"[HardCut]   seg {len(segment_reports)} done: "
+                f"alloc {torch.cuda.memory_allocated()/2**30:.2f}GB  "
+                f"reserved {torch.cuda.memory_reserved()/2**30:.2f}GB  "
+                f"device-free {_free/2**30:.2f}GB",
+                flush=True,
+            )
+            if _empty_between:
+                comfy.model_management.soft_empty_cache()
+                _free2, _ = torch.cuda.mem_get_info()
+                if _free2 - _free > 32 * 2**20:
+                    print(f"[HardCut]   cache released: +{(_free2-_free)/2**30:.2f}GB free",
+                          flush=True)
+        except Exception as _mm_exc:
+            print(f"[HardCut]   mem probe skipped: {_mm_exc}", flush=True)
         segment_reports.append(
             {
                 "index": len(segment_reports),
