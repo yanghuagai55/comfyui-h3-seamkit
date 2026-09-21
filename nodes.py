@@ -315,8 +315,10 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
         slots = [cut_1, cut_2, cut_3, cut_4][:CUT_SLOTS]
         seg_frames = [float(int(n) * FRAME_GRID) for n in slots if int(n) > 0] or None
         cuts = []
+        _ov = max(0, int(overlap_frames))
         info = plan_hard_cut(
-            total_seconds, cuts, canvas_megapixels, chunk_step, seg_frames
+            total_seconds, cuts, canvas_megapixels, chunk_step, seg_frames,
+            overlap=_ov,
         )
 
         # The plan carries `temporal_chunk_frames` for the upstream builder's
@@ -672,7 +674,16 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         second_w, second_h = resolution_for(second_megapixels, w_ratio, h_ratio, multiple)
         canvas_mp = second_w * second_h / 1_000_000.0
 
-        info = auto_plan(total_seconds, chunk_step, canvas_mp)
+        # The window sizing must reserve room for the overlap the executor will
+        # actually use: calm search brings its own anchored overlap, so plan the
+        # segments against THAT, or a calm seam pushes the longest window past
+        # the load line (15s layout: 157.5 -> 183.7).
+        _effective_overlap = (
+            max(0, int(calm_overlap_frames)) if auto_calm_search
+            else max(0, int(overlap_frames))
+        )
+        info = auto_plan(total_seconds, chunk_step, canvas_mp,
+                         overlap=_effective_overlap)
 
         plan_chunk = info["longest"]
         if plan_chunk % FRAME_GRID:

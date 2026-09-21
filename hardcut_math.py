@@ -472,6 +472,7 @@ def plan_hard_cut(
     canvas_mp: float = 1.0,
     chunk_step: int = 0,
     segment_frames: Iterable[float] | None = None,
+    overlap: int = 0,
 ) -> dict:
     """Full plan: duration, windowing, cuts, load.
 
@@ -550,7 +551,7 @@ def plan_hard_cut(
         "cut_mode": cut_mode,
         "cut_slots": CUT_SLOTS,
         "segment_frames": seg_frames,
-        "overlap": 0,
+        "overlap": max(0, int(overlap)),
         "segments": segs,
         "segment_lengths": [e - s for s, e in segs],
         "cut_frames": frames,
@@ -561,11 +562,12 @@ def plan_hard_cut(
         "tail_seconds": seconds_for_frames(tail),
         "tail_ok": tail >= min_tail,
         "min_tail_frames": min_tail,
-        "load": estimate_load(segs, canvas_mp),
-        "max_canvas_mp": max_canvas_mp(segs),
+        "load": estimate_load(segs, canvas_mp, overlap),
+        "max_canvas_mp": max_canvas_mp(segs, overlap),
         "canvas_mp": float(canvas_mp),
         "alternatives": alternatives,
         "ladder": ladder,
+        "overlap_used": max(0, int(overlap)),
     }
 
 
@@ -601,6 +603,7 @@ def auto_plan(
     chunk_step: int,
     canvas_mp: float = 1.0,
     max_segments: int = 10,
+    overlap: int = 0,
 ) -> dict:
     """Fully automatic cut planning from a chunk STEP (17-frame 档位).
 
@@ -660,8 +663,8 @@ def auto_plan(
             "chunk_frames": chunk_frames,
             "max_segment_seconds": max_segment_seconds,
             "max_frames": chunk_frames,
-            "load": estimate_load(segs, canvas_mp),
-            "max_canvas_mp": max_canvas_mp(segs),
+            "load": estimate_load(segs, canvas_mp, overlap),
+            "max_canvas_mp": max_canvas_mp(segs, overlap),
             "canvas_mp": float(canvas_mp),
             "variance": variance,
             "cut_mode": "frames",
