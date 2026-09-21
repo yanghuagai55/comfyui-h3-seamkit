@@ -514,6 +514,49 @@ def execute(
             int(plan["temporal_overlap_frames"]),
         )
 
+    # ---- log the cut decisions NOW ----
+    # The report only lands when the whole second pass is finished, and a 15s
+    # render takes minutes; without this you stare at a black console while the
+    # thing decides where to split.  Never let logging break a run.
+    try:
+        lengths = [int(e) - int(s) for _st, s, _et, e in segments]
+        longest = max(lengths) if lengths else 0
+        boundaries = (
+            list(seam_hunt.get("boundary_frames") or [])
+            if seam_hunt
+            else list(segment_frames or [])
+        )
+        print(
+            f"[HardCut] planned_cuts={planned or '-'} "
+            f"boundary_frames={boundaries or '-'} "
+            f"segments={len(segments)} lengths={lengths} longest={longest}f",
+            flush=True,
+        )
+        if seam_hunt:
+            print(
+                f"[HardCut]   tolerance={seam_hunt.get('tolerance_frames')}f "
+                f"hunt={'on' if auto_seam_hunt else 'off'}",
+                flush=True,
+            )
+            for entry in seam_hunt.get("aligned") or []:
+                moved = entry.get("moved")
+                print(
+                    f"[HardCut]   cut planned={entry.get('planned_cut')} -> "
+                    f"boundary={entry.get('boundary_frame')} "
+                    f"(moved={moved}"
+                    + (
+                        f", measured={entry.get('measured_turn_frame')}"
+                        if entry.get("measured_turn_frame") is not None
+                        else ""
+                    )
+                    + f", ratio={entry.get('ratio')})",
+                    flush=True,
+                )
+            if seam_hunt.get("note"):
+                print(f"[HardCut]   note: {seam_hunt['note']}", flush=True)
+    except Exception as _log_exc:  # pragma: no cover - logging must never fail the run
+        print(f"[HardCut] log error: {_log_exc}", flush=True)
+
     accumulated = None
     segment_reports = []
     for start_token, start_frame, end_token, end_frame in segments:
