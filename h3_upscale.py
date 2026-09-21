@@ -305,7 +305,9 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
 # wobble or a busy-motion stretch - so the cut stays where the plan put it.
 # Measured 2026-09-20 on a 15s render: real turns score 2.0-2.5, a false one
 # (motion peak mistaken for a turn) scored 1.49 and moved a cut 17 frames.
-FLAT_RATIO = 1.8     # below this a tolerance window counts as featureless
+# Measured on the convrot weights: real turns score 1.82-1.91, a false one (motion peak) scored 1.51.  1.6 splits them with margin - 1.8 sat right on
+# top of the real turns and risked dropping them too.
+FLAT_RATIO = 1.6     # below this a tolerance window counts as featureless
 
 
 def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
@@ -480,6 +482,22 @@ def execute(
         if boundary_tokens:
             boundary_tokens.sort()
             cand = [core.frames_for_tokens(t) for t in boundary_tokens]
+            # ★ A cut the hunt did not accept (flat window) must fall back to
+            # the PLANNED frame, not disappear: dropping it merges two windows
+            # into one and blows the load (measured: 85/187/272 -> only 85/187
+            # kept -> segments [85,102,175], last one 175f instead of 90f ->
+            # OOM on the first run).
+            accepted = {
+                int(e["boundary_frame"])
+                for e in aligned
+                if e.get("boundary_frame") is not None
+            }
+            extra = [int(c) for c in planned if int(c) not in accepted]
+            if extra:
+                seam_hunt_note = (
+                    f"hunt found no usable change near {extra}; keeping the planned cut(s)"
+                )
+            cand = sorted({int(c) for c in cand} | set(extra))
             tail = frame_count - cand[-1]
             if tail < FRAME_GRID:
                 seam_hunt_note = (
