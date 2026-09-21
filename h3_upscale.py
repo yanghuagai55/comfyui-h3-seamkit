@@ -487,12 +487,21 @@ def execute(
             # into one and blows the load (measured: 85/187/272 -> only 85/187
             # kept -> segments [85,102,175], last one 175f instead of 90f ->
             # OOM on the first run).
-            accepted = {
-                int(e["boundary_frame"])
-                for e in aligned
-                if e.get("boundary_frame") is not None
-            }
-            extra = [int(c) for c in planned if int(c) not in accepted]
+            # "unaccepted" means THIS cut's own entry carries no boundary - NOT
+            # "its planned frame is absent from the boundary list".  A cut the
+            # hunt MOVED (85 -> 68) is accepted; falling back for it as well
+            # added a duplicate boundary and split off a 17-frame sliver
+            # (measured: boundaries [68,85,170,187,272] -> segments
+            # [68,17,85,17,85,90], i.e. six samples instead of three).
+            extra = []
+            for cut in planned:
+                entry = next(
+                    (e for e in aligned
+                     if int(e.get("planned_cut", -1)) == int(cut)),
+                    None,
+                )
+                if entry is None or entry.get("boundary_frame") is None:
+                    extra.append(int(cut))
             if extra:
                 seam_hunt_note = (
                     f"hunt found no usable change near {extra}; keeping the planned cut(s)"
