@@ -81,7 +81,8 @@ def _snap_boundary(frame: int, video_tokens: int, step: int = 1):
 
 
 def explicit_segments(
-    video_tokens: int, total_frames: int, cut_frames, token_step: int = 1
+    video_tokens: int, total_frames: int, cut_frames, token_step: int = 1,
+    overlap_frames: int = 0,
 ) -> list:
     """Explicit cut-frame list -> UNEQUAL window bounds.
 
@@ -89,6 +90,13 @@ def explicit_segments(
     1-4 frame resolution; `token_step=5` = the coarse 17-frame grid).
     `cut_frames` is in frames; 0 and the clip end are implied and must not be
     listed.
+
+    `overlap_frames` > 0 keeps every CUT where it is but moves each window's
+    START back by that many frames, so window i+1 re-reads the tail of window i.
+    That overlap is what lets the sampler anchor its first token on the previous
+    window's output (see `anchor_conditioning`) instead of starting cold at a
+    hard boundary.  It must stay below the shortest window or the window would
+    collapse onto itself.
 
     Every cut is validated against the grid *by the number the caller wrote*,
     before any bounds are built, so a rejected cut is always reported with that
@@ -140,8 +148,12 @@ def explicit_segments(
     # pull every boundary back onto a multiple of 17.
     bounds = [0] + [fr for _f, _t, fr in snapped] + [int(total_frames)]
     segments = []
+    ov = max(0, int(overlap_frames))
     for i in range(len(bounds) - 1):
         lo, hi = bounds[i], bounds[i + 1]
+        # overlap: keep the cut (hi) where it is, pull this window's start back
+        if i > 0 and ov:
+            lo = max(0, lo - ov)
         if lo == 0:
             start_token, start_frame = 0, 0
         else:
@@ -155,8 +167,19 @@ def explicit_segments(
                 f"window {i} collapses to {end_token} token(s) (frames {start_frame}.."
                 f"{end_frame}); cuts must sit on distinct 17-frame grid points, away "
                 "from both the clip start and the clip end."
+                + (f" overlap_frames={ov} is too large for this window."
+                   if ov else "")
             )
         segments.append((start_token, start_frame, end_token, end_frame))
+    if ov and len(segments) > 1:
+        # the sampler needs the start to land strictly inside the previous
+        # window, i.e. overlap < shortest window length
+        shortest = min(e - s for _st, s, _et, e in segments)
+        if ov >= shortest:
+            raise ValueError(
+                f"overlap_frames={ov} must be smaller than the shortest window "
+                f"({shortest} frames)"
+            )
     return segments
 
 
@@ -528,17 +551,38 @@ def execute(
             seam_hunt["note"] = seam_hunt_note
 
     # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
+    # overlap tokens: when > 0 each window's START is pulled back so the sampler
+    # can anchor its first token on the previous window (see anchor_conditioning
+    # below).  The knob is free to set, but the value that actually reaches the
+    # sampler is clamped below one full window - an overlap of a whole window
+    # would leave nothing new to generate.
+    ov_input = max(0, int(plan.get("temporal_overlap_frames", 0)))
+    _chunk = int(plan.get("temporal_chunk_frames") or 0)
+    ov_tokens = ov_input
+    if _chunk > 0 and ov_input >= _chunk:
+        ov_tokens = max(0, _chunk - 1)
+    locked_overlap = max(
+        0, min(int(plan.get("locked_overlap_tokens", ov_tokens)), ov_tokens)
+    )
+    if ov_input:
+        print(
+            f"[HardCut]   overlap: requested {ov_input}f -> effective {ov_tokens}f "
+            f"(chunk {_chunk}f), locked {locked_overlap}f"
+            + ("   [clamped below one window]" if ov_tokens != ov_input else ""),
+            flush=True,
+        )
     if segment_frames:
         segments = explicit_segments(
-            int(video.shape[2]), frame_count, segment_frames
+            int(video.shape[2]), frame_count, segment_frames,
+            overlap_frames=ov_tokens,
         )
     elif plan.get("temporal_strategy") == "full_clip_safe":
         segments = [(0, 0, int(video.shape[2]), frame_count)]
     else:
         segments, frame_count = core.compute_temporal_segments(
             int(video.shape[2]),
-            int(plan["temporal_chunk_frames"]),
-            int(plan["temporal_overlap_frames"]),
+            _chunk,
+            ov_tokens,
         )
 
     # ---- log the cut decisions NOW ----
@@ -609,10 +653,19 @@ def execute(
         chunk_conditioning = core.reanchor_conditioning(
             conditioning, start_frame, end_frame, tuple(chunk_video.shape[-2:])
         )
-        # Hard cut: windows are independent (zero overlap), so no
-        # anchor_conditioning against `accumulated` — upstream only anchors when
-        # there is locked overlap, and anchoring at a hard boundary indexes one
-        # token past the previous window and raises.
+        # Overlap > 0: pin this window's FIRST token on the previous window's
+        # output (upstream inserts it as minimax_keyframes[0] and applies
+        # anchor_strength as a noise-aug factor), so the sampler continues from
+        # what was already generated instead of starting cold at a hard cut.
+        # With overlap 0 there is nothing for it to anchor to - upstream raises
+        # "previous chunk does not reach the next chunk anchor" - so it stays off.
+        if ov_tokens and accumulated is not None:
+            chunk_conditioning = core.anchor_conditioning(
+                chunk_conditioning,
+                accumulated,
+                start_frame,
+                float(plan.get("anchor_strength", 0.999)),
+            )
 
         chunk_noise_video = (
             global_video_noise[:, :, start_token:end_token]
@@ -640,7 +693,15 @@ def execute(
             chunk_noise_video,
             chunk_noise_audio,
         )
-        accumulated = core._append_video(accumulated, sampled, start_token)
+        if ov_tokens:
+            # guarded overlap: the first `locked_overlap` tokens stay exactly as
+            # the previous window published them, the remaining `transition`
+            # tokens take this window's fresh sample, then the rest is appended.
+            accumulated, _ov, _tr = core._append_video_guarded_overlap(
+                accumulated, sampled, start_token, locked_overlap
+            )
+        else:
+            accumulated = core._append_video(accumulated, sampled, start_token)
         segment_reports.append(
             {
                 "index": len(segment_reports),
