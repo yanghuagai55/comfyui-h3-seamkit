@@ -562,6 +562,38 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
 
 
 
+def release_text_encoders() -> list:
+    """Unload CLIP / text-encoder models, keep the diffusion model loaded.
+
+    On a 32 GB machine the H3 stack is DiT (19.5 GB) + Qwen3-VL TE (14.6 GB);
+    keeping both parked is what overflows aimdo's host buffer.  The second pass
+    never uses the TE, and here its conditioning is already built, so the TE can
+    go.  Unlike model_management.unload_all_models() this leaves the DiT alone,
+    so the second pass does not have to reload 19.5 GB.
+    """
+    freed = []
+    try:
+        import comfy.model_management as _mm
+        loaded = list(getattr(_mm, "current_loaded_models", []) or [])
+    except Exception:
+        return freed
+    for entry in loaded:
+        try:
+            from .nodes_unload import _looks_like_text_encoder
+        except Exception:
+            break
+        if not _looks_like_text_encoder(entry):
+            continue
+        inner = getattr(entry, "model", None)
+        name = type(inner).__name__ if inner is not None else "?"
+        try:
+            entry.model_unload()
+            freed.append(name)
+        except Exception:
+            pass
+    return freed
+
+
 def execute(
     model,
     conditioning,
@@ -693,6 +725,17 @@ def execute(
             segment_frames = calm_boundaries
             for _n in _calm_notes:
                 print(f"[HardCut]   calm: {_n}", flush=True)
+
+    # ---- free the text encoder before sampling ----
+    # The conditioning above is fully built, and nothing downstream of this point
+    # touches the TE: the DiT stays loaded, the encoder's 14.6 GB (and the aimdo
+    # host buffer it occupies) goes back.  Disable with
+    # plan.hardcut.unload_text_encoder_before_sampling = false.
+    if bool((plan.get("hardcut") or {}).get("unload_text_encoder_before_sampling", True)):
+        _freed_te = release_text_encoders()
+        if _freed_te:
+            print(f"[HardCut]   TE unloaded before sampling: {', '.join(_freed_te)}",
+                  flush=True)
 
     # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
     # overlap tokens: when > 0 each window's START is pulled back so the sampler
