@@ -134,17 +134,21 @@ def find_calm_boundaries(
         # to merge two windows and double the load)
         pending_cuts = [int(c) for c in planned if int(c) != cut]
         refs = boundaries + pending_cuts
-        # deviation = how far the MODEL actually turned from the plan.  Prefer
-        # the measured turn (true frame); the snapped boundary is only a
-        # fallback and can only be 0/17/34... away, too coarse for a 3-4 frame
-        # tolerance.
+        # The deviation that decides "hard cut or anchored overlap" is how far
+        # the FINAL boundary lands from where the model ACTUALLY turned - not how
+        # far the model drifted from the plan.  The hunt already snaps the
+        # boundary onto the exclusive-frame grid, so a 15-frame plan error can
+        # end up 2 frames off (plan 187, real turn 202 -> boundary 204).
+        # Only when that residual exceeds seam_tolerance do we stop trusting the
+        # hard cut and switch the seam to an anchored overlap.
         _m = entry.get("measured_turn_frame")
-        if _m is not None:
-            _dev = abs(int(_m) - cut)
-            _dev_src = f"measured {_m}"
+        if b is not None and _m is not None:
+            _dev = abs(int(b) - int(_m))
+            _dev_src = f"boundary {b} vs measured {_m}"
         elif b is not None:
+            # no measured turn reported: fall back to the plan distance
             _dev = abs(int(b) - cut)
-            _dev_src = f"boundary {b}"
+            _dev_src = f"boundary {b} vs plan {cut}"
         else:
             _dev, _dev_src = None, None
         if (
@@ -156,8 +160,8 @@ def find_calm_boundaries(
             boundaries.append(int(b))
             overlaps.append(0)
             notes.append(
-                f"cut {cut}: hunt reliable ({_dev_src}, dev {_dev}f <= "
-                f"{int(seam_tolerance)}f) -> hard cut"
+                f"cut {cut}: hard cut, residual {_dev}f <= {int(seam_tolerance)}f "
+                f"({_dev_src})"
             )
             continue
 
