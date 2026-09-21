@@ -573,7 +573,7 @@ def execute(
     negative=None,
     cfg: float = 1.0,
     auto_seam_hunt: bool = False,
-    auto_seam_sensitivity: int = 20,
+    show_memory_log: bool = True,
 ):
     core = _core()
     learned = _learned()
@@ -867,6 +867,8 @@ def execute(
             accumulated = core._append_video(accumulated, sampled, start_token)
         prev_end_frame = int(end_frame)
         try:
+            if not show_memory_log:
+                raise _SkipProbe()
             _free, _total = torch.cuda.mem_get_info()
             print(
                 f"[HardCut]   seg {len(segment_reports)} done: "
@@ -881,6 +883,8 @@ def execute(
                 if _free2 - _free > 32 * 2**20:
                     print(f"[HardCut]   cache released: +{(_free2-_free)/2**30:.2f}GB free",
                           flush=True)
+        except _SkipProbe:
+            pass
         except Exception as _mm_exc:
             print(f"[HardCut]   mem probe skipped: {_mm_exc}", flush=True)
         segment_reports.append(
@@ -949,17 +953,15 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "会覆盖 plan 里的 segment_frames。"
                     ),
                 ),
-                io.Int.Input(
-                    "auto_seam_sensitivity",
-                    default=20,
-                    min=5,
-                    max=80,
-                    step=1,
+                io.Boolean.Input(
+                    "show_memory_log",
+                    default=True,
                     tooltip=(
-                        "（已停用，保留兼容）旧版用固定阈值检测（20 = 2.0 倍），在打斗类"
-                        "内容上会把真转镜漏掉、反而抓到动作重击。现改为：在每个计划切点的"
-                        "容差窗内直接取 latent 变化最强的 token 作为边界 —— 无阈值。"
-                        "低于 1.1 倍视为平坦，保持原计划边界。"
+                        "每个分块采样结束后打印真实显存：alloc（真正占用）/ reserved（池）"
+                        "/ device-free（卡上剩余），并在段间释放缓存后报告释放量。"
+                        "用来区分「显存逐段上涨」是哪一类：alloc 涨=有引用没放，"
+                        "reserved 涨=显存池碎片，只有 device-free 掉=pinned/其它进程。"
+                        "关掉只保留必要的进度日志。"
                     ),
                 ),
             ],
