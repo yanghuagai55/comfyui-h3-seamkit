@@ -709,10 +709,10 @@ def auto_prompt(plan: dict, style_lead: str = "", action_outline: str = "") -> s
     lines.append("")
     lines.append("retention_analysis:")
     lines.append(
-        f"<Subject 1> (appears in {shot_list}): fully_preserved - <要保持的具体特征>."
+        f"<Subject 1> (appears in {shot_list}): fully_copy - <要保持的具体特征>."
     )
     lines.append(
-        f"<Subject 2> (appears in {shot_list}): fully_preserved - <环境/光线/构图>."
+        f"<Subject 2> (appears in {shot_list}): fully_copy - <环境/光线/构图>."
     )
     lines.append("")
     lines.append("detailed_description:")
@@ -1184,6 +1184,25 @@ def validate_prompt(
     prompt = prompt or ""
     errors: list[str] = []
     warnings: list[str] = []
+
+    # Official Ref2VA retention tags are exactly these four; anything else
+    # (a common one being "fully_preserved") is not what the text encoder
+    # was trained on.
+    _OFFICIAL_RETENTION = ("fully_copy", "partially_copy", "reference", "weak_reference")
+    _ret = re.search(r"retention_analysis\s*:(.*?)(?=\n[a-z_]+\s*:|\Z)", prompt, re.S | re.I)
+    if _ret:
+        _tags = set(re.findall(r"\b([a-z_]{3,})\b", _ret.group(1)))
+        _bad = sorted(
+            t for t in _tags
+            if (t.endswith("_copy") or t == "weak_reference" or t == "fully_preserved")
+            and t not in _OFFICIAL_RETENTION
+        )
+        if _bad:
+            warnings.append(
+                "retention_analysis uses unofficial tag(s) "
+                + ", ".join(_bad)
+                + " - the official set is fully_copy / partially_copy / reference / weak_reference"
+            )
     info: dict = {"canvas_mp": float(canvas_mp) if canvas_mp else None}
 
     # ---- 1. section skeleton -------------------------------------------

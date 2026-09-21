@@ -19,8 +19,8 @@ sound, executed as a <M>-shot sequence with a hard cut at <MM:SS.mmm> [, and a s
 cut at <MM:SS.mmm>], fusing <A> into <B>: <一句话动作/情节总纲>.
 
 retention_analysis:
-<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - <要保持不变的具体特征>.
-<Subject 2> (appears in [Shot 1], [Shot 2]): fully_preserved - <环境/光线/构图>.
+<Subject 1> (appears in [Shot 1], [Shot 2]): fully_copy - <要保持不变的具体特征>.
+<Subject 2> (appears in [Shot 1], [Shot 2]): fully_copy - <环境/光线/构图>.
 
 detailed_description:
 <一两句定调：风格/画质/色调 —— 必须放在 [Shot 1] 之前>.
@@ -137,8 +137,8 @@ summary:
 [reference generation] The target video is an 8-second, 16:9, 2K clip with native stereo sound, executed as a two-shot sequence with a hard cut at 00:04.250, fusing the 2D anime heroine <Subject 1> into the photorealistic campus park path of <Subject 2>: Rem sinks into a combat stance, dashes forward with sparks scraping off the bricks, guards with her maid sleeve and sidesteps the strikes of the shadow enemy <Subject 3>, then continues into a rapid chain of kicks and knife-hand strikes that ends with the enemy knocked flying out of frame, finishing on a stable battle-end pose. Both shots share one continuous action line: the cut only changes the camera, never the fight.
 
 retention_analysis:
-<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - her blue short hair with bangs over the right eye, blue pupils, white flower headband, purple butterfly ribbon, black-and-white maid outfit, white apron, white over-knee stockings, and black shoes stay identical in every frame of the high-speed combat across both shots; her proportions remain stable, her face never distorts, her limbs connect naturally, the outfit never clips through her body, and there is no frame flicker.
-<Subject 2> (appears in [Shot 1], [Shot 2]): fully_preserved - the curved red-brick path, green trees, lawn, shrubs, dappled sunlight, and distant campus building keep the same real structure, light direction, and color temperature for the entire video across both shots, remaining a stable background through the whole battle.
+<Subject 1> (appears in [Shot 1], [Shot 2]): fully_copy - her blue short hair with bangs over the right eye, blue pupils, white flower headband, purple butterfly ribbon, black-and-white maid outfit, white apron, white over-knee stockings, and black shoes stay identical in every frame of the high-speed combat across both shots; her proportions remain stable, her face never distorts, her limbs connect naturally, the outfit never clips through her body, and there is no frame flicker.
+<Subject 2> (appears in [Shot 1], [Shot 2]): fully_copy - the curved red-brick path, green trees, lawn, shrubs, dappled sunlight, and distant campus building keep the same real structure, light direction, and color temperature for the entire video across both shots, remaining a stable background through the whole battle.
 <Subject 3> (appears in [Shot 1], [Shot 2]): partially_preserved - stays a faceless blurred dark silhouette throughout, always out of focus and never taking the frame from Rem.
 
 detailed_description:

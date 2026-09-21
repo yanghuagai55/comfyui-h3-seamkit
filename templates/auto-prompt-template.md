@@ -121,8 +121,8 @@ executed as an <N>-shot sequence with hard cuts at <算好的时间戳逐字填>
 segment no longer than <C/24 秒> seconds.
 
 retention_analysis:
-<Subject 1> (appears in [Shot 1], [Shot 2] ...): fully_preserved - <保留了什么>.
-<Subject 2> (appears in [Shot 1], [Shot 2] ...): fully_preserved - <保留了什么>.
+<Subject 1> (appears in [Shot 1], [Shot 2] ...): fully_copy - <保留了什么>.
+<Subject 2> (appears in [Shot 1], [Shot 2] ...): fully_copy - <保留了什么>.
 
 detailed_description:
 <一两句英文定调：风格/画质/色调>.
@@ -156,8 +156,8 @@ summary:
 [reference generation] The target video is a 10.125-second clip with native stereo sound, executed as a three-shot sequence with hard cuts at 00:03.542 and 00:07.083, with every segment no longer than 3.542 seconds.
 
 retention_analysis:
-<Subject 1> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - face, hair, cardigan and necklace stay identical across both cuts; only the camera distance changes.
-<Subject 2> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_preserved - the same courtyard and the same low afternoon light continue across both cuts.
+<Subject 1> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_copy - face, hair, cardigan and necklace stay identical across both cuts; only the camera distance changes.
+<Subject 2> (appears in [Shot 1], [Shot 2], [Shot 3]): fully_copy - the same courtyard and the same low afternoon light continue across both cuts.
 
 detailed_description:
 The target video is in a cinematic, softly lit style with a slightly desaturated palette and shallow depth of field.
