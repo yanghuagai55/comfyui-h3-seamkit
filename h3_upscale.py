@@ -88,7 +88,7 @@ def find_calm_boundaries(
     *,
     window: int = 34,
     overlap_frames: int = 17,
-    deviation_threshold: int = 17,
+    seam_tolerance: int = 17,
     min_sep: int = 34,
     grid: int = FRAME_GRID,
 ):
@@ -134,19 +134,40 @@ def find_calm_boundaries(
         # to merge two windows and double the load)
         pending_cuts = [int(c) for c in planned if int(c) != cut]
         refs = boundaries + pending_cuts
+        # deviation = how far the MODEL actually turned from the plan.  Prefer
+        # the measured turn (true frame); the snapped boundary is only a
+        # fallback and can only be 0/17/34... away, too coarse for a 3-4 frame
+        # tolerance.
+        _m = entry.get("measured_turn_frame")
+        if _m is not None:
+            _dev = abs(int(_m) - cut)
+            _dev_src = f"measured {_m}"
+        elif b is not None:
+            _dev = abs(int(b) - cut)
+            _dev_src = f"boundary {b}"
+        else:
+            _dev, _dev_src = None, None
         if (
             b is not None
-            and abs(int(b) - cut) <= int(deviation_threshold)
+            and _dev is not None
+            and _dev <= int(seam_tolerance)
             and all(abs(int(b) - int(o)) >= int(min_sep) for o in refs)
         ):
             boundaries.append(int(b))
             overlaps.append(0)
-            notes.append(f"cut {cut}: hunt reliable (boundary {b}) -> hard cut")
+            notes.append(
+                f"cut {cut}: hunt reliable ({_dev_src}, dev {_dev}f <= "
+                f"{int(seam_tolerance)}f) -> hard cut"
+            )
             continue
 
         # candidates: exclusive frames inside the window, away from the others
+        # window 0 = keep the boundary where the plan put it and only switch
+        # that seam to an anchored overlap (no search at all)
         lo, hi = max(grid, cut - int(window)), min(frame_count - grid, cut + int(window))
         cands = [f for f in range(lo, hi + 1, grid) if f % grid == 0]
+        if int(window) == 0 and cut % grid:
+            cands = []   # off-grid plan with no room to snap
         cands = [f for f in cands if all(abs(f - int(o)) >= int(min_sep) for o in refs)]
         if not cands:
             boundaries.append(cut)
@@ -662,7 +683,7 @@ def execute(
                 profile, planned, aligned, frame_count,
                 window=int(_hc.get("calm_search_window", 34)),
                 overlap_frames=int(_hc.get("calm_overlap_frames", 17)),
-                deviation_threshold=int(_hc.get("deviation_threshold", 17)),
+                seam_tolerance=int(_hc.get("seam_tolerance", 17)),
             )
             segment_frames = calm_boundaries
             for _n in _calm_notes:

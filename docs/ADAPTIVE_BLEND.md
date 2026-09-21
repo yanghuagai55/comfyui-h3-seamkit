@@ -161,11 +161,10 @@ for cut in planned_cuts:
 | 参数 | 位置 | 默认 | 说明 |
 |---|---|---|---|
 | `overlap_frames` | `#56` / `#48` | 0 | 全局段间重叠（帧；UI step=17 但**执行器不做倍数取整**，非倍数值经 token 边吸附（1–4 帧分辨率）生效；送到采样器前钳制到 `< chunk`） |
-| `seam_tolerance_frames` | `#56` | **17**（widget 默认；执行器读不到时的回退值也是 17） | hunt 采纳半径：检测到的转镜离计划点超过此值即为误检 |
+| `seam_tolerance_frames` | `#56` | **17**（复用，未新增参数） | **一值两用**：① hunt 采纳半径（检测到的转镜离计划点超过它即判误检）② **平缓搜索的触发阈值**——模型实际转镜（`measured`）与计划切点的差超过它 → 该缝转 overlap（想更敏感就把它调到 3~4） |
 | `auto_calm_search` | `#56`（新增） | `false` | 启用自适应平缓搜索 |
 | `calm_search_window` | `#56`（新增） | 34 | 搜索半径（帧），`cut ± window` 内找最平缓的独占帧 |
 | `calm_overlap_frames` | `#56`（新增） | 17 | 平缓缝使用的 overlap |
-| `deviation_threshold` | `#56`（新增） | 17 | 偏差超过它才触发搜索（否则按硬切处理） |
 | `anchor_strength` | plan | 0.999 | 锚定强度（传给 `minimax_visual_cond_noise_aug`） |
 | `locked_overlap_tokens` | plan | = overlap（帧） | 重叠区中"完全保留旧结果"的量；上游按 **token** 计，执行器负责帧→token 换算（`×5/17`） |
 

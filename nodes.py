@@ -552,7 +552,10 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "二采会在 latent 上找模型真正的转镜点，**只有它离本节点算出的切点 ≤ 本值时才采纳**"
                         "（超过＝疑似误检，忽略并在报告里说明）。\n"
                         "默认 17 = 一格网格：17 帧内算同一刀，超出就认为是别的东西在动。\n"
-                        "调大 = 更信任检测（但误检风险↑）；调小 = 只认同一个网格点附近的变化。"
+                        "调大 = 更信任检测（但误检风险↑）；调小 = 只认同一个网格点附近的变化。\n"
+                        "**一值两用**（自适应搜索开启时）：它同时是**触发 overlap 的偏差阈值**——\n"
+                        "模型实际转镜（`measured`）与计划切点的差超过本值 → 那条缝转用锚定重叠。\n"
+                        "实测差 3~4 帧时缝就能看出来，想更敏感就调到 **3~4**。"
                     ),
                 ),
                 io.Int.Input(
@@ -594,7 +597,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     tooltip=(
                         "★ 自适应平缓搜索（需要 `#40` 的 `auto_seam_hunt` 一起开）。\n"
                         "hunt 判定某个切点**不可靠**时（没检测到转镜，或检测到的位置离计划点"
-                        "超过 `deviation_threshold`），不再硬切在计划点上，而是在 **± "
+                        "超过 `seam_tolerance_frames`），不再硬切在计划点上，而是在 **± "
                         "`calm_search_window`** 范围内找 **latent 变化最小的独占帧**，"
                         "把边界挪过去，并给那条缝开 `calm_overlap_frames` 的重叠锚定。\n"
                         "目的：接缝既不落在内容剧变处，也不用两条独立结果硬拼。"
@@ -617,17 +620,6 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     tooltip=(
                         "平缓缝使用的重叠（帧）。17 = 一个 token 组。\n"
                         "负载按 (最长窗 + 本值) 算——15s/1.5MP 下 17 已到 178.5，34 会爆。"
-                    ),
-                ),
-                io.Int.Input(
-                    "deviation_threshold",
-                    default=17,
-                    min=0,
-                    max=170,
-                    step=1,
-                    tooltip=(
-                        "偏差阈值（帧）：hunt 给出的边界离计划点超过本值 → 视为不可靠 → 触发平缓搜索。\n"
-                        "≤ 本值则按硬切处理（缝本来就在转镜上）。"
                     ),
                 ),
             ],
@@ -672,7 +664,6 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         auto_calm_search: bool = False,
         calm_search_window: int = 34,
         calm_overlap_frames: int = 17,
-        deviation_threshold: int = 17,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -719,7 +710,6 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["auto_calm_search"] = bool(auto_calm_search)
         _hc["calm_search_window"] = max(0, int(calm_search_window))
         _hc["calm_overlap_frames"] = max(0, int(calm_overlap_frames))
-        _hc["deviation_threshold"] = max(0, int(deviation_threshold))
 
         note = ""
         if not used_upstream:
