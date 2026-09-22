@@ -684,6 +684,15 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     advanced=True,
                 ),
                 io.Float.Input(
+                    "calm_min_gain",
+                    default=0.15,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="挪动收益门：候选点必须比计划点安静至少这个比例才值得挪。避免「压线抖动」（0.09 分之差决定两种成片）。0 = 关闭，退回旧的绝对门限。",
+                    advanced=True,
+                ),
+                io.Float.Input(
                     "calm_too_quiet_below",
                     default=0.05,
                     min=0.0,
@@ -749,6 +758,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         hunt_min_persistence: float = 0.8,
         seam_blend: bool = False,
         calm_too_quiet_below: float = 0.05,
+        calm_min_gain: float = 0.15,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -816,6 +826,10 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["hunt_min_persistence"] = max(0.0, float(hunt_min_persistence))
         _hc["seam_blend"] = bool(seam_blend)
         _hc["calm_too_quiet_below"] = max(0.0, float(calm_too_quiet_below))
+        _hc["calm_min_gain"] = max(0.0, float(calm_min_gain))
+        # Canvas megapixels, so #40 can re-check the load guard after the calm
+        # search moves a boundary (auto_plan sized the PLANNED windows only).
+        _hc["canvas_mp"] = float(canvas_mp)
 
         note = ""
         if not used_upstream:

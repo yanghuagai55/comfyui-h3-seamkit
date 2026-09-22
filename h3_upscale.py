@@ -26,7 +26,7 @@ import comfy.nested_tensor
 from comfy_api.latest import io
 
 from .bridge import PLAN_TYPE_STRING, find_upstream_module
-from .hardcut_math import FPS, FRAME_GRID
+from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL
 
 CATEGORY = "MiniMax H3/SeamKit"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
@@ -96,6 +96,7 @@ def find_calm_boundaries(
     abstain_below: float = 0.0,
     calm_min_quality: float = 0.0,
     too_quiet_below: float = 0.0,
+    calm_min_gain: float = 0.0,
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
@@ -147,11 +148,15 @@ def find_calm_boundaries(
             _mean = sum(_vals) / len(_vals)
             _contrast = (max(_vals) / _mean) if _mean > 0 else 1.0
             if _contrast < abstain_below:
+                # The clip is too flat to be worth SEARCHING, but the seams
+                # still exist and a hard cut through continuous content breaks
+                # it.  Same rule as everywhere else: keep the plan, anchor.
                 return (
                     [int(c) for c in planned],
-                    [0] * len(planned),
+                    [int(overlap_frames)] * len(planned),
                     [f"clip too flat for a search (jerk contrast {_contrast:.2f} < "
-                     f"{abstain_below:.2f}) -> keep every planned cut as a hard cut"],
+                     f"{abstain_below:.2f}) -> keep every planned cut, "
+                     f"overlap {int(overlap_frames)}f"],
                 )
 
     boundaries, overlaps, notes = [], [], []
@@ -255,8 +260,11 @@ def find_calm_boundaries(
         best_score = score.get(tok_of(best), float("inf"))
         if best_score == float("inf"):
             boundaries.append(cut)
-            overlaps.append(0)
-            notes.append(f"cut {cut}: profile has no score here -> keep plan (hard cut)")
+            overlaps.append(int(overlap_frames))
+            notes.append(
+                f"cut {cut}: profile has no score here -> keep plan, "
+                f"overlap {int(overlap_frames)}f"
+            )
             continue
         # ---- per-seam quality gate ------------------------------------------
         # score is normalised so that 1.0 = the clip's own median, i.e. "as
@@ -284,6 +292,26 @@ def find_calm_boundaries(
                 f"cut {cut}: calmest frame is nearly static (score {best_score:.3f} "
                 f"< {float(too_quiet_below):.3f}), no good spot to move to "
                 f"-> keep plan, overlap {int(overlap_frames)}f"
+            )
+            continue
+        # D6: a fixed absolute gate made the decision hinge on ~0.09 of score,
+        # because on a busy clip the best candidate sits right at the clip
+        # median (score 1.0) - so two nearly identical candidates landed on
+        # opposite sides and produced visibly different cuts.  What actually
+        # matters is the GAIN over staying put, so require a relative
+        # improvement: moving must beat the planned frame by `calm_min_gain`.
+        _plan_score = score.get(tok_of(cut), float("inf"))
+        _gain = (
+            (_plan_score - best_score) / _plan_score
+            if _plan_score not in (0.0, float("inf")) else 0.0
+        )
+        if calm_min_gain > 0.0 and _gain < float(calm_min_gain):
+            boundaries.append(cut)
+            overlaps.append(int(overlap_frames))
+            notes.append(
+                f"cut {cut}: best candidate only {_gain*100:.0f}% calmer than the "
+                f"planned frame (< calm_min_gain {float(calm_min_gain)*100:.0f}%) "
+                f"-> not worth moving, keep plan, overlap {int(overlap_frames)}f"
             )
             continue
         if calm_min_quality > 0.0 and best_score > float(calm_min_quality):
@@ -669,6 +697,10 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
 # Measured on the convrot weights: real turns score 1.82-1.91, a false one (motion peak) scored 1.51.  1.6 splits them with margin - 1.8 sat right on
 # top of the real turns and risked dropping them too.
 FLAT_RATIO = 1.6     # below this a tolerance window counts as featureless
+# One 17-frame block carries 5 tokens: 1 exclusive (a single frame) + 4 shared
+# (each covering 4 frames).  So a tolerance below ~4 frames cannot even reach
+# the neighbouring candidate row - worth saying out loud in the log.
+GRID_FRAMES_PER_TOKEN = 4
 
 
 def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
@@ -720,6 +752,16 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
             and abs(frame_of(int(row[0])) - cut) <= tolerance
         ]
         if not window:
+            # Silent before.  A tolerance narrower than one token cell (17
+            # frames / 5 tokens = ~4 frames per step) leaves almost no candidate
+            # rows, and combined with the persistence and flat-ratio gates the
+            # hunt quietly finds nothing at all - which reads as "the detector
+            # is broken" rather than "the window was too narrow".
+            notes.append(
+                f"cut {cut}: no candidate token within {tolerance}f "
+                f"(one token spans ~{GRID_FRAMES_PER_TOKEN}f) -> increase "
+                f"seam_tolerance_frames or the hunt will find nothing here"
+            )
             continue
         # Rank by local_change x persistence.  The global score is still the
         # local-change term (the LOCAL variant suppresses a turn, see above); the
@@ -1011,7 +1053,35 @@ def execute(
                 abstain_below=float(_hc.get("calm_abstain_below", 0.0)),
                 calm_min_quality=float(_hc.get("calm_min_quality", 0.0)),
                 too_quiet_below=float(_hc.get("calm_too_quiet_below", 0.0)),
+                calm_min_gain=float(_hc.get("calm_min_gain", 0.0)),
             )
+            # ---- load guard (external review D2) ---------------------------
+            # auto_plan sized the PLANNED windows.  The search just moved the
+            # boundaries, and a longer window costs more second-pass memory
+            # (load = longest_frames x canvas_mp), so recheck and undo any move
+            # that breaks the anchor.  Otherwise the calm search can quietly
+            # create the oversized window that produces tail artefacts.
+            _mp = float(_hc.get("canvas_mp") or 0.0) or 1.5
+            _total = int(frame_count)
+            for _i in range(len(calm_boundaries)):
+                _lo = max(0, int(calm_boundaries[_i]) - int(
+                    calm_overlaps[_i] if _i < len(calm_overlaps) else 0))
+                _hi = int(calm_boundaries[_i + 1]) if _i + 1 < len(calm_boundaries) else _total
+                _frames = max(0, _hi - _lo)
+                if _frames * _mp < float(LOAD_FAIL):
+                    continue
+                _plan_cut = int(planned[_i]) if _i < len(planned) else int(calm_boundaries[_i])
+                if _plan_cut == int(calm_boundaries[_i]):
+                    continue                      # already the plan; nothing to undo
+                _log_buf["calm"].append(
+                    f"[HardCut]   calm: cut {_plan_cut}: move to "
+                    f"{int(calm_boundaries[_i])} would make segment {_i} "
+                    f"{_frames}f x {_mp:.2f}MP = {_frames * _mp:.0f} >= "
+                    f"{float(LOAD_FAIL):.0f} -> reverted to the planned frame"
+                )
+                calm_boundaries[_i] = _plan_cut
+                if _i < len(calm_overlaps):
+                    calm_overlaps[_i] = 0    # a reverted seam is a plain cut
             segment_frames = calm_boundaries
             for _n in _calm_notes:
                 _log_buf["calm"].append(f"[HardCut]   calm: {_n}")
@@ -1087,14 +1157,27 @@ def execute(
         # "boundary=None" while the windows were split exactly on it.
         boundaries = [int(e) for _st, _sf, _et, e in segments][:-1]
         hunted = [int(f) for f in (seam_hunt or {}).get("boundary_frames") or []]
-        src_tag = ", ".join(
-            f"{b}{'' if b in hunted else '*'}" for b in boundaries
-        )
+        # Three states, not two.  '' = hunt accepted a real turn here; '+' = the
+        # calm search moved it; '*' = untouched, on the planned frame.  The old
+        # version labelled calm moves as '*' too, which read as "nothing was
+        # found here" even though the boundary had clearly moved.
+        _moved = set()
+        if calm_boundaries is not None:
+            for _pc, _cb in zip(planned or [], calm_boundaries):
+                if int(_pc) != int(_cb):
+                    _moved.add(int(_cb))
+
+        def _tag(_b):
+            if _b in hunted:
+                return ""
+            return "+" if _b in _moved else "*"
+
+        src_tag = ", ".join(f"{b}{_tag(b)}" for b in boundaries)
         _log_buf["sum"].append(
             f"[HardCut] planned_cuts={planned or '-'} "
             f"boundary_frames=[{src_tag or '-'}] "
             f"segments={len(segments)} lengths={lengths} longest={longest}f"
-            + ("   (* = kept on the planned frame, hunt found no turn there)"
+            + ("   ('+' = moved by the search, '*' = on the planned frame)"
                if any(b not in hunted for b in boundaries) else "")
         )
         if seam_hunt:

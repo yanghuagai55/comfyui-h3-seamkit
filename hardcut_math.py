@@ -47,6 +47,8 @@ MIN_TAIL_SECONDS = 2.0   # a trailing window shorter than this is not worth a cu
 # bare model - keep them in mind when you disable the LoRAs again.)
 LOAD_PASS = 180.0        # known-good with quality LoRAs on
 LOAD_FAIL = 191.0        # measured CUDA OOM with the LoRAs on
+# (imported by h3_upscale.py so the calm search can re-check the guard after it
+#  moves a boundary - see D2 in CODE_REVIEW_20260922.md)
 
 
 # --------------------------------------------------------------------------
