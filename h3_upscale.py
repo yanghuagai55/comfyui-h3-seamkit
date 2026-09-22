@@ -269,20 +269,25 @@ def find_calm_boundaries(
         # still: putting a seam in the stillest spot shows it off.  A slow but
         # CONTINUOUS move hides it.  So the very calmest frames are a trap too.
         if too_quiet_below > 0.0 and best_score < float(too_quiet_below):
+            # No good spot to move to.  Do NOT hard cut: a hard cut between two
+            # windows that were never told about each other breaks the content
+            # itself, which is worse than a visible seam.  Anchor instead - the
+            # overlap at least carries the previous window's frames across.
             boundaries.append(cut)
-            overlaps.append(0)
+            overlaps.append(int(overlap_frames))
             notes.append(
                 f"cut {cut}: calmest frame is nearly static (score {best_score:.3f} "
-                f"< {float(too_quiet_below):.3f}) - 4-frame quantisation would show "
-                f"-> keep plan, hard cut"
+                f"< {float(too_quiet_below):.3f}), no good spot to move to "
+                f"-> keep plan, overlap {int(overlap_frames)}f"
             )
             continue
         if calm_min_quality > 0.0 and best_score > float(calm_min_quality):
             boundaries.append(cut)
-            overlaps.append(0)
+            overlaps.append(int(overlap_frames))
             notes.append(
                 f"cut {cut}: no calm frame within {window}f (best {best_score:.2f} "
-                f"> calm_min_quality {float(calm_min_quality):.2f}) -> keep plan, hard cut"
+                f"> calm_min_quality {float(calm_min_quality):.2f}) "
+                f"-> keep plan, overlap {int(overlap_frames)}f"
             )
             continue
         boundaries.append(int(best))
