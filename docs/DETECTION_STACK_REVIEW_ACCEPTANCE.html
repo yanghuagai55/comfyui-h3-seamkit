@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H3 接缝检测体系送审报告 · 外部验收报告</title>
+<style>
+  :root{
+    --bg:#141414; --panel:#1e1c1a; --panel2:#262321; --line:#3a3532;
+    --fg:#efe9e3; --dim:#a89f97; --accent:#e8a44c; --accent2:#c96f4a;
+    --ok:#7fb069; --warn:#d9a441; --bad:#c96f4a; --mono:"Cascadia Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.75 -apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 80px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:.3px}
+  .sub{color:var(--dim);font-size:13.5px;margin-bottom:26px}
+  h2{font-size:18px;margin:38px 0 14px;padding-left:11px;
+     border-left:3px solid var(--accent)}
+  h3{font-size:15px;margin:22px 0 8px;color:var(--accent)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin:12px 0}
+  .card.hi{border-color:var(--accent);background:var(--panel2)}
+  .card.bad{border-color:var(--bad)}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:13.5px}
+  th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;
+        vertical-align:top}
+  th{color:var(--accent);font-weight:600;background:rgba(232,164,76,.06)}
+  code{font-family:var(--mono);font-size:12.5px;background:#000;
+       padding:1.5px 5px;border-radius:4px;color:#e8c88c}
+  pre{background:#0d0d0d;border:1px solid var(--line);border-radius:8px;
+      padding:13px 15px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;
+      color:#ddd5cc;line-height:1.6}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  .pill{display:inline-block;font-size:11.5px;padding:1.5px 10px;border-radius:20px;
+        border:1px solid var(--line);font-weight:600;letter-spacing:.5px}
+  .pill.pass{border-color:var(--ok);color:var(--ok)}
+  .pill.fail{border-color:var(--bad);color:var(--bad)}
+  .pill.cond{border-color:var(--warn);color:var(--warn)}
+  .kv{display:grid;grid-template-columns:170px 1fr;gap:6px 14px;font-size:13.5px}
+  .kv div:nth-child(odd){color:var(--dim)}
+  .foot{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);
+        color:var(--dim);font-size:12.5px}
+  ul{margin:8px 0;padding-left:22px} li{margin:5px 0}
+  .num{font-family:var(--mono)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>H3 接缝检测体系送审报告 · 外部验收报告</h1>
+<div class="sub">
+  被审文档：<code>docs/DETECTION_STACK_REVIEW.html</code>（提交 <code>f83cbab</code>）｜
+  受审代码：<code>ba43005</code>（HEAD 为纯文档提交，代码等价）｜
+  验收日期：2026-09-22 ｜ 验收方式：文档声明逐条对照代码 + git 审计 + 55 项运行时复验（全程 CPU）
+</div>
+
+<div class="card hi">
+<b>总判定：<span class="warn">有条件通过</span></b> ——
+检测体系的功能声明、测试声明、来源与许可声明<b>全部属实且可复现</b>
+（55/55：22 单元 + 10 边界探针 + 23 回归全部通过）；
+但 §七 的版本标注存在 <b>1 项失实（缺陷 D1，中危）</b>：
+<b>tag <code>v1.1.0</code> 并不包含受审的检测栈</b>。
+外部审计者若 <code>checkout v1.1.0</code>，拿到的代码<b>没有</b> jerk 排序、
+calm_policy、相机补偿三组提交。修正版本标注后方可作为送审版本凭据分发。
+</div>
+
+<h2>一、验收方法</h2>
+<div class="card">
+<div class="kv">
+  <div>文档 ↔ 代码对照</div><div>§一–§七 每条可检声明定位到 <code>h3_upscale.py</code> /
+    <code>nodes.py</code> 的具体函数与行号核对</div>
+  <div>git 审计</div><div>两仓库（插件 + 工作流）的 tag 目标、提交时间线、
+    <code>describe</code> 输出、文档提交的文件范围</div>
+  <div>运行时复验</div><div>三组共 55 项检查全部重跑（本次验收现场，非引用历史结果）：
+    22 项单元测试（文档 §四声明）+ 10 项验收方自加边界探针 + 23 项上一轮验收回归</div>
+  <div>环境</div><div><code>D:\comfyui\comfyenv\python.exe</code>（torch 2.14.0+cu130，纯 CPU 路径），
+    与文档 §六"无需 GPU"的声明一致</div>
+</div>
+</div>
+
+<h2>二、逐节核验结果</h2>
+<table>
+<tr><th>文档章节</th><th>核心声明</th><th>核验证据</th><th>判定</th></tr>
+<tr><td>§一 体系全貌</td>
+    <td>数据流：补偿（可选）→ d1/d3 双列 → max 组合 → abstain 门 → 逐 cut 双策略</td>
+    <td>各环节行为均被下述测试/探针独立触发验证，链路与代码一致</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ① 一阶比值（全局中位）</td>
+    <td><code>d1_ratio = d[i]/median(d)</code>，全局而非局部基准</td>
+    <td><code>_latent_change_profile</code> 实现一致；test_profile #1 输出 ratio 基准 1.00 = 全片中位</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ② 三阶 jerk（借自 MAINodes）</td>
+    <td>三阶差分、居中对齐到 d1 同格；T&lt;4 退化为 0</td>
+    <td>P9：单点脉冲下 d1/d3 峰值同格（t=4/t=4）；P6：T=3 时 jerk 列全零——与声明一致</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ③ 组合打分 max(d1,d3)</td>
+    <td>两者都小才算平缓；反例 170:(0.30,9.00) 应被否决</td>
+    <td>test_jerk #1 精确复现：旧判据会选 170，现判据选 204</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ④ 相机补偿（借自 MAINodes）</td>
+    <td>±max_shift 整数位移累积对齐；纯平移下 1.00 → 0.00</td>
+    <td>test_profile #1 <b>逐字复现 1.00 → 0.00</b>；P4：超 max_shift 位移仅部分补偿
+    （|d1| 1.1479→0.2013，与 §五"只是近似"的披露吻合）；P5：静止片不失真</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ⑤ 空间聚合三模式</td>
+    <td>提供 mean/max/top-decile；<b>诚实说明：归一化后峰值不可区分、收益未证实</b></td>
+    <td>三模式均运行正常（test_profile #2）；实测三模式峰值同为 1.00——
+    文档的自我否定性披露<b>与实测一致</b>（这是少见的诚实标注，验收方确认非虚言）</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ⑥ abstain 门（借自 MAINodes）</td>
+    <td>contrast = max(j3)/mean(j3)，低于阈值整片放弃</td>
+    <td>P2：ratio 的 max/mean 与原始 max(j3)/mean(j3) 数学等价性验证通过；
+    test_profile #3/#4：触发时保持计划切点、阈值 0 关闭后正常搜索</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§二 ⑦ 双缝策略</td>
+    <td>calm_overlap 取 score 最低；jerk_hardcut 取 3-token burst 和的峰值 + 硬切</td>
+    <td>P3：burst(221)=20 &gt; burst(204)=17，选 221——求和窗与相位行为正确；
+    test_jerk #4/#5：同 profile 下两策略互为镜像（170+ov17 / 204+硬切）</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§三 来源与许可</td>
+    <td>MAINodes 为 GPL-3.0-or-later；留档不进 custom_nodes；注释标注来源；本包同许可</td>
+    <td>MAINodes LICENSE 原文含 "either version 3 … or any later version" ✓；
+    留档在 <code>_hardcut_work/ref/MAINodes/</code>，custom_nodes 目录下无此包 ✓；
+    <code>h3_upscale.py</code> 第 139/218/443/517 行共 4 处 IDEA 标注（作者/许可/未复制声明）✓；
+    本包 LICENSE 为 GPL v3 ✓</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§四 测试证据</td>
+    <td>22 PASS / 0 FAIL（4+13+5）；表中 7 行关键用例</td>
+    <td>本次验收全量重跑：<b>22/22 通过</b>，§四表格逐行复现
+    （含"1.00→0.00"“jerk 否决选 204”“双策略镜像”“abstain 触发/关闭”“残差判据”“R1/R2/R3 反例”）</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§五 已知弱点</td>
+    <td>未做视觉验证；聚合收益未证实；补偿仅合成验证；只选独占帧；F.pad 历史崩溃已修</td>
+    <td>全部为<b>限制性披露</b>，无需复现即为诚实；其中两条可检项经探针证实为真
+    （P4 部分补偿、P6 T&lt;4 退化）；未发现任何"把未验证说成已验证"的条目</td>
+    <td class="ok">✓ 诚实</td></tr>
+<tr><td>§六 审计指引</td>
+    <td>核心函数位置；复现命令；无需 GPU</td>
+    <td>全部函数/路径存在；三条复现命令本次验收实际执行且通过；全程未动 GPU</td>
+    <td class="ok">✓ 属实</td></tr>
+<tr><td>§七 版本</td>
+    <td>插件 <b>tag v1.1.0 ｜ HEAD ba43005</b>；工作流 <b>tag v1.1.0 ｜ HEAD 1e2a8f3</b>；
+    基线 v1.0.0-baseline-20260921</td>
+    <td><b>失实</b>：插件 tag v1.1.0 → <code>3357ac1</code>（ba43005 之前 3 个提交），
+    工作流 tag v1.1.0 → <code>7ec945b</code>（1e2a8f3 之前 2 个提交）。
+    见第三节缺陷 D1</td>
+    <td class="bad">✗ 失实</td></tr>
+</table>
+
+<h2>三、缺陷清单</h2>
+
+<div class="card bad">
+<h3 style="margin-top:0">D1（中危）§七 版本标注失实：tag v1.1.0 不含受审检测栈</h3>
+<p><b>文档声明</b>："插件 tag <code>v1.1.0</code> ｜ HEAD <code>ba43005</code>"、
+"工作流 tag <code>v1.1.0</code> ｜ HEAD <code>1e2a8f3</code>"——两处均把 tag 与 HEAD 并列陈述，
+读作"tag 即此版本"。</p>
+<p><b>实测事实</b>（本次验收现场执行）：</p>
+<pre>插件:   git rev-parse v1.1.0^{commit}   -> 3357ac1   （ba43005 之前 3 个提交）
+        git describe --tags ba43005    -> v1.1.0-3-gba43005
+工作流: git describe --tags            -> v1.1.0-2-g1e2a8f3
+两 tag 均创建于 2026-09-22 13:07:26；检测栈三提交在其后落地：</pre>
+<table>
+<tr><th>时间（2026-09-22）</th><th>插件仓库</th><th>工作流仓库</th></tr>
+<tr><td class="num">13:07:26</td><td><b>tag v1.1.0 → 3357ac1</b>（text encoder 提交，9/21 22:54）</td>
+    <td><b>tag v1.1.0 → 7ec945b</b>（9/21 19:55）</td></tr>
+<tr><td class="num">13:12:02</td><td>3e89d12 calm search: rank by |d1| AND |d3|</td><td>—</td></tr>
+<tr><td class="num">13:20:54</td><td>c573602 add calm_policy: jerk_hardcut</td><td>55750d2 calm_policy widget</td></tr>
+<tr><td class="num">15:54:13</td><td><b>ba43005</b> camera compensation, reduce modes, abstain gate ← 受审</td>
+    <td><b>1e2a8f3</b> 3 profile params ← 声明的 HEAD</td></tr>
+<tr><td class="num">15:55:18</td><td>f83cbab 送审报告（纯文档：仅 +281 行本 HTML）</td><td>—</td></tr>
+</table>
+<p><b>影响</b>：外部审计者按文档 checkout <code>v1.1.0</code>，得到的是<b>不含检测栈</b>的代码——
+jerk 排序、calm_policy、相机补偿/聚合/abstain（§二 ②④⑤⑥⑦ 的全部受审对象）都不在里面。
+版本凭据与受审对象错位，送审报告的核心引用失效。</p>
+<p><b>修复建议</b>（三选一，均一分钟内可完成）：</p>
+<ul>
+<li><b>重打 tag</b>（若 v1.1.0 尚未对外分发）：<code>git tag -f v1.1.0 f83cbab</code>（两仓库同理，
+工作流打到 1e2a8f3），使 tag 覆盖受审状态；</li>
+<li><b>升版</b>：保留 v1.1.0 原位，在 f83cbab / 1e2a8f3 上新增 <code>v1.1.1</code>，
+文档 §七 改引 v1.1.1；</li>
+<li><b>改文档</b>：§七 与页眉的"版本 v1.1.0"改为 describe 实况
+（插件 <code>v1.1.0-3-gba43005</code>、工作流 <code>v1.1.0-2-g1e2a8f3</code>），
+并注明 tag 落后于受审 HEAD 的提交数。</li>
+</ul>
+</div>
+
+<h2>四、观察项（不计为缺陷）</h2>
+<div class="card">
+<ul>
+<li><b>O1 标注措辞</b>：§三 称"按对方习惯的格式标注了 <code>ADAPTED/IDEA from …</code>"，
+实际代码 4 处均为 "IDEA re-implemented (no code copied) from MAINodes (matlowai, GPL-3.0-or-later …)"，
+未出现字面 "ADAPTED"。语义等价，措辞与事实略有出入。</li>
+<li><b>O2 测试不在仓库内</b>：三个测试文件位于 <code>D:\comfyui\_hardcut_work\tools\</code>
+（仓库外、未版本化）。§六 已如实给出该路径，不构成失实；但换机或 CI 无法复现，
+建议将 <code>test_profile.py / test_calm.py / test_jerk.py</code> 收入插件仓库（如 <code>tools/</code> 或 <code>tests/</code>）。</li>
+<li><b>O3 探针 P1/P1b</b>：验收方尝试构造"计划切点相距 17 帧 → 回退路径产出 17 帧碎窗"的反例，
+本次构造下未成立（最终间距 51 帧，最小窗 51 帧）。
+I3 前提（计划切点间距 ≥ 34）仍由上游 plan 保证，风险登记但未复现。</li>
+</ul>
+</div>
+
+<h2>五、运行时复验汇总（本次验收现场执行，非引用）</h2>
+<div class="card">
+<table>
+<tr><th>组</th><th>脚本</th><th>项数</th><th>结果</th><th>覆盖</th></tr>
+<tr><td>单元测试（文档 §四）</td><td><code>_hardcut_work\tools\test_profile.py</code></td>
+    <td class="num">4</td><td class="ok">4/4</td>
+    <td>相机补偿、三聚合模式、abstain 触发/关闭</td></tr>
+<tr><td></td><td><code>_hardcut_work\tools\test_calm.py</code></td>
+    <td class="num">13</td><td class="ok">13/13</td>
+    <td>策略、残差判据、间距、R1/R2/R3 外部验收反例、C3 单位换算</td></tr>
+<tr><td></td><td><code>_hardcut_work\tools\test_jerk.py</code></td>
+    <td class="num">5</td><td class="ok">5/5</td>
+    <td>jerk 否决、3 列兼容降级、jerk_hardcut 峰值、双策略镜像</td></tr>
+<tr><td>边界探针（验收方自加）</td><td><code>%TEMP%\seamkit_acceptance\probe_v110.py</code></td>
+    <td class="num">10</td><td class="ok">10/10</td>
+    <td>P1/P1b 碎窗反例、P2 abstain 数学、P3 burst 相位、P4 部分 compensate、
+    P5 静止对照、P6 T&lt;4 退化、P7 3 列降级、P8 参数全链路（nodes.py 写入 → executor 读出）、
+    P9 居中对齐</td></tr>
+<tr><td>上一轮验收回归</td><td><code>%TEMP%\seamkit_acceptance\acceptance_test.py</code></td>
+    <td class="num">23</td><td class="ok">23/23</td>
+    <td>A1–A6 决策、B1–B12 分段不变量 I1–I7、C1/C2/C3b/D2——
+    <b>上一轮 4 项缺陷（D2 死旋钮、C1 间距、C2 重复边界、C3 locked 单位）修复确认有效</b></td></tr>
+<tr><td colspan="3"><b>合计</b></td><td class="ok"><b>55/55</b></td><td></td></tr>
+</table>
+</div>
+
+<h2>六、复现指引</h2>
+<div class="card">
+<pre>set PY=D:\comfyui\comfyenv\python.exe
+
+:: 22 项单元测试（文档 §四）
+%PY% D:\comfyui\_hardcut_work\tools\test_profile.py
+%PY% D:\comfyui\_hardcut_work\tools\test_calm.py
+%PY% D:\comfyui\_hardcut_work\tools\test_jerk.py
+
+:: 10 项边界探针 + 23 项上一轮回归
+%PY% C:\Users\coolw\AppData\Local\Temp\seamkit_acceptance\probe_v110.py
+%PY% C:\Users\coolw\AppData\Local\Temp\seamkit_acceptance\acceptance_test.py
+
+:: D1 证据
+git -C D:\comfyui\ComfyUI\custom_nodes\comfyui-h3-seamkit describe --tags ba43005
+git -C D:\comfyui\ComfyUI\user\default\workflows describe --tags</pre>
+</div>
+
+<h2>七、结论</h2>
+<div class="card hi">
+<ul>
+<li><b>§一–§六 全部声明属实</b>：七个组件的定义、出处、实测数据与代码一致；
+22 项测试真实存在、真实覆盖计算路径、全数通过；来源与许可标注经原文核对无误；
+§五 的限制性披露（含"归一化后聚合模式不可区分""补偿只是近似"两条自我否定）诚实无夸大。</li>
+<li><b>上一轮 4 项缺陷修复经回归确认有效</b>（C1/C2/C3b/D2 全过）。</li>
+<li><b>唯一未过项：§七 版本标注（D1，中危）</b>——tag v1.1.0 与受审 HEAD 错位 3/2 个提交，
+按文档取 tag 会拿不到检测栈。建议在文档分发前完成修复（重打 tag / 升 v1.1.1 / 改用 describe 实况）。</li>
+<li>修正 D1 后，本送审报告可作为外部审计的可靠底稿。</li>
+</ul>
+</div>
+
+<div class="foot">
+本报告为独立验收记录，与被审文档作者分离执行；所有命令与输出均可按第六节原样复现。
+验收基线：插件 <code>f83cbab</code>（代码等价 <code>ba43005</code>）、工作流 <code>1e2a8f3</code>。
+</div>
+
+</div>
+</body>
+</html>

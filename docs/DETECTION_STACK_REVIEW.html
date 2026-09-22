@@ -263,11 +263,41 @@ python test_jerk.py       # jerk 否决、双策略镜像、3 列兼容</pre>
 <h2>七、版本</h2>
 <div class="card">
 <div class="kv">
-  <div>插件</div><div>tag <code>v1.1.0</code> ｜ HEAD <code>ba43005</code></div>
-  <div>工作流</div><div>tag <code>v1.1.0</code> ｜ HEAD <code>1e2a8f3</code></div>
-  <div>基线</div><div>tag <code>v1.0.0-baseline-20260921</code>（可回退）</div>
+  <div>插件</div><div>tag <code>v1.2.0</code>（本检测栈）｜ HEAD <code>ba43005</code></div>
+  <div>工作流</div><div>tag <code>v1.2.0</code> ｜ HEAD <code>1e2a8f3</code></div>
+  <div>历史 tag</div><div><code>v1.1.0</code> = 自适应接缝（<b>不含</b>本检测栈三组提交）·
+    <code>v1.0.0-baseline-20260921</code> = 自适应前基线（可回退）</div>
   <div>相关文档</div><div><code>docs/ADAPTIVE_BLEND.md</code> ·
-    <code>docs/ADAPTIVE_BLEND_ACCEPTANCE.html</code>（上一轮外部验收，4 项缺陷已全部修复）</div>
+    <code>docs/ADAPTIVE_BLEND_ACCEPTANCE.html</code>（上一轮外部验收，4 项缺陷已全部修复）·
+    <code>docs/DETECTION_STACK_REVIEW_ACCEPTANCE.html</code>（本轮外部验收）</div>
+</div>
+</div>
+
+<h2>八、外部验收与修复</h2>
+<div class="card hi">
+<b>验收报告</b>：<code>docs/DETECTION_STACK_REVIEW_ACCEPTANCE.html</code>（外部审计方 2026-09-22）
+<div class="kv" style="margin-top:10px">
+  <div>总判定</div><div><b>有条件通过</b>——55/55 运行时检查通过
+    （22 单元 + 10 验收方自加边界探针 + 23 上轮回归，全程 CPU）</div>
+  <div>逐节核验</div><div>§一–§四 <b>全部"✓ 属实"</b>：功能声明、测试声明、
+    来源与许可声明均与代码一致。其中 §二⑤ 的"自我否定性披露"被验收方确认为
+    <i>"少见的诚实标注…非虚言"</i>；相机补偿的"只是近似"披露也与探针 P4
+    （超 <code>max_shift</code> 位移仅部分补偿）吻合。</div>
+  <div><span class="warn">D1（中危）</span></div>
+    <div><b>版本标注失实</b>：报告原写"版本 v1.1.0"，但 <code>v1.1.0</code> 这个 tag
+    打在 <b>13:07</b>，而构成检测栈的三组提交分别在 <b>13:14 / 13:22 / 15:55</b>——
+    外部审计者 <code>checkout v1.1.0</code> 会拿不到 jerk 排序、<code>calm_policy</code>
+    与相机补偿。</div>
+  <div>修复</div><div>新增 tag <code>v1.2.0</code>（含检测栈）并更新本节版本标注。
+    <b>已核对</b>：<code>v1.2.0</code> 中 <code>jerk_by_idx</code> 5 处、
+    <code>jerk_hardcut</code> 2 处、<code>_camera_compensate</code> 3 处；
+    <code>v1.1.0</code> 中对应为 <b>0</b>。旧的 <code>v1.1.0</code> 保留原义、
+    <b>未移动</b>（已发布的 tag 不应改写）。</div>
+</div>
+<div style="color:var(--dim);font-size:13px;margin-top:10px">
+<b>教训</b>：打 tag 与"完成一批功能"是两个动作。功能提交之后若忘记重新打 tag，
+文档里的版本号就会指向一个不含该功能的快照——外部审计者是靠
+<code>git describe</code> / <code>checkout</code> 去找代码的，这种失实会直接让他们验错版本。
 </div>
 </div>
 
