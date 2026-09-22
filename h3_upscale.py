@@ -95,6 +95,7 @@ def find_calm_boundaries(
     policy: str = "calm_overlap",
     abstain_below: float = 0.0,
     calm_min_quality: float = 0.0,
+    too_quiet_below: float = 0.0,
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
@@ -260,6 +261,22 @@ def find_calm_boundaries(
         # overlap THERE - the one combination with no defence: alignment blends
         # two independently generated versions of a busy frame, which reads as
         # ghosting.  Better to stay put and hard cut.
+        # ---- too quiet ----------------------------------------------------
+        # A near-zero score means the neighbouring frames are almost identical,
+        # which sounds ideal - but H3's latent is four frames per token, so an
+        # almost-static stretch decodes as 'three frames identical, one frame
+        # nudged'.  That ratchet is invisible under motion and glaring in a
+        # still: putting a seam in the stillest spot shows it off.  A slow but
+        # CONTINUOUS move hides it.  So the very calmest frames are a trap too.
+        if too_quiet_below > 0.0 and best_score < float(too_quiet_below):
+            boundaries.append(cut)
+            overlaps.append(0)
+            notes.append(
+                f"cut {cut}: calmest frame is nearly static (score {best_score:.3f} "
+                f"< {float(too_quiet_below):.3f}) - 4-frame quantisation would show "
+                f"-> keep plan, hard cut"
+            )
+            continue
         if calm_min_quality > 0.0 and best_score > float(calm_min_quality):
             boundaries.append(cut)
             overlaps.append(0)
@@ -644,7 +661,8 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
 FLAT_RATIO = 1.6     # below this a tolerance window counts as featureless
 
 
-def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
+def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
+                      min_persistence: float = 0.0):
     """Per planned cut: the strongest latent change in the window, then SNAP it
     onto the exclusive-frame grid the window start requires.
 
@@ -699,8 +717,24 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
         # The 0.25 floor keeps the old ordering if persistence is unavailable
         # (older profiles, or the switch off) so behaviour degrades, not breaks.
         window.sort(key=lambda x: -(x[2] * (0.25 + 0.75 * x[3])))
-        peak_idx, peak_local, peak_ratio, _peak_pers = window[0][:4]
+        peak_idx, peak_local, peak_ratio, peak_pers = window[0][:4]
         peak_frame = frame_of(peak_idx)
+        # ---- false-positive gate (PERSIST) ---------------------------------
+        # A sharp local change is not a shot change on its own: a flicker, a
+        # shake, or a texture sweeping past produce the same bump.  What a real
+        # cut does is leave the latent state somewhere ELSE and keep it there.
+        # Below the floor we decline the detection and let the plan (and the
+        # calm search / hard cut) stand instead.
+        if min_persistence > 0.0 and peak_pers < float(min_persistence):
+            aligned.append({
+                "planned_cut": cut,
+                "moved": False,
+                "note": (f"local change is real but not persistent "
+                         f"(persistence {peak_pers:.2f} < {float(min_persistence):.2f}) "
+                         f"-> treated as a false positive, cut not accepted"),
+                "top_candidates": top,
+            })
+            continue
         top = [
             [frame_of(i), round(float(gr), 2), round(float(pr), 2)]
             for i, _lr, gr, pr in window[:3]
@@ -858,7 +892,10 @@ def execute(
             persistence=bool((plan.get("hardcut") or {}).get("hunt_persistence", True)),
         )
         aligned, boundary_tokens = _align_to_profile(
-            profile, planned, tolerance, int(video.shape[2])
+            profile, planned, tolerance, int(video.shape[2]),
+            min_persistence=float(
+                (plan.get("hardcut") or {}).get("hunt_min_persistence", 0.0)
+            ),
         )
         if boundary_tokens:
             boundary_tokens.sort()
@@ -957,6 +994,7 @@ def execute(
                 policy=str(_hc.get("calm_policy", "calm_overlap")),
                 abstain_below=float(_hc.get("calm_abstain_below", 0.0)),
                 calm_min_quality=float(_hc.get("calm_min_quality", 0.0)),
+                too_quiet_below=float(_hc.get("calm_too_quiet_below", 0.0)),
             )
             segment_frames = calm_boundaries
             for _n in _calm_notes:

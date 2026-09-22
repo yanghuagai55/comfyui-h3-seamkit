@@ -668,6 +668,24 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     tooltip="逐缝质量门：窗内最优点的分数仍高于它就退回计划点硬切。分数以全片中位为 1.0，0.8 表示「至少比平时安静两成」。0 = 关闭。",
                     advanced=True,
                 ),
+                io.Float.Input(
+                    "hunt_min_persistence",
+                    default=0.8,
+                    min=0.0,
+                    max=1.0,
+                    step=0.02,
+                    tooltip="hunt 采纳门：检测到的局部变化若持久性低于本值，判为假信号（闪烁/抖动/纹理划过）不予采纳，退回计划点。0 = 关闭。",
+                    advanced=True,
+                ),
+                io.Float.Input(
+                    "calm_too_quiet_below",
+                    default=0.05,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="平缓搜索的下限门：窗内最优点若过于静止（分数低于本值），4 帧量化的顿挫会显眼，此时不挪边界、直接硬切。0 = 关闭。",
+                    advanced=True,
+                ),
                 io.Boolean.Input(
                     "hunt_persistence",
                     default=True,
@@ -722,6 +740,8 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         calm_abstain_below: float = 0.0,
         hunt_persistence: bool = True,
         calm_min_quality: float = 0.8,
+        hunt_min_persistence: float = 0.8,
+        calm_too_quiet_below: float = 0.05,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -786,6 +806,8 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["calm_abstain_below"] = max(0.0, float(calm_abstain_below))
         _hc["hunt_persistence"] = bool(hunt_persistence)
         _hc["calm_min_quality"] = max(0.0, float(calm_min_quality))
+        _hc["hunt_min_persistence"] = max(0.0, float(hunt_min_persistence))
+        _hc["calm_too_quiet_below"] = max(0.0, float(calm_too_quiet_below))
 
         note = ""
         if not used_upstream:
