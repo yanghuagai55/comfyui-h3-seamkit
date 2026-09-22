@@ -484,7 +484,7 @@ def _reduce_hw(x, mode: str = "mean"):
 
 
 def _latent_change_profile(video, win: int = 2, compensate: bool = False,
-                           reduce_mode: str = "mean") -> list:
+                           reduce_mode: str = "mean", persistence: bool = True) -> list:
     """Every token boundary scored TWICE - no threshold anywhere.
 
     `[(token_index, local_ratio, global_ratio), ...]` for all boundaries; the
@@ -539,13 +539,44 @@ def _latent_change_profile(video, win: int = 2, compensate: bool = False,
     jmed = float(j3.median())
     if jmed <= 0:
         jmed = 1.0
+
+    # ---- persistence (IDEA from PERSIST, arXiv:2608.29287) ----------------
+    # Their reformulation of shot-boundary detection: a frame is a real boundary
+    # only when its local change evidence comes with a PERSISTENT update of the
+    # clip's latent state, not a transient excursion that "returns to the
+    # surrounding trend".  Flicker, hand-held shake, motion blur, occlusion and a
+    # texture passing a spot all produce equally sharp local change without a new
+    # shot - and our d1/d3 cannot tell those apart from a real cut.
+    #
+    # Hand-rolled from the paper's idea (the paper trains a FiLM-conditioned
+    # classifier; we use a plain window-mean difference).  No code copied.
+    #   before = mean latent state of the tokens BEFORE the change
+    #   after  = mean latent state of the tokens AFTER it
+    #   real cut  -> two different steady states      -> large
+    #   flicker   -> after falls back toward before   -> small
+    half = max(1, int(win) * 5)          # one token = 5 slots; same phase either side
+    pers = [0.0] * n
+    if persistence and v.shape[2] >= 4:
+        for i in range(n):
+            lo, hi = max(0, i - half), min(n, i + half)
+            if lo >= i or hi <= i + 1:
+                continue
+            _before = v[:, :, lo:i].mean(dim=2)
+            _after = v[:, :, i + 1:hi].mean(dim=2)
+            _den = 0.5 * (float(_before.abs().mean()) + float(_after.abs().mean())) + 1e-6
+            pers[i] = float((_after - _before).abs().mean()) / _den
+        _pmax = max(pers) if pers else 0.0
+        if _pmax > 0:
+            pers = [p / _pmax for p in pers]     # normalise to the clip's own max
+
     out = []
     for i in range(n):
         lo, hi = max(0, i - win), min(n, i + win + 1)
         med = float(d[lo:hi].median())
         if med <= 0:
             continue
-        out.append((i, float(d[i]) / med, float(d[i]) / gmed, float(j3[i]) / jmed))
+        out.append((i, float(d[i]) / med, float(d[i]) / gmed,
+                    float(j3[i]) / jmed, pers[i]))
     return out
 
 def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
@@ -634,20 +665,28 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
 
     aligned, boundary_tokens = [], []
     for cut in planned:
-        # index, not unpack: the profile grew a fourth column (|d3| ratio)
+        # index, not unpack: the profile grew columns (|d3|, persistence)
         window = [
-            (int(row[0]), row[1], float(row[2]))
+            (int(row[0]), row[1], float(row[2]),
+             float(row[4]) if len(row) > 4 else 1.0)
             for row in profile
             if 0 < int(row[0]) + 1 < int(video_tokens)
             and abs(frame_of(int(row[0])) - cut) <= tolerance
         ]
         if not window:
             continue
-        # rank by the GLOBAL score: the local one suppresses the turn itself
-        window.sort(key=lambda x: -x[2])
-        peak_idx, peak_local, peak_ratio = window[0]
+        # Rank by local_change x persistence.  The global score is still the
+        # local-change term (the LOCAL variant suppresses a turn, see above); the
+        # persistence term is what separates a real cut from a sharp transient.
+        # The 0.25 floor keeps the old ordering if persistence is unavailable
+        # (older profiles, or the switch off) so behaviour degrades, not breaks.
+        window.sort(key=lambda x: -(x[2] * (0.25 + 0.75 * x[3])))
+        peak_idx, peak_local, peak_ratio, _peak_pers = window[0][:4]
         peak_frame = frame_of(peak_idx)
-        top = [[frame_of(i), round(float(gr), 2)] for i, _lr, gr in window[:3]]
+        top = [
+            [frame_of(i), round(float(gr), 2), round(float(pr), 2)]
+            for i, _lr, gr, pr in window[:3]
+        ]
         note = None
 
         if peak_ratio < FLAT_RATIO:
@@ -798,6 +837,7 @@ def execute(
             video,
             compensate=bool((plan.get("hardcut") or {}).get("profile_camera_compensate", False)),
             reduce_mode=str((plan.get("hardcut") or {}).get("profile_reduce", "mean")),
+            persistence=bool((plan.get("hardcut") or {}).get("hunt_persistence", True)),
         )
         aligned, boundary_tokens = _align_to_profile(
             profile, planned, tolerance, int(video.shape[2])

@@ -654,6 +654,11 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     step=0.05,
                     tooltip="放弃门：jerk 的对比度(max/mean)低于本值就整片不做搜索、保持计划切点。0=关闭。",
                 ),
+                io.Boolean.Input(
+                    "hunt_persistence",
+                    default=True,
+                    tooltip="hunt 排序时加入「持久性」判据：真转场 = 变化后停在新状态；闪烁/抖动/纹理划过 = 变化后回到原状态。关掉则退回旧的纯局部变化排序。",
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -700,6 +705,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         profile_camera_compensate: bool = False,
         profile_reduce: str = "mean",
         calm_abstain_below: float = 0.0,
+        hunt_persistence: bool = True,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -759,6 +765,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["profile_camera_compensate"] = bool(profile_camera_compensate)
         _hc["profile_reduce"] = str(profile_reduce)
         _hc["calm_abstain_below"] = max(0.0, float(calm_abstain_below))
+        _hc["hunt_persistence"] = bool(hunt_persistence)
 
         note = ""
         if not used_upstream:
