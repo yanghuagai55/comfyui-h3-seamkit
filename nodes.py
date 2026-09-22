@@ -158,7 +158,7 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                     default=8.0,
                     min=1.0,
                     max=MAX_SECONDS,
-                    step=0.5,
+                    step=0.01,
                     tooltip="Clip length in seconds. Snapped to the 17n+5 frame grid.",
                 ),
                 io.Int.Input(
