@@ -850,6 +850,35 @@ def execute(
         if seam_hunt_note:
             seam_hunt["note"] = seam_hunt_note
 
+        # ---- jerk profile digest -------------------------------------------
+        # Why: a high-jerk peak may sit on the FALLING side of a burst.  Motion
+        # that is violent enough makes the model give up and smear, and the
+        # smear flattens frame-to-frame differences, so |d3| can fall off again
+        # past the peak.  If that happens, the chosen boundary is "the edge of
+        # the burst" rather than "the messiest frame" - and whether the seam is
+        # hidden then depends on the masking still being there.  These numbers
+        # let us see the curve's shape instead of arguing about it.
+        try:
+            _jr = sorted(
+                ((int(r[0]), float(r[3])) for r in profile if len(r) > 3),
+                key=lambda kv: -kv[1],
+            )[:6]
+            if _jr:
+                seam_hunt["jerk_peaks"] = [
+                    {"token": t, "frame": int(t) // 5 * FRAME_GRID,
+                     "ratio": round(r, 2)}
+                    for t, r in _jr
+                ]
+                _med_t = max(1, len(profile) // 2)
+                seam_hunt["jerk_shape_note"] = (
+                    "top-6 |d3| ratios, token->frame via token//5*17. "
+                    "A peak followed by a sharp fall means the burst is being "
+                    "smeared (motion overload); a flat top means sustained motion."
+                )
+                seam_hunt["profile_len"] = len(profile)
+        except Exception as _pe:
+            seam_hunt["jerk_peaks_error"] = str(_pe)
+
     # ---- adaptive: if the hunt could not vouch for a cut, move that boundary to
     # the CALMEST frame nearby and give that seam an anchored overlap, instead of
     # cutting through continuous content.  Needs the hunt's profile, so it only
