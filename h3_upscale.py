@@ -704,7 +704,7 @@ GRID_FRAMES_PER_TOKEN = 4
 
 
 def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
-                      min_persistence: float = 0.0):
+                      min_persistence: float = 0.0, search_window: int = 0):
     """Per planned cut: the strongest latent change in the window, then SNAP it
     onto the exclusive-frame grid the window start requires.
 
@@ -741,6 +741,13 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
                 return t
         return None
 
+    # The SEARCH radius and the RESIDUAL threshold are different things.  The
+    # window must be wide enough to actually see the model's turn (measured
+    # drift runs 1-17 frames, and 78 vs a planned 85 is a typical case); the
+    # threshold decides whether, once measured, the boundary is trustworthy.
+    # Sharing one number made a small tolerance blind the detector entirely.
+    _win = int(search_window) if int(search_window) > 0 else max(int(tolerance), 34)
+
     aligned, boundary_tokens = [], []
     for cut in planned:
         # index, not unpack: the profile grew columns (|d3|, persistence)
@@ -749,7 +756,7 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
              float(row[4]) if len(row) > 4 else 1.0)
             for row in profile
             if 0 < int(row[0]) + 1 < int(video_tokens)
-            and abs(frame_of(int(row[0])) - cut) <= tolerance
+            and abs(frame_of(int(row[0])) - cut) <= _win
         ]
         if not window:
             # Silent before.  A tolerance narrower than one token cell (17
@@ -948,6 +955,7 @@ def execute(
             min_persistence=float(
                 (plan.get("hardcut") or {}).get("hunt_min_persistence", 0.0)
             ),
+            search_window=int((plan.get("hardcut") or {}).get("hunt_search_window", 0)),
         )
         if boundary_tokens:
             boundary_tokens.sort()
