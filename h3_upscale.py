@@ -204,9 +204,14 @@ def find_calm_boundaries(
             cands = []   # off-grid plan with no room to snap
         cands = [f for f in cands if all(abs(f - int(o)) >= int(min_sep) for o in refs)]
         if not cands:
+            # Same rule as the gates: with nothing suitable to move to, do not
+            # break the content - keep the planned cut and anchor it.
             boundaries.append(cut)
-            overlaps.append(0)
-            notes.append(f"cut {cut}: no calm candidate in window -> keep plan (hard cut)")
+            overlaps.append(int(overlap_frames))
+            notes.append(
+                f"cut {cut}: no calm candidate in window -> keep plan, "
+                f"overlap {int(overlap_frames)}f"
+            )
             continue
 
         def tok_of(frame):
