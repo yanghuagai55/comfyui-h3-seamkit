@@ -903,10 +903,15 @@ def execute(
         0, min(int(plan.get("locked_overlap_tokens", ov_tokens)), ov_tokens)
     )
     if ov_input:
+        # This is the FALLBACK only: when the calm search runs it decides each
+        # seam individually (calm_overlaps), and a hard cut there is 0.  Say so,
+        # otherwise the line reads as if every seam got the global value.
         print(
-            f"[HardCut]   overlap: requested {ov_input}f -> effective {ov_tokens}f "
+            f"[HardCut]   overlap: fallback {ov_input}f -> {ov_tokens}f "
             f"(chunk {_chunk}f), locked {locked_overlap}f"
-            + ("   [clamped below one window]" if ov_tokens != ov_input else ""),
+            + ("   [clamped below one window]" if ov_tokens != ov_input else "")
+            + ("   | per-seam values below take precedence"
+               if calm_overlaps is not None else ""),
             flush=True,
         )
     if segment_frames:
