@@ -659,6 +659,15 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     tooltip="放弃门：jerk 的对比度(max/mean)低于本值就整片不做搜索、保持计划切点。0=关闭。",
                     advanced=True,
                 ),
+                io.Float.Input(
+                    "calm_min_quality",
+                    default=0.8,
+                    min=0.0,
+                    max=3.0,
+                    step=0.05,
+                    tooltip="逐缝质量门：窗内最优点的分数仍高于它就退回计划点硬切。分数以全片中位为 1.0，0.8 表示「至少比平时安静两成」。0 = 关闭。",
+                    advanced=True,
+                ),
                 io.Boolean.Input(
                     "hunt_persistence",
                     default=True,
@@ -712,6 +721,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         profile_reduce: str = "mean",
         calm_abstain_below: float = 0.0,
         hunt_persistence: bool = True,
+        calm_min_quality: float = 0.8,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -775,6 +785,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["profile_reduce"] = str(profile_reduce)
         _hc["calm_abstain_below"] = max(0.0, float(calm_abstain_below))
         _hc["hunt_persistence"] = bool(hunt_persistence)
+        _hc["calm_min_quality"] = max(0.0, float(calm_min_quality))
 
         note = ""
         if not used_upstream:

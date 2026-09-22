@@ -94,6 +94,7 @@ def find_calm_boundaries(
     grid: int = FRAME_GRID,
     policy: str = "calm_overlap",
     abstain_below: float = 0.0,
+    calm_min_quality: float = 0.0,
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
@@ -245,10 +246,27 @@ def find_calm_boundaries(
             continue
 
         best = min(cands, key=lambda f: score.get(tok_of(f), float("inf")))
-        if score.get(tok_of(best), float("inf")) == float("inf"):
+        best_score = score.get(tok_of(best), float("inf"))
+        if best_score == float("inf"):
             boundaries.append(cut)
             overlaps.append(0)
             notes.append(f"cut {cut}: profile has no score here -> keep plan (hard cut)")
+            continue
+        # ---- per-seam quality gate ------------------------------------------
+        # score is normalised so that 1.0 = the clip's own median, i.e. "as
+        # eventful as usual".  A move is only worth making if the best frame in
+        # range is actually calm; otherwise we would be sliding the boundary to
+        # a spot that is merely the least-bad one and then adding an anchored
+        # overlap THERE - the one combination with no defence: alignment blends
+        # two independently generated versions of a busy frame, which reads as
+        # ghosting.  Better to stay put and hard cut.
+        if calm_min_quality > 0.0 and best_score > float(calm_min_quality):
+            boundaries.append(cut)
+            overlaps.append(0)
+            notes.append(
+                f"cut {cut}: no calm frame within {window}f (best {best_score:.2f} "
+                f"> calm_min_quality {float(calm_min_quality):.2f}) -> keep plan, hard cut"
+            )
             continue
         boundaries.append(int(best))
         overlaps.append(int(overlap_frames))
@@ -899,8 +917,11 @@ def execute(
         # hidden then depends on the masking still being there.  These numbers
         # let us see the curve's shape instead of arguing about it.
         try:
+            # only 17k (token 5k) is a legal boundary, so only those are worth
+            # reporting - a peak on a shared token cannot be cut at anyway
             _jr = sorted(
-                ((int(r[0]), float(r[3])) for r in profile if len(r) > 3),
+                ((int(r[0]), float(r[3])) for r in profile
+                 if len(r) > 3 and int(r[0]) % 5 == 0),
                 key=lambda kv: -kv[1],
             )[:6]
             if _jr:
@@ -911,9 +932,9 @@ def execute(
                 ]
                 _med_t = max(1, len(profile) // 2)
                 seam_hunt["jerk_shape_note"] = (
-                    "top-6 |d3| ratios, token->frame via token//5*17. "
-                    "A peak followed by a sharp fall means the burst is being "
-                    "smeared (motion overload); a flat top means sustained motion."
+                    "top-6 |d3| ratios on exclusive frames only (token 5k -> frame 17k), "
+                    "the only frames a boundary may sit on. A peak followed by a sharp "
+                    "fall means the burst is being smeared; a flat top means sustained motion."
                 )
                 seam_hunt["profile_len"] = len(profile)
         except Exception as _pe:
@@ -935,6 +956,7 @@ def execute(
                 seam_tolerance=int(_hc.get("seam_tolerance", 17)),
                 policy=str(_hc.get("calm_policy", "calm_overlap")),
                 abstain_below=float(_hc.get("calm_abstain_below", 0.0)),
+                calm_min_quality=float(_hc.get("calm_min_quality", 0.0)),
             )
             segment_frames = calm_boundaries
             for _n in _calm_notes:
