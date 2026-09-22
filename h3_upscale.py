@@ -1186,7 +1186,14 @@ def execute(
             chunk_noise_video,
             chunk_noise_audio,
         )
-        if seg_overlap:
+        # Blend or freeze?  Both are upstream paths over the SAME overlap frames:
+        #   _append_video                  -> linear crossfade across the overlap
+        #   _append_video_guarded_overlap  -> keep the published frames verbatim
+        # We defaulted to the frozen one to avoid ghosting when both sides are
+        # moving.  But freezing means the boundary is still a hard join, which
+        # reads as a cut - so it is now a switch, and blending is available for
+        # material where ghosting is not a risk (still or slow shots).
+        if seg_overlap and not bool((plan.get("hardcut") or {}).get("seam_blend", False)):
             # guarded overlap: the first `locked_overlap` tokens stay exactly as
             # the previous window published them, the remaining `transition`
             # tokens take this window's fresh sample, then the rest is appended.
@@ -1200,8 +1207,11 @@ def execute(
                 accumulated, sampled, start_token, _locked_tokens
             )
             print(f"[HardCut]   window {len(segment_reports)}: anchored prefix "
-                  f"{seg_overlap} frames at {start_frame}", flush=True)
+                  f"{seg_overlap} frames at {start_frame} (frozen)", flush=True)
         else:
+            if seg_overlap:
+                print(f"[HardCut]   window {len(segment_reports)}: crossfaded overlap "
+                      f"{seg_overlap} frames at {start_frame}", flush=True)
             accumulated = core._append_video(accumulated, sampled, start_token)
         prev_end_frame = int(end_frame)
         try:

@@ -668,6 +668,12 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     tooltip="逐缝质量门：窗内最优点的分数仍高于它就退回计划点硬切。分数以全片中位为 1.0，0.8 表示「至少比平时安静两成」。0 = 关闭。",
                     advanced=True,
                 ),
+                io.Boolean.Input(
+                    "seam_blend",
+                    default=False,
+                    tooltip="缝的处理：关=冻结式锚定（重叠区全用上一段的帧，边界仍是硬接，运动大时安全）；开=线性混合（crossfade，边界消失，但运动大的地方会重影）。",
+                    advanced=True,
+                ),
                 io.Float.Input(
                     "hunt_min_persistence",
                     default=0.8,
@@ -741,6 +747,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         hunt_persistence: bool = True,
         calm_min_quality: float = 0.8,
         hunt_min_persistence: float = 0.8,
+        seam_blend: bool = False,
         calm_too_quiet_below: float = 0.05,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
@@ -807,6 +814,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["hunt_persistence"] = bool(hunt_persistence)
         _hc["calm_min_quality"] = max(0.0, float(calm_min_quality))
         _hc["hunt_min_persistence"] = max(0.0, float(hunt_min_persistence))
+        _hc["seam_blend"] = bool(seam_blend)
         _hc["calm_too_quiet_below"] = max(0.0, float(calm_too_quiet_below))
 
         note = ""
