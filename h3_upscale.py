@@ -1214,27 +1214,29 @@ def execute(
                       f"{seg_overlap} frames at {start_frame}", flush=True)
             accumulated = core._append_video(accumulated, sampled, start_token)
         prev_end_frame = int(end_frame)
-        try:
-            if not show_memory_log:
-                raise _SkipProbe()
-            _free, _total = torch.cuda.mem_get_info()
-            print(
-                f"[HardCut]   seg {len(segment_reports)} done: "
-                f"alloc {torch.cuda.memory_allocated()/2**30:.2f}GB  "
-                f"reserved {torch.cuda.memory_reserved()/2**30:.2f}GB  "
-                f"device-free {_free/2**30:.2f}GB",
-                flush=True,
-            )
-            if _empty_between:
-                comfy.model_management.soft_empty_cache()
-                _free2, _ = torch.cuda.mem_get_info()
-                if _free2 - _free > 32 * 2**20:
-                    print(f"[HardCut]   cache released: +{(_free2-_free)/2**30:.2f}GB free",
-                          flush=True)
-        except _SkipProbe:
-            pass
-        except Exception as _mm_exc:
-            print(f"[HardCut]   mem probe skipped: {_mm_exc}", flush=True)
+        # The probe is optional; when it is off, simply do not run it.  (An
+        # earlier version raised a private exception to skip the block and
+        # caught it below - but the class was never defined anywhere, so
+        # turning the switch off took the whole node down with a NameError.
+        # Plain control flow has no such failure mode.)
+        if show_memory_log:
+            try:
+                _free, _total = torch.cuda.mem_get_info()
+                print(
+                    f"[HardCut]   seg {len(segment_reports)} done: "
+                    f"alloc {torch.cuda.memory_allocated()/2**30:.2f}GB  "
+                    f"reserved {torch.cuda.memory_reserved()/2**30:.2f}GB  "
+                    f"device-free {_free/2**30:.2f}GB",
+                    flush=True,
+                )
+                if _empty_between:
+                    comfy.model_management.soft_empty_cache()
+                    _free2, _ = torch.cuda.mem_get_info()
+                    if _free2 - _free > 32 * 2**20:
+                        print(f"[HardCut]   cache released: +{(_free2-_free)/2**30:.2f}GB free",
+                              flush=True)
+            except Exception as _mm_exc:
+                print(f"[HardCut]   mem probe skipped: {_mm_exc}", flush=True)
         segment_reports.append(
             {
                 "index": len(segment_reports),
