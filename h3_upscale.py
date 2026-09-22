@@ -114,10 +114,16 @@ def find_calm_boundaries(
     score = {}
     for row in profile or ():
         try:
-            idx, _local, glob = int(row[0]), row[1], float(row[2])
+            idx, glob = int(row[0]), float(row[2])
+            # column 3 is the |d3| (jerk) ratio; rank by the WORSE of the two so
+            # a spot that is quiet in value terms but busy in jerk terms (a
+            # "drifter": steady motion, high velocity, low jerk - or the reverse)
+            # does not win.  Falls back to the first difference alone when an
+            # older profile has only three columns.
+            jerk = float(row[3]) if len(row) > 3 else glob
         except (TypeError, IndexError, ValueError):
             continue
-        score[idx] = glob
+        score[idx] = max(glob, jerk)
     entry_by_cut = {}
     for e in aligned or ():
         try:
@@ -402,13 +408,37 @@ def _latent_change_profile(video, win: int = 2) -> list:
     gmed = float(d.median())
     if gmed <= 0:
         return []
+    # ---- third difference (jerk) -------------------------------------------
+    # IDEA (re-implemented, no code copied) from MAINodes' H3 Jerk Oracle
+    # (matlowai, GPL-3.0-or-later - same licence as this pack), which ranks
+    # tokens by |d3| instead of |d1|.  Reason, in their words and measurements:
+    # the value-domain first difference is contaminated by motion energy - a
+    # textured object passing a location makes the values there pulse, and a
+    # pulse has large differences of EVERY order even at constant velocity
+    # (they measured corr(|d1|, |d3|) = 0.96-0.98 on real clips).  |d3| measures
+    # how abruptly the motion CHANGES, which is closer to what "calm" means.
+    if v.shape[2] >= 4:
+        j3 = (
+            v[:, :, 3:] - 3.0 * v[:, :, 2:-1] + 3.0 * v[:, :, 1:-2] - v[:, :, :-3]
+        ).abs().mean(dim=(0, 1, 3, 4))
+        # centre-align onto d's (n) grid: leading + trailing edge pad
+        j3 = torch.nn.functional.pad(j3, (1, 1), mode="replicate")
+        if int(j3.numel()) < n:
+            j3 = torch.nn.functional.pad(j3, (0, n - int(j3.numel())), mode="replicate")
+        elif int(j3.numel()) > n:
+            j3 = j3[:n]
+    else:
+        j3 = torch.zeros_like(d)
+    jmed = float(j3.median())
+    if jmed <= 0:
+        jmed = 1.0
     out = []
     for i in range(n):
         lo, hi = max(0, i - win), min(n, i + win + 1)
         med = float(d[lo:hi].median())
         if med <= 0:
             continue
-        out.append((i, float(d[i]) / med, float(d[i]) / gmed))
+        out.append((i, float(d[i]) / med, float(d[i]) / gmed, float(j3[i]) / jmed))
     return out
 
 def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
@@ -497,10 +527,12 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int):
 
     aligned, boundary_tokens = [], []
     for cut in planned:
+        # index, not unpack: the profile grew a fourth column (|d3| ratio)
         window = [
-            (idx, lr, gr) for idx, lr, gr in profile
-            if 0 < int(idx) + 1 < int(video_tokens)
-            and abs(frame_of(idx) - cut) <= tolerance
+            (int(row[0]), row[1], float(row[2]))
+            for row in profile
+            if 0 < int(row[0]) + 1 < int(video_tokens)
+            and abs(frame_of(int(row[0])) - cut) <= tolerance
         ]
         if not window:
             continue
