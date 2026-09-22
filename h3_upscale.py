@@ -719,6 +719,10 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
         window.sort(key=lambda x: -(x[2] * (0.25 + 0.75 * x[3])))
         peak_idx, peak_local, peak_ratio, peak_pers = window[0][:4]
         peak_frame = frame_of(peak_idx)
+        top = [
+            [frame_of(i), round(float(gr), 2), round(float(pr), 2)]
+            for i, _lr, gr, pr in window[:3]
+        ]
         # ---- false-positive gate (PERSIST) ---------------------------------
         # A sharp local change is not a shot change on its own: a flicker, a
         # shake, or a texture sweeping past produce the same bump.  What a real
@@ -735,10 +739,6 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
                 "top_candidates": top,
             })
             continue
-        top = [
-            [frame_of(i), round(float(gr), 2), round(float(pr), 2)]
-            for i, _lr, gr, pr in window[:3]
-        ]
         note = None
 
         if peak_ratio < FLAT_RATIO:
