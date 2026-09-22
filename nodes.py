@@ -635,6 +635,25 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "靠运动掩蔽藏缝，不用重叠。"
                     ),
                 ),
+                io.Boolean.Input(
+                    "profile_camera_compensate",
+                    default=False,
+                    tooltip="先按整数位移把每帧对齐到前一帧，再做变化剖面。纯运镜(平移/摇镜)会被读成静止，只有相对相机的运动留下。提示词里有运镜时打开它。",
+                ),
+                io.Combo.Input(
+                    "profile_reduce",
+                    options=["mean", "max", "top-decile"],
+                    default="mean",
+                    tooltip="空间聚合方式：mean=全网平均(默认)；max=取最热的一点；top-decile=最热10%的均值。后两者不会把局部热点平均掉。",
+                ),
+                io.Float.Input(
+                    "calm_abstain_below",
+                    default=0.0,
+                    min=0.0,
+                    max=10.0,
+                    step=0.05,
+                    tooltip="放弃门：jerk 的对比度(max/mean)低于本值就整片不做搜索、保持计划切点。0=关闭。",
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -678,6 +697,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         calm_search_window: int = 34,
         calm_overlap_frames: int = 17,
         calm_policy: str = "calm_overlap",
+        profile_camera_compensate: bool = False,
+        profile_reduce: str = "mean",
+        calm_abstain_below: float = 0.0,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -734,6 +756,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["calm_search_window"] = max(0, int(calm_search_window))
         _hc["calm_overlap_frames"] = max(0, int(calm_overlap_frames))
         _hc["calm_policy"] = str(calm_policy)
+        _hc["profile_camera_compensate"] = bool(profile_camera_compensate)
+        _hc["profile_reduce"] = str(profile_reduce)
+        _hc["calm_abstain_below"] = max(0.0, float(calm_abstain_below))
 
         note = ""
         if not used_upstream:

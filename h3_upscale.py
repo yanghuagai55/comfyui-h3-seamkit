@@ -93,6 +93,7 @@ def find_calm_boundaries(
     min_sep: int = 34,
     grid: int = FRAME_GRID,
     policy: str = "calm_overlap",
+    abstain_below: float = 0.0,
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
@@ -133,6 +134,23 @@ def find_calm_boundaries(
             entry_by_cut[int(e.get("planned_cut"))] = e
         except (TypeError, ValueError):
             continue
+
+    # ---- abstain: a quantile can RANK but cannot say "nothing to do here" ----
+    # (idea from MAINodes' Jerk Oracle `abstain_below`).  If the jerk profile has
+    # almost no contrast, every candidate is equally unremarkable and moving a
+    # boundary buys nothing; keep the plan untouched and say so.
+    if abstain_below > 0.0 and jerk_by_idx:
+        _vals = [v for v in jerk_by_idx.values() if v > 0]
+        if _vals:
+            _mean = sum(_vals) / len(_vals)
+            _contrast = (max(_vals) / _mean) if _mean > 0 else 1.0
+            if _contrast < abstain_below:
+                return (
+                    [int(c) for c in planned],
+                    [0] * len(planned),
+                    [f"clip too flat for a search (jerk contrast {_contrast:.2f} < "
+                     f"{abstain_below:.2f}) -> keep every planned cut as a hard cut"],
+                )
 
     boundaries, overlaps, notes = [], [], []
     for cut in planned:
@@ -416,7 +434,57 @@ def _sample_fullframe(
     return sampled.tensors[0]
 
 
-def _latent_change_profile(video, win: int = 2) -> list:
+def _camera_compensate(v, max_shift: int = 3):
+    """Align each token to its predecessor by the integer (dy, dx) latent shift
+    that minimises their mean absolute difference, accumulating along the clip,
+    so a steady pan or truck reads as stillness and only motion AGAINST the
+    camera survives into the differences.
+
+    IDEA re-implemented (no code copied) from MAINodes (matlowai,
+    GPL-3.0-or-later - same licence as this pack).  Their note is the whole
+    reason this exists: "the documented cause of panrun's over-dilation
+    (124 -> 345 frames) was the pan itself scoring as jerk."  Our prompt
+    templates offer 14 camera moves, so without this a truck or arc shot is
+    read as violent motion and the calm search walks away from perfectly good
+    boundaries.
+
+    Edges wrap (torch.roll); at <= max_shift latent cells on a ~64-cell frame
+    that is a border effect, not a signal.
+    """
+    T = int(v.shape[2])
+    if T < 2 or max_shift <= 0:
+        return v
+    frames = [v[:, :, 0]]
+    dy = dx = 0
+    for t in range(1, T):
+        prev = frames[-1]
+        cur = v[:, :, t]
+        best, best_shift = None, (dy, dx)
+        for sy in range(dy - max_shift, dy + max_shift + 1):
+            for sx in range(dx - max_shift, dx + max_shift + 1):
+                cand = torch.roll(cur, (sy, sx), dims=(-2, -1))
+                err = float((cand - prev).abs().mean())
+                if best is None or err < best:
+                    best, best_shift = err, (sy, sx)
+        dy, dx = best_shift
+        frames.append(torch.roll(cur, (dy, dx), dims=(-2, -1)))
+    return torch.stack(frames, dim=2)
+
+
+def _reduce_hw(x, mode: str = "mean"):
+    """Collapse (1, C, T, h, w) -> (T,).  `mean` matches the community default;
+    `max` / `top-decile` keep a small hot region from being averaged away."""
+    if mode == "max":
+        return x.amax(dim=(0, 1, 3, 4))
+    if str(mode).startswith("top"):
+        flat = x.flatten(-2)                       # (1, C, T, h*w)
+        k = max(1, int(flat.shape[-1]) // 10)
+        return flat.topk(k, dim=-1).values.mean(dim=(0, 1, 3))
+    return x.mean(dim=(0, 1, 3, 4))
+
+
+def _latent_change_profile(video, win: int = 2, compensate: bool = False,
+                           reduce_mode: str = "mean") -> list:
     """Every token boundary scored TWICE - no threshold anywhere.
 
     `[(token_index, local_ratio, global_ratio), ...]` for all boundaries; the
@@ -438,7 +506,9 @@ def _latent_change_profile(video, win: int = 2) -> list:
     v = video.detach().float()
     if v.ndim != 5 or v.shape[2] < 3:
         return []
-    d = (v[:, :, 1:] - v[:, :, :-1]).abs().mean(dim=(0, 1, 3, 4))
+    if compensate:
+        v = _camera_compensate(v)
+    d = _reduce_hw((v[:, :, 1:] - v[:, :, :-1]).abs(), reduce_mode)
     n = int(d.numel())
     gmed = float(d.median())
     if gmed <= 0:
@@ -453,13 +523,15 @@ def _latent_change_profile(video, win: int = 2) -> list:
     # (they measured corr(|d1|, |d3|) = 0.96-0.98 on real clips).  |d3| measures
     # how abruptly the motion CHANGES, which is closer to what "calm" means.
     if v.shape[2] >= 4:
-        j3 = (
-            v[:, :, 3:] - 3.0 * v[:, :, 2:-1] + 3.0 * v[:, :, 1:-2] - v[:, :, :-3]
-        ).abs().mean(dim=(0, 1, 3, 4))
-        # centre-align onto d's (n) grid: leading + trailing edge pad
-        j3 = torch.nn.functional.pad(j3, (1, 1), mode="replicate")
+        j3 = _reduce_hw(
+            (v[:, :, 3:] - 3.0 * v[:, :, 2:-1] + 3.0 * v[:, :, 1:-2] - v[:, :, :-3]).abs(),
+            reduce_mode,
+        )
+        # centre-align onto d's (n) grid: leading + trailing edge pad.
+        # (F.pad with mode="replicate" rejects 1-D tensors, so grow it by hand.)
+        j3 = torch.cat([j3[:1], j3, j3[-1:]])
         if int(j3.numel()) < n:
-            j3 = torch.nn.functional.pad(j3, (0, n - int(j3.numel())), mode="replicate")
+            j3 = torch.cat([j3, j3[-1:].expand(n - int(j3.numel()))])
         elif int(j3.numel()) > n:
             j3 = j3[:n]
     else:
@@ -722,7 +794,11 @@ def execute(
         # STRONGEST latent change within the tolerance window of each planned
         # cut.  No threshold; the top candidates go into the report so the
         # latent's behaviour near the cut is visible at last.
-        profile = _latent_change_profile(video)
+        profile = _latent_change_profile(
+            video,
+            compensate=bool((plan.get("hardcut") or {}).get("profile_camera_compensate", False)),
+            reduce_mode=str((plan.get("hardcut") or {}).get("profile_reduce", "mean")),
+        )
         aligned, boundary_tokens = _align_to_profile(
             profile, planned, tolerance, int(video.shape[2])
         )
@@ -789,6 +865,7 @@ def execute(
                 overlap_frames=int(_hc.get("calm_overlap_frames", 17)),
                 seam_tolerance=int(_hc.get("seam_tolerance", 17)),
                 policy=str(_hc.get("calm_policy", "calm_overlap")),
+                abstain_below=float(_hc.get("calm_abstain_below", 0.0)),
             )
             segment_frames = calm_boundaries
             for _n in _calm_notes:
