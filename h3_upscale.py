@@ -982,6 +982,12 @@ def execute(
     # cutting through continuous content.  Needs the hunt's profile, so it only
     # runs when auto_seam_hunt is on.
     calm_boundaries = None
+    # Log lines are buffered and emitted in READING order at the end, not in
+    # code order: the flow is params -> per-cut detection -> decisions ->
+    # fallback config -> summary, while the code computes the plan first, hunts
+    # second and decides third.  Printing as we go put the decisions above the
+    # detections they came from.
+    _log_buf = {"cfg": [], "hunt": [], "calm": [], "overlap": [], "sum": []}
     calm_overlaps = None
     if auto_seam_hunt and planned and isinstance(plan.get("hardcut"), dict):
         _hc = plan["hardcut"]
@@ -998,7 +1004,7 @@ def execute(
             )
             segment_frames = calm_boundaries
             for _n in _calm_notes:
-                print(f"[HardCut]   calm: {_n}", flush=True)
+                _log_buf["calm"].append(f"[HardCut]   calm: {_n}")
 
     # ---- free the text encoder before sampling ----
     # The conditioning above is fully built, and nothing downstream of this point
@@ -1035,13 +1041,12 @@ def execute(
         # This is the FALLBACK only: when the calm search runs it decides each
         # seam individually (calm_overlaps), and a hard cut there is 0.  Say so,
         # otherwise the line reads as if every seam got the global value.
-        print(
+        _log_buf["overlap"].append(
             f"[HardCut]   overlap: fallback {ov_input}f -> {ov_tokens}f "
             f"(chunk {_chunk}f), locked {locked_overlap}f"
             + ("   [clamped below one window]" if ov_tokens != ov_input else "")
             + ("   | per-seam values below take precedence"
-               if calm_overlaps is not None else ""),
-            flush=True,
+               if calm_overlaps is not None else "")
         )
     if segment_frames:
         segments = explicit_segments(
@@ -1075,19 +1080,17 @@ def execute(
         src_tag = ", ".join(
             f"{b}{'' if b in hunted else '*'}" for b in boundaries
         )
-        print(
+        _log_buf["sum"].append(
             f"[HardCut] planned_cuts={planned or '-'} "
             f"boundary_frames=[{src_tag or '-'}] "
             f"segments={len(segments)} lengths={lengths} longest={longest}f"
             + ("   (* = kept on the planned frame, hunt found no turn there)"
-               if any(b not in hunted for b in boundaries) else ""),
-            flush=True,
+               if any(b not in hunted for b in boundaries) else "")
         )
         if seam_hunt:
-            print(
+            _log_buf["cfg"].append(
                 f"[HardCut]   tolerance={seam_hunt.get('tolerance_frames')}f "
-                f"hunt={'on' if auto_seam_hunt else 'off'}",
-                flush=True,
+                f"hunt={'on' if auto_seam_hunt else 'off'}"
             )
             for entry in seam_hunt.get("aligned") or []:
                 moved = entry.get("moved")
@@ -1105,9 +1108,12 @@ def execute(
                      if entry.get("measured_turn_frame") is not None else "")
                     + f", ratio={entry.get('ratio')})"
                 )
-                print(head + tail, flush=True)
+                _log_buf["hunt"].append(head + tail)
             if seam_hunt.get("note"):
-                print(f"[HardCut]   note: {seam_hunt['note']}", flush=True)
+                _log_buf["hunt"].append(f"[HardCut]   note: {seam_hunt['note']}")
+        for _section in ("cfg", "hunt", "calm", "overlap", "sum"):
+            for _line in _log_buf[_section]:
+                print(_line, flush=True)
     except Exception as _log_exc:  # pragma: no cover - logging must never fail the run
         print(f"[HardCut] log error: {_log_exc}", flush=True)
 
