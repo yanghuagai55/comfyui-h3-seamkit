@@ -1184,6 +1184,7 @@ def validate_prompt(
     overlap_frames: int = 0,
     overlap_anchored: bool = False,
     segment_frames: Iterable[float] | None = None,
+    loose: bool = False,
 ) -> dict:
     """Check that a hand-written R2V prompt really describes the plan's hard cut.
 
@@ -1224,10 +1225,12 @@ def validate_prompt(
     known = [h for h in headers if h in PROMPT_SECTIONS]
     missing = [s for s in PROMPT_SECTIONS if s not in set(known)]
     if missing:
-        errors.append(
-            "prompt is missing required section header(s): "
-            + ", ".join(f"{s}:" for s in missing)
-        )
+        # `loose` = the caller has stopped relying on the prompt for boundary
+        # placement (auto_calm_search / overlap), so a free-form prompt is
+        # legitimate and this is advice, not a contradiction.
+        _m = ("prompt is missing required section header(s): "
+              + ", ".join(f"{s}:" for s in missing))
+        (warnings if loose else errors).append(_m)
     duplicated = sorted({h for h in known if known.count(h) > 1})
     if duplicated:
         warnings.append("section header(s) appear more than once: " + ", ".join(duplicated))
@@ -1237,10 +1240,9 @@ def validate_prompt(
     indices = [s["index"] for s in shots]
     info["shots"] = indices
     if not shots:
-        errors.append(
-            "no '[Shot N]' marker found — the executor will cut, but nothing in the "
-            "prompt asks the model for a shot change"
-        )
+        _m = ("no '[Shot N]' marker found — the executor will cut, but nothing in the "
+              "prompt asks the model for a shot change")
+        (warnings if loose else errors).append(_m)
     elif indices != list(range(1, len(indices) + 1)):
         errors.append(
             f"[Shot N] numbering must run consecutively from 1; found {indices}"
@@ -1439,11 +1441,10 @@ def validate_prompt(
 
     # ---- 7. plan wired but the prompt declares nothing ------------------
     if requested and not cut_secs and not missing_stamps:
-        errors.append(
-            f"the plan cuts {len(requested)} time(s) "
-            f"({', '.join(f'{c:.3f}s' for c in requested)}) but the prompt declares no "
-            "'At MM:SS.mmm' timestamp at all"
-        )
+        _m = (f"the plan cuts {len(requested)} time(s) "
+              f"({', '.join(f'{c:.3f}s' for c in requested)}) but the prompt declares no "
+              "'At MM:SS.mmm' timestamp at all")
+        (warnings if loose else errors).append(_m)
     elif cut_secs and not requested:
         warnings.append(
             "no plan was supplied, so the prompt was judged on its own — wire "

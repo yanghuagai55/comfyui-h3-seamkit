@@ -463,6 +463,11 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     step=0.5,
                     tooltip="Clip length in seconds. Snapped to the 17n+5 frame grid.",
                 ),
+                io.Boolean.Input(
+                    "loose_prompt",
+                    default=True,
+                    tooltip="自由提示词：开启时不再强制提示词的段落结构与 At 时间戳，边界由 hunt/自适应搜索决定。关掉则恢复严格校验（提示词必须与执行器切点一致）。",
+                ),
                 io.Float.Input(
                     "target_segment_seconds",
                     default=5.0,
@@ -698,6 +703,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         second_pass_sigma0: float,
         seam_tolerance_frames: int,
         overlap_frames: int = 0,
+        loose_prompt: bool = True,
         auto_calm_search: bool = False,
         calm_search_window: int = 34,
         calm_overlap_frames: int = 17,
@@ -811,6 +817,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                 overlap_frames=max(0, int(overlap_frames)),
                 segment_frames=list(info["cut_frames"]),
                 overlap_anchored=bool(auto_calm_search) or int(overlap_frames) > 0,
+                loose=bool(loose_prompt) or bool(auto_calm_search) or int(overlap_frames) > 0,
             )
             out_prompt = incoming
             errors = result.get("errors") or []
@@ -833,8 +840,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
             out_prompt, moved = incoming, False
             if moved:
                 report += (
-                    "\n\nprompt time shift ("
-                    f"{int(prompt_shift_frames):+d} frame(s)) — only the `prompt` OUTPUT moves:\n"
+                    "\n\nprompt time shift — only the `prompt` OUTPUT moves:\n"
                     "  the executor still splits where the plan says; the model is asked for the "
                     "time it\n  actually turns at, so the shot change and the window boundary "
                     "line up:"
@@ -858,6 +864,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     overlap_frames=max(0, int(overlap_frames)),
                     segment_frames=list(info["cut_frames"]),
                     overlap_anchored=bool(auto_calm_search) or int(overlap_frames) > 0,
+                    loose=bool(loose_prompt) or bool(auto_calm_search) or int(overlap_frames) > 0,
                 )
                 late = recheck.get("errors") or []
                 if late:
