@@ -624,6 +624,17 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "负载按 (最长窗 + 本值) 算——15s/1.5MP 下 17 已到 178.5，34 会爆。"
                     ),
                 ),
+                io.Combo.Input(
+                    "calm_policy",
+                    options=["calm_overlap", "jerk_hardcut"],
+                    default="calm_overlap",
+                    tooltip=(
+                        "hunt 判定不可靠时怎么放这条缝。"
+                        "calm_overlap：边界挪到最平缓的独占帧，并给这条缝加锚定重叠（靠内容连续+锚定把缝缝住）。"
+                        "jerk_hardcut：反过来，把边界放在 jerk 最高（运动最剧烈/模型最容易糊）的独占帧上并硬切，"
+                        "靠运动掩蔽藏缝，不用重叠。"
+                    ),
+                ),
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
@@ -666,6 +677,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         auto_calm_search: bool = False,
         calm_search_window: int = 34,
         calm_overlap_frames: int = 17,
+        calm_policy: str = "calm_overlap",
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -721,6 +733,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["auto_calm_search"] = bool(auto_calm_search)
         _hc["calm_search_window"] = max(0, int(calm_search_window))
         _hc["calm_overlap_frames"] = max(0, int(calm_overlap_frames))
+        _hc["calm_policy"] = str(calm_policy)
 
         note = ""
         if not used_upstream:

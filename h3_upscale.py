@@ -92,6 +92,7 @@ def find_calm_boundaries(
     seam_tolerance: int = 17,
     min_sep: int = 34,
     grid: int = FRAME_GRID,
+    policy: str = "calm_overlap",
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
@@ -112,6 +113,7 @@ def find_calm_boundaries(
     """
     # global score per token; the profile rows are (idx, local, global)
     score = {}
+    jerk_by_idx = {}
     for row in profile or ():
         try:
             idx, glob = int(row[0]), float(row[2])
@@ -124,6 +126,7 @@ def find_calm_boundaries(
         except (TypeError, IndexError, ValueError):
             continue
         score[idx] = max(glob, jerk)
+        jerk_by_idx[idx] = jerk
     entry_by_cut = {}
     for e in aligned or ():
         try:
@@ -190,6 +193,38 @@ def find_calm_boundaries(
             # frames here are exclusive anchors: frame 17k starts token 5k
             # (FRAME_PER_TOKEN=(1,4,4,4,4) puts a 1-frame token every 17 frames)
             return int(frame) // int(grid) * 5
+
+        if policy == "jerk_hardcut":
+            # Opposite bet to the calm search: put the seam where the picture is
+            # ALREADY moving hardest.  Two reasons.  Motion masks a cut, and
+            # high jerk is exactly where MAINodes measured the model gives up and
+            # smears - so the sharpness step between two windows is smallest
+            # between two already-soft frames.  Hard cut, no anchor: continuity
+            # is not expected here, concealment is.
+            # Score a 3-token window so a single spike does not win over a
+            # sustained burst.
+            def burst(f, _grid=grid):
+                t = tok_of(f)
+                return sum(
+                    jerk_by_idx.get(t + k, 0.0)
+                    for k in (-5, 0, 5)          # one token either side, same phase
+                )
+
+            peak = max(cands, key=burst)
+            if burst(peak) <= 0.0:
+                boundaries.append(cut)
+                overlaps.append(0)
+                notes.append(
+                    f"cut {cut}: jerk_hardcut found no jerk anywhere -> keep plan (hard cut)"
+                )
+                continue
+            boundaries.append(int(peak))
+            overlaps.append(0)
+            notes.append(
+                f"cut {cut}: hunt unreliable ({b}) -> JERK peak {peak} "
+                f"(burst {burst(peak):.2f}), hard cut (no overlap)"
+            )
+            continue
 
         best = min(cands, key=lambda f: score.get(tok_of(f), float("inf")))
         if score.get(tok_of(best), float("inf")) == float("inf"):
@@ -753,6 +788,7 @@ def execute(
                 window=int(_hc.get("calm_search_window", 34)),
                 overlap_frames=int(_hc.get("calm_overlap_frames", 17)),
                 seam_tolerance=int(_hc.get("seam_tolerance", 17)),
+                policy=str(_hc.get("calm_policy", "calm_overlap")),
             )
             segment_frames = calm_boundaries
             for _n in _calm_notes:
