@@ -206,6 +206,7 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                         "the report is what to read before committing. NOT the Auto "
                         "node's chunk_step, which is an absolute per-segment cap."
                     ),
+                    advanced=True,
                 ),
                 io.Float.Input(
                     "canvas_megapixels",
@@ -227,6 +228,7 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                     "release_policy",
                     options=list(RELEASE_POLICIES),
                     default="clear_after",
+                    advanced=True,
                 ),
                 io.Float.Input(
                     "anchor_strength",
@@ -238,11 +240,13 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                         "Kept for interface compatibility. With overlap 0 the executor "
                         "never takes the anchor branch, so this value has no effect."
                     ),
+                    advanced=True,
                 ),
                 io.Combo.Input(
                     "second_pass_audio_policy",
                     options=list(AUDIO_POLICIES),
                     default="joint_av_preserve_input",
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "cut_offset_frames",
@@ -275,6 +279,7 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
                         "**送入采样器的值会被自动压到 < chunk**（一整个窗口就没内容可生成了）。\n"
                         "负载按 (最长段 + 本值) 算：15s/1.5MP 下 **17 已经到 178.5，34 会爆**。"
                     ),
+                    advanced=True,
                 ),
             ],
             outputs=[
@@ -458,19 +463,17 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     step=0.5,
                     tooltip="Clip length in seconds. Snapped to the 17n+5 frame grid.",
                 ),
-                io.Int.Input(
-                    "chunk_step",
-                    default=6,
-                    min=1,
-                    max=100,
-                    step=1,
+                io.Float.Input(
+                    "target_segment_seconds",
+                    default=5.0,
+                    min=0.71,
+                    max=60.0,
+                    step=0.05,
                     tooltip=(
-                        "Chunk 档位 = 每段最多多少「17 帧块」（绝对上限）。每段最大帧数 = "
-                        "chunk_step × 17，最大秒数 = chunk_step × 17 ÷ 24 = chunk_step × 0.708s。"
-                        "例：6 → 102 帧 ≈ 4.25s；7 → 119 帧 ≈ 4.96s；8 → 136 帧 ≈ 5.67s；"
-                        "11 → 187 帧 ≈ 7.79s。每一段（含末段）都不超过这个上限。"
-                        "注意：与 Plan 节点的 chunk_step 同名不同义——那边是相对步进"
-                        "（±17 帧），这里是绝对块数上限。"
+                        "想要的最长分段（秒）—— 直接写时间，不用算 17 帧块。\n"
+                        "内部会取最接近的 17n 帧档位：4.25s -> 102 帧（n=6）。\n"
+                        "段越长、画布越大，二采负载越高；报告里的 `load estimate` 会给"
+                        "SAFE / BORDERLINE / LIKELY-OOM，看那个决定要不要调小。"
                     ),
                 ),
                 io.Float.Input(
@@ -512,11 +515,17 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     advanced=True,
                 ),
                 io.Combo.Input("model_name", options=upscaler_options()),
-                io.Combo.Input("precision", options=list(PRECISIONS), default="bf16"),
+                io.Combo.Input(
+                    "precision",
+                    options=list(PRECISIONS),
+                    default="bf16",
+                    advanced=True,
+                ),
                 io.Combo.Input(
                     "release_policy",
                     options=list(RELEASE_POLICIES),
                     default="clear_after",
+                    advanced=True,
                 ),
                 io.Float.Input(
                     "anchor_strength",
@@ -525,11 +534,13 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     max=1.0,
                     step=0.001,
                     tooltip="No effect at overlap 0; kept for interface compatibility.",
+                    advanced=True,
                 ),
                 io.Combo.Input(
                     "second_pass_audio_policy",
                     options=list(AUDIO_POLICIES),
                     default="joint_av_preserve_input",
+                    advanced=True,
                 ),
                 io.Float.Input(
                     "second_pass_sigma0",
@@ -542,6 +553,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "`denoise`。**接缝幅度 ∝ σ₀**：调小它，段边界那道缝会更淡（代价是"
                         "二采引入的细节变少）。本机实测 0.30 能用，可试 0.20~0.25。"
                     ),
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "seam_tolerance_frames",
@@ -561,24 +573,6 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     ),
                 ),
                 io.Int.Input(
-                    "prompt_shift_frames",
-                    default=1,
-                    min=-17,
-                    max=17,
-                    step=1,
-                    tooltip=(
-                        "★ 改写 `prompt` 输出的时间戳（帧）：本节点算完切点后，把提示词里"
-                        "**每个 `[Shot N] At MM:SS.mmm`** 整体平移这么多帧再输出（正 = 写晚一点）。\n"
-                        "为什么需要：模型不会正好在被告知的时刻转镜（实测偏移 −10 ~ +1 帧，"
-                        "随内容/种子变），而执行器的边界只能落在 token 网格上 —— "
-                        "**改提示词的时间是唯一比网格更细的旋钮**。\n"
-                        "它在这里做，是为了**不让写提示词的大模型知道这些机制**"
-                        "（少喂非剧情内容 = 剧情权重不被稀释）。\n"
-                        "只动镜头声明的秒数，镜内动作节拍不动；summary / soundscape 里引用的同一时间"
-                        "会一起改，保持自洽。填 0 = 不改写。"
-                    ),
-                ),
-                io.Int.Input(
                     "overlap_frames",
                     default=0,
                     min=0,
@@ -592,6 +586,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "**送入采样器的值会被自动压到 < chunk**（一整个窗口就没内容可生成了）。\n"
                         "负载按 (最长段 + 本值) 算：15s/1.5MP 下 **17 已经到 178.5，34 会爆**。"
                     ),
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "auto_calm_search",
@@ -612,6 +607,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     max=170,
                     step=17,
                     tooltip="平缓搜索半径（帧）：在 `切点 ± 本值` 内找最平缓的独占帧。",
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "calm_overlap_frames",
@@ -623,6 +619,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "平缓缝使用的重叠（帧）。17 = 一个 token 组。\n"
                         "负载按 (最长窗 + 本值) 算——15s/1.5MP 下 17 已到 178.5，34 会爆。"
                     ),
+                    advanced=True,
                 ),
                 io.Combo.Input(
                     "calm_policy",
@@ -639,12 +636,14 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     "profile_camera_compensate",
                     default=False,
                     tooltip="先按整数位移把每帧对齐到前一帧，再做变化剖面。纯运镜(平移/摇镜)会被读成静止，只有相对相机的运动留下。提示词里有运镜时打开它。",
+                    advanced=True,
                 ),
                 io.Combo.Input(
                     "profile_reduce",
                     options=["mean", "max", "top-decile"],
                     default="mean",
                     tooltip="空间聚合方式：mean=全网平均(默认)；max=取最热的一点；top-decile=最热10%的均值。后两者不会把局部热点平均掉。",
+                    advanced=True,
                 ),
                 io.Float.Input(
                     "calm_abstain_below",
@@ -653,11 +652,13 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     max=10.0,
                     step=0.05,
                     tooltip="放弃门：jerk 的对比度(max/mean)低于本值就整片不做搜索、保持计划切点。0=关闭。",
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "hunt_persistence",
                     default=True,
                     tooltip="hunt 排序时加入「持久性」判据：真转场 = 变化后停在新状态；闪烁/抖动/纹理划过 = 变化后回到原状态。关掉则退回旧的纯局部变化排序。",
+                    advanced=True,
                 ),
             ],
             outputs=[
@@ -684,7 +685,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         cls,
         prompt: str,
         total_seconds: float,
-        chunk_step: int,
+        target_segment_seconds: float,
         first_megapixels: float,
         second_megapixels: float,
         aspect_ratio: str,
@@ -696,7 +697,6 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         second_pass_audio_policy: str,
         second_pass_sigma0: float,
         seam_tolerance_frames: int,
-        prompt_shift_frames: int,
         overlap_frames: int = 0,
         auto_calm_search: bool = False,
         calm_search_window: int = 34,
@@ -722,7 +722,10 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
             max(0, int(calm_overlap_frames)) if auto_calm_search
             else max(0, int(overlap_frames))
         )
-        info = auto_plan(total_seconds, chunk_step, canvas_mp,
+        # Seconds -> the nearest legal 17-frame window cap.  The report's
+        # `load estimate` is the number to watch, not this conversion.
+        _chunk_step = max(1, int(round(float(target_segment_seconds) * FPS / FRAME_GRID)))
+        info = auto_plan(total_seconds, _chunk_step, canvas_mp,
                          overlap=_effective_overlap)
 
         plan_chunk = info["longest"]
@@ -825,7 +828,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
             # therefore the one lever finer than the grid.  It lives here, not in
             # the prompt, so whoever writes the prompt never has to be taught
             # plugin mechanics (and the plot keeps its weight in the text).
-            out_prompt, moved = shift_shot_times(incoming, prompt_shift_frames)
+            # Prompt time-shifting is retired: the hunt/calm search owns boundary
+            # placement now, so the prompt is passed through untouched.
+            out_prompt, moved = incoming, False
             if moved:
                 report += (
                     "\n\nprompt time shift ("
@@ -857,9 +862,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                 late = recheck.get("errors") or []
                 if late:
                     report += (
-                        "\n  WARNING: after the shift the declared times no longer sit within 1 "
-                        "frame of the plan's cuts — lower `prompt_shift_frames`, or write the "
-                        "prompt to land exactly on the plan:\n    - "
+                        "\n  WARNING: the declared times do not sit within 1 "
+                        "frame of the plan's cuts — write the prompt to land on the plan, "
+                        "or let the hunt/calm search move the boundary instead:\n    - "
                         + "\n    - ".join(str(e) for e in late[:MAX_LISTED])
                     )
         else:
