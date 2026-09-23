@@ -100,12 +100,13 @@ def find_calm_boundaries(
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
-    A cut whose hunt entry carries a boundary close to the plan is trustworthy
-    (the model really turns there) -> keep it and hard-cut (overlap 0).
+    A cut whose hunt entry landed ON the measured turn is trustworthy (the
+    boundary sits on the model's own cut) -> hard-cut there, overlap 0.
 
-    Anything else (hunt rejected it, or it points far away) means we are about
-    to cut through continuous content, so instead of cutting at the plan we look
-    for the CALMEST exclusive frame within `window` of it: the token whose
+    Anything else (hunt rejected it, or the 17-frame grid forced the boundary
+    away from the turn) means we are about to cut through continuous content, so
+    instead of cutting at the plan we look for the CALMEST exclusive frame
+    within `window` of it: the token whose
     global latent-change score is lowest, i.e. the least eventful moment.  The
     boundary goes there and that seam gets `overlap_frames` of anchored prefix,
     so the sampler continues from the previous window instead of starting cold.
@@ -170,21 +171,26 @@ def find_calm_boundaries(
         pending_cuts = [int(c) for c in planned if int(c) != cut]
         refs = boundaries + pending_cuts
         # The deviation that decides "hard cut or anchored overlap" is how far
-        # the FINAL boundary lands from where the model ACTUALLY turned - not how
-        # far the model drifted from the plan.  The hunt already snaps the
-        # boundary onto the exclusive-frame grid, so a 15-frame plan error can
-        # end up 2 frames off (plan 187, real turn 202 -> boundary 204).
-        # Only when that residual exceeds seam_tolerance do we stop trusting the
-        # hard cut and switch the seam to an anchored overlap.
+        # the FINAL boundary had to sit from where the model ACTUALLY turned.
+        # A boundary may only sit on an exclusive frame (17k), so this residual
+        # is the grid quantisation of the turn: 0 when the turn itself is on the
+        # grid, up to 8 when it falls halfway between two legal frames.  A small
+        # residual means the seam lands on the model's own cut -> hard cut; a
+        # large one means the cut would sit mid-shot, where the two windows
+        # render the same content differently -> anchored overlap instead.
+        #
+        # Do NOT fall back to |boundary - planned|: that is a different quantity
+        # (plan drift, a multiple of 17), and comparing it against the same
+        # threshold silently turned clean hits into overlaps at random - see the
+        # note in _align_to_profile (2026-09-23).
         _m = entry.get("measured_turn_frame")
         if b is not None and _m is not None:
             _dev = abs(int(b) - int(_m))
-            _dev_src = f"boundary {b} vs measured {_m}"
-        elif b is not None:
-            # no measured turn reported: fall back to the plan distance
-            _dev = abs(int(b) - cut)
-            _dev_src = f"boundary {b} vs plan {cut}"
+            _dev_src = f"boundary {b} vs measured turn {_m}"
         else:
+            # No measured turn -> we cannot claim the boundary sits on the
+            # model's cut, so do not hard-cut.  Fall through to the calm search
+            # and let that seam get an anchored overlap.
             _dev, _dev_src = None, None
         if (
             b is not None
@@ -986,8 +992,15 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
             "local_ratio": round(float(peak_local), 2),
             "top_candidates": top,
         }
-        if final_frame != peak_frame:
-            entry["measured_turn_frame"] = peak_frame
+        # ★ ALWAYS report the measured turn - not only when the snap moved the
+        # frame.  The calm search decides hard-cut vs anchored-overlap from how
+        # far the boundary had to sit from the TURN; while this key was written
+        # conditionally, every peak that already landed on a multiple of 17 left
+        # it absent, the gate fell back to the PLAN distance, and the same
+        # situation (plan 85, turn 68 vs turn 66) flipped between an anchored
+        # overlap and a hard cut purely because of where the argmax fell
+        # (2026-09-23).
+        entry["measured_turn_frame"] = peak_frame
         if note:
             entry["note"] = note
         aligned.append(entry)
