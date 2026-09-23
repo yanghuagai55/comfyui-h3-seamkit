@@ -676,5 +676,26 @@ D:\comfyui\comfyenv\python.exe toolsnalyze_cut.py "<成片.mp4>" --cuts 4.958,8
 - **T8mars / comfyui-minimax-h3-audio-T8** —— 分块二采、3D latent 放大器、音频条件与
   整套 H3 节点生态都来自这个包。本插件只是站在它上面改了"分段"这一层。
 - **MiniMax / Comfy-Org** —— H3 模型与 ComfyUI 集成。
+- **ComfyUI 核心** —— `KSamplerX0Inpaint`（`comfy/samplers.py`）与
+  `MiniMaxH3.scale_latent_inpaint`（`comfy/model_base.py`）**已原生实现** RePaint 式逐步
+  重条件化；缝窗重去噪直接调用它们，上游一行未改。
 - 所有实测数字都来自本机 RTX 4060 Laptop 8GB + torch 2.14.0+cu130 的真实跑片，
   换卡请重新量锚点。
+
+### 方法来源：只借鉴思路，未拷贝代码
+
+| 来源 | 用在本插件的哪里 | 借鉴形式 | 其仓库许可 |
+|---|---|---|---|
+| **RePaint** — Lugmayr et al., CVPR 2022（arXiv:2201.09865） | 缝窗重去噪的"逐步锚定"语义 | 仅思路；机制由 ComfyUI 核心原生提供 | **CC BY-NC-SA 4.0（非商用）** —— 本仓库**未使用**其代码 |
+| **StreamingT2V**（arXiv:2403.08312） | 单帧条件导致块间不一致 → `anchor_tokens` 扩锚 | 仅论文结论 | 未使用其代码 |
+| **Towards Chunk-Wise Generation for Long Videos**（arXiv:2411.18668） | 长片分块路线调研 | 仅论文结论 | 未使用其代码 |
+| **PERSIST**（arXiv:2608.29287） | 转镜判定的"持续性"门（`persistence` 列） | 仅思路，独立重新实现 | 未使用其代码 |
+| **MAINodes**（matlowai） | jerk 判据、相机补偿、abstain 门 | **思路重新实现，未拷贝代码**（代码内已注明） | GPL-3.0-or-later（与本包一致） |
+
+> **为什么这张表必须留着**：RePaint 的官方仓库是 **CC BY-NC-SA 4.0**
+> （"非商用 + 相同方式共享"），**与 GPL-3.0 不兼容**。本仓库因此**刻意不引用、不移植
+> 它的任何代码** —— 依赖的是 ComfyUI 核心（GPL-3.0）自带的实现，许可链条干净。
+> 日后若有人直接移植 RePaint 代码进来，会**破坏本包的许可**，请不要这么做。
+>
+> 论文里的**方法**（算法思想）不受版权保护，引用属于学术礼节而非法律义务；
+> 只有**代码表达**受版权约束 —— 这正是上表区分"思路"与"代码"的原因。
