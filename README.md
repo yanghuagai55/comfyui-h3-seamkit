@@ -102,6 +102,8 @@ D:\comfyui\comfyenv\python.exe <本仓库>\tools\pinned_memory_patch.py
 | `MiniMaxH3SeamRepairAll` ★ | `h3_seamkit/repair` | 全包：切片 → 重绘 → 融合 → 磨平 → 叠化，一个节点做完 |
 | `MiniMaxH3RedrawBridge` | `h3_seamkit/repair` | 只做"重绘桥段"这一支 |
 | `MiniMaxH3SeamFuse` | `h3_seamkit/repair` | 把桥段按权重渐变贴回主片 |
+| `MiniMaxH3AVLatentSave` | `MiniMax H3/SeamKit` | **一采缓存存盘**（直通：LATENT 进、LATENT 出）；上游指纹自动校验 |
+| `MiniMaxH3AVLatentLoad` | `MiniMax H3/SeamKit` | **读回冻结的一采** —— 接到二采的 `latent` 输入即可跳过一采做 A/B |
 | `MiniMaxH3SeamBlend` | `h3_seamkit/repair` | 缝两侧两帧互相靠拢（磨平跳变） |
 | `MiniMaxH3SeamDissolve` | `h3_seamkit/repair` | 一段崩坏帧用两端做锚点叠化替换 |
 
@@ -492,6 +494,52 @@ report 关键字段：`measured_turn_frame`（测得的转镜帧）/ `boundary_f
 
 ---
 
+## 一采缓存：把二采的输入冻结下来（做干净的 A/B）
+
+**为什么需要**：分块二采的接缝好坏，必须在**同一份二采输入**上比较两次跑。
+但本机实测（2026-09-23）：**一采不是逐位可复现的** —— 同 seed 同 prompt，跨会话跑出来的
+测得的转镜帧能差 **9 帧**。而"让采样变确定"这条路在 8GB 上走不通：
+
+- 关 `--use-sage-attention` → **一采直接 CUDA OOM**（Sage 是 int8/fp8 量化注意力，省的是显存）；
+- 钉 MATH 后端 → 注意力矩阵 O(n²) 内存，更不可能。
+
+**所以唯一干净的 A/B 是「冻结一采」**：把它落盘、让二采读盘。二采输入因此逐位相同，
+而生成速度一点不损失 —— 一采 latent 只有 **约 4 MB（26 token）/ 17 MB（107 token）**。
+
+```
+① 只存档（不改行为）：AV Latent Cache (Save) 串在「一采 → 二采」之间
+      —— 它是**直通**节点，不用改接线
+② 要跳过一采：把二采执行器的 latent 输入从「一采输出」改接 AV Latent Cache (Load)
+      —— 必须换接线：ComfyUI 会先算完所有输入才调用下游，光加存节点不会让一采停跑
+```
+
+### 指纹：不需要你记得改 key
+
+缓存文件名带一个**上游指纹**，取自「从本节点的 latent 输入反向走完的整个上游子图」。
+
+本节点恰好卡在**一采与二采之间** → 它的上游正好就是整条一采链
+（提示词 / 种子 / 参考图 / 底模 / LoRA / 采样器），**二采在它下游、天然不进指纹**。
+
+| 情况 | 行为 |
+|---|---|
+| 指纹一致 | 命中跳过（省一次写入） |
+| **指纹不一致** | **自动覆盖**并打印差异，例如 `种子: ['777'] -> ['888']` |
+| 拿不到图（旧格式文件） | 退回按 key 命中，并明确提示"无法核对指纹" |
+| 写入失败（云盘只读 / 磁盘满） | 只打印一行，**永不中断生成** |
+
+⚠️ **Load 侧无法自动校验**：它图上没有上游可走，所以它把存档指纹与摘要（种子/节点数）
+打出来供人工对一眼；形状仍逐项核对，防止文件被截断或替换。
+
+> **来源**：缓存这套做法的思路来自 **AIMixer 的
+> [ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)**
+> （Apache-2.0，见其 `director/segment_cache.py`：一采/成片分开的落盘缓存、
+> 指纹精确匹配、分类清理）。**本仓库为独立实现，未拷贝其代码**，差异在于：
+> 它按**段**存（它自己是执行器，逐段生成），我们按**整片**存一个文件；
+> 它从自己的 plan 取指纹字段，我们从**图**上反向走上游子图取指纹 ——
+> 后者不需要用户手填任何身份字段。
+> ComfyUI 核心的 `SaveLatent`/`LoadLatent` 做不了这件事：它存 `latent_tensor` 单张量、
+> 走 safetensors（`nodes.py:553/576`），读回来不是 NestedTensor。
+
 ## 命令行工具
 
 `tools/` 下的脚本全部**不需要 ComfyUI 在跑**，装了 `av` / `numpy` / `cv2` 就能用
@@ -504,6 +552,8 @@ report 关键字段：`measured_turn_frame`（测得的转镜帧）/ `boundary_f
 | `tools/repair_seam.py` | **像素域修复**：`--locate` / `--replace` / `--blend` / `--dissolve` / `--fuse` |
 | `tools/check_widgets.py` | **体检工作流**：查本包节点的 `widgets_values` 是否与 schema 对得上 |
 | `tools/pinned_memory_patch.py` | **环境修补**（交互式）：抬高 aimdo host buffer 上限，解决二采中途 `hostbuf_grow` 被拒 |
+| `tools/attention_backend_patch.py` | **环境修补**（交互式）：强制 SDPA 走 MATH + 生成实验用启动脚本。⚠️ **8GB 上不要用**（关 Sage 会 OOM） |
+| `tools/latent_cache.py` | **一采缓存管理**：`list` / `show <key>` / `verify <key>` / `purge <key>\|--all` / `dir` |
 
 ```bash
 # 量实际转镜帧（--sheet 导出逐帧接触表方便肉眼复核）
@@ -712,6 +762,11 @@ D:\comfyui\comfyenv\python.exe toolsnalyze_cut.py "<成片.mp4>" --cuts 4.958,8
 - **ComfyUI 核心** —— `KSamplerX0Inpaint`（`comfy/samplers.py`）与
   `MiniMaxH3.scale_latent_inpaint`（`comfy/model_base.py`）**已原生实现** RePaint 式逐步
   重条件化；缝窗重去噪直接调用它们，上游一行未改。
+- **AIMixer / [ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)**
+  （Apache-2.0）—— **一采缓存的做法**（落盘缓存 + 指纹精确匹配 + 分类清理）是从它的
+  `director/segment_cache.py` 学来的思路，本仓库为独立实现、未拷贝代码。
+  它的 `director/` 里还有不少好设计（external_groups / vram_cleanup / segment_mp4_export），
+  值得单独读。
 - 所有实测数字都来自本机 RTX 4060 Laptop 8GB + torch 2.14.0+cu130 的真实跑片，
   换卡请重新量锚点。
 
@@ -724,6 +779,7 @@ D:\comfyui\comfyenv\python.exe toolsnalyze_cut.py "<成片.mp4>" --cuts 4.958,8
 | **Towards Chunk-Wise Generation for Long Videos**（arXiv:2411.18668） | 长片分块路线调研 | 仅论文结论 | 未使用其代码 |
 | **PERSIST**（arXiv:2608.29287） | 转镜判定的"持续性"门（`persistence` 列） | 仅思路，独立重新实现 | 未使用其代码 |
 | **MAINodes**（matlowai） | jerk 判据、相机补偿、abstain 门 | **思路重新实现，未拷贝代码**（代码内已注明） | GPL-3.0-or-later（与本包一致） |
+| **ComfyUI_MiniMaxH3_Director**（AIMixer） | `MiniMaxH3AVLatentSave/Load` 的**一采缓存做法**：落盘缓存、指纹精确匹配、分类清理 | **思路重新实现，未拷贝代码**（见「一采缓存」一节） | **Apache-2.0** —— 可用可改可商用，保留 NOTICE |
 
 > **为什么这张表必须留着**：RePaint 的官方仓库是 **CC BY-NC-SA 4.0**
 > （"非商用 + 相同方式共享"），**与 GPL-3.0 不兼容**。本仓库因此**刻意不引用、不移植
