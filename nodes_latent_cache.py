@@ -114,11 +114,14 @@ class MiniMaxH3AVLatentSave(io.ComfyNode):
                     "overwrite",
                     default=False,
                     tooltip=(
-                        "关（默认）：同 key 已存在就跳过，只打印一行 —— 省一次 17 MB 写入。\n"
-                        "开：覆盖旧缓存（改了上游提示词/种子就该开）。"
+                        "关（默认）：指纹一致就跳过写入，省一次 17 MB —— 指纹不一致时**自动覆盖**并提示。\n"
+                        "开：无条件重写。\n"
+                        "指纹 = 上游整条一采链（提示词/种子/参考图/底模/LoRA/采样器）的哈希，\n"
+                        "二采参数不进指纹 —— 所以改二采不会让一采缓存失效，改一采则必然刷新。"
                     ),
                 ),
             ],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[io.Latent.Output("latent")],
         )
 
@@ -137,14 +140,42 @@ class MiniMaxH3AVLatentSave(io.ComfyNode):
         pt_path = root / f"{stem}.pt"
         meta_path = root / f"{stem}.json"
 
+        # cls.hidden 由 ComfyUI 运行时注入；用 getattr 链兜底，脱离运行时（单测）也不会炸
+        _hidden = getattr(cls, "hidden", None)
+        fp, summary = fingerprint_of(
+            getattr(_hidden, "prompt", None), getattr(_hidden, "unique_id", None)
+        )
+        old = _read_meta(meta_path)
+        old_fp = old.get("fingerprint")
+
         if pt_path.is_file() and not overwrite:
-            print(f"[SeamKit] latent cache HIT (skip write): {pt_path.name}", flush=True)
-            return io.NodeOutput(latent)
+            if fp and old_fp == fp:
+                print(
+                    f"[SeamKit] latent cache HIT (skip write): {pt_path.name}  fp={fp[:12]}",
+                    flush=True,
+                )
+                return io.NodeOutput(latent)
+            if not fp:
+                # 拿不到图（脱离运行时/单测）或是旧格式文件 —— 退回"按 key 命中"，只提示
+                print(
+                    f"[SeamKit] latent cache HIT by key (skip write): {pt_path.name}"
+                    "  ⚠ 未取到上游图，无法核对指纹；要刷新请开 overwrite",
+                    flush=True,
+                )
+                return io.NodeOutput(latent)
+            diff = fingerprint_diff(old.get("summary") or {}, summary)
+            print(
+                f"[SeamKit] latent cache 指纹不一致 -> 覆盖 {pt_path.name}  "
+                f"({old_fp[:12] if old_fp else '无'} -> {fp[:12]});  变化: " + "; ".join(diff),
+                flush=True,
+            )
 
         tensors = _av_to_plain(samples)
         meta = {
             "key": key,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "fingerprint": fp,
+            "summary": summary,
             "tensor_count": len(tensors),
             "shapes": [list(t.shape) for t in tensors],
             "dtypes": [str(t.dtype) for t in tensors],
@@ -163,11 +194,22 @@ class MiniMaxH3AVLatentSave(io.ComfyNode):
 
         size_mb = pt_path.stat().st_size / 1e6
         print(
-            f"[SeamKit] latent cache SAVED: {pt_path.name}  "
-            f"{size_mb:.1f} MB  shapes={meta['shapes']}  dtypes={meta['dtypes']}",
+            f"[SeamKit] latent cache SAVED: {pt_path.name}  {size_mb:.1f} MB  "
+            f"fp={fp[:12]}  shapes={meta['shapes']}  "
+            f"seed={summary.get('seeds')}  nodes={summary.get('nodes')}",
             flush=True,
         )
         return io.NodeOutput(latent)
+
+
+def _read_meta(meta_path) -> dict:
+    try:
+        if meta_path.is_file():
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
 
 
 class MiniMaxH3AVLatentLoad(io.ComfyNode):
@@ -217,9 +259,17 @@ class MiniMaxH3AVLatentLoad(io.ComfyNode):
         meta = payload.get("meta") or {}
         _check_shapes(tensors, meta, pt_path.name)
         samples = _plain_to_av(tensors)
+        fp = meta.get("fingerprint") or "<无>"
+        summary = meta.get("summary") or {}
         print(
-            f"[SeamKit] latent cache LOADED: {pt_path.name}  "
-            f"tensors={len(tensors)}  saved_at={meta.get('saved_at', '?')}",
+            f"[SeamKit] latent cache LOADED: {pt_path.name}  tensors={len(tensors)}  "
+            f"saved_at={meta.get('saved_at', '?')}  fp={str(fp)[:12]}  "
+            f"seed={summary.get('seeds')}  nodes={summary.get('nodes')}",
+            flush=True,
+        )
+        print(
+            "           注意：本节点图上没有上游可走，**无法自动核对指纹** —— "
+            "请把这里的 fp 与 Save 那次日志里的 fp 对一眼（前 12 位相同即可）。",
             flush=True,
         )
         return io.NodeOutput({"samples": samples})
@@ -238,3 +288,87 @@ def _check_shapes(tensors: list, meta: dict, name: str) -> None:
 
 
 NODES = [MiniMaxH3AVLatentSave, MiniMaxH3AVLatentLoad]
+
+
+# --------------------------------------------------------------------------
+# 指纹：照搬 ComfyUI_MiniMaxH3_Director 的 first_pass_cache_fingerprint 思路 ——
+# 「身份 = 只影响一采的那些东西」，二采参数不进指纹，改二采不会让一采缓存失效。
+#
+# 区别在于它从自己的 plan 取字段（它自己就是执行器），而我们从**图**上取：
+# Save 节点的上游恰好就是整条一采链（提示词/种子/参考图/底模/LoRA/采样器），
+# 二采在它下游 —— 所以「沿 latent 链接反向走完上游子图再哈希」正好等于我们要的身份。
+# 这样用户填错 key 也不会静默复用旧 latent。
+# --------------------------------------------------------------------------
+
+_SEED_KEYS = ("noise_seed", "seed", "seed_num")
+_TEXT_KEYS = ("value", "text", "prompt", "string")
+
+
+def _is_link(v) -> bool:
+    return isinstance(v, list) and len(v) == 2 and isinstance(v[0], (str, int))
+
+
+def upstream_subgraph(prompt, node_unique_id) -> dict:
+    """从本节点的 `latent` 输入出发，反向收集完整上游子图。"""
+    if not isinstance(prompt, dict):
+        return {}
+    me = prompt.get(str(node_unique_id))
+    if not isinstance(me, dict):
+        return {}
+    link = (me.get("inputs") or {}).get("latent")
+    if not _is_link(link):
+        return {}
+    seen: dict = {}
+    stack = [str(link[0])]
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        node = prompt.get(nid)
+        if not isinstance(node, dict):
+            continue
+        ins = node.get("inputs") or {}
+        literals = {k: v for k, v in ins.items() if not _is_link(v)}
+        links = {k: str(v[0]) for k, v in ins.items() if _is_link(v)}
+        seen[nid] = {"t": node.get("class_type"), "lit": literals, "lnk": links}
+        stack.extend(links.values())
+    return seen
+
+
+def fingerprint_of(prompt, node_unique_id) -> tuple[str, dict]:
+    """返回 (哈希, 便于人看的摘要)。摘要用于 mismatch 时说清"变了什么"。"""
+    graph = upstream_subgraph(prompt, node_unique_id)
+    if not graph:
+        return "", {"note": "no upstream graph available"}
+    blob = json.dumps(graph, sort_keys=True, ensure_ascii=False, default=str)
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    seeds, texts, classes = [], [], []
+    for node in graph.values():
+        classes.append(str(node.get("t") or "?"))
+        for k, v in (node.get("lit") or {}).items():
+            if k in _SEED_KEYS and isinstance(v, (int, float, str)):
+                seeds.append(f"{v}")
+            if k in _TEXT_KEYS and isinstance(v, str) and v.strip():
+                texts.append(v.strip().replace("\n", " ")[:70])
+    summary = {
+        "nodes": len(graph),
+        "seeds": sorted(set(seeds))[:3],
+        "texts": texts[:2],
+        "has": sorted(set(classes))[:12],
+    }
+    return digest, summary
+
+
+def fingerprint_diff(stored: dict, expected: dict) -> list:
+    """粗粒度对比摘要，给出"哪里变了"的线索（不追求完备，够定位就行）。"""
+    out = []
+    if not isinstance(stored, dict) or not isinstance(expected, dict):
+        return ["<no-summary>"]
+    for key, label in (("seeds", "种子"), ("texts", "文本"), ("nodes", "节点数")):
+        if stored.get(key) != expected.get(key):
+            out.append(f"{label}: {stored.get(key)} -> {expected.get(key)}")
+    if len(out) == 0 and stored.get("has") != expected.get("has"):
+        out.append("上游节点集合变了")
+    return out or ["（摘要看不出差异，可能只是数值细节）"]
+
