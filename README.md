@@ -80,7 +80,8 @@ aimdo: src/hostbuf.c:46:ERROR:hostbuf_grow: requested ... beyond reserved host b
 D:\comfyui\comfyenv\python.exe <本仓库>\tools\pinned_memory_patch.py
 ```
 
-（细节与"升级后怎么重打"见 [`docs/PINNED_MEMORY.md`](docs/PINNED_MEMORY.md)；
+（改后启动日志会从 `Enabled pinned memory 12954.0` 变成 `14574.0`，用这个核对；
+**ComfyUI 升级后这行会被覆盖，重跑一次上面那个工具即可**。
 不要用 `--high-ram` —— 它会完全去掉上限，pinned 内存不能换页，在 32 GB 机器上
 跑 32.4 GB 的模型容易从"干净报错"变成掉页卡死。）
 
@@ -203,7 +204,7 @@ cut_1 = 4, cut_2 = 10        →  [68] + [102] + [剩下的]
 
 分块二采（`guarded_overlap_exp`）在段间用 `overlap` 做混合：前一半锁定为前段输出，
 后一半 smoothstep 渐变接管。两段独立采样必然有分歧，于是观感就是**突然变糊 / 重影**。
-上游在 `docs/DUAL_MODEL_SEAM_FIX_20260913.md` 里明确说这类 post-sampling 混合**会产生重影**，
+上游的说明里明确讲过：这类 post-sampling 混合**会产生重影**，
 且「不能靠增大重叠承诺自动消除内容漂移」。
 
 **本插件的做法：不混了。**
