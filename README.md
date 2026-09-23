@@ -74,13 +74,13 @@ aimdo: src/hostbuf.c:46:ERROR:hostbuf_grow: requested ... beyond reserved host b
 | 16 GB | 12.5 GiB | 14.0 GiB | ✗ |
 
 修法是把 `ComfyUI/comfy/model_management.py` 里 Windows 分支的 `ram * 0.40`
-改成 `ram * 0.45`（**一行**）。本项目附带交互式工具与完整说明：
+改成 `ram * 0.45`（**一行**）。本仓库附带交互式工具，菜单 `1` 打补丁 / `2` 复原：
 
 ```bash
-D:\comfyui\comfyenv\python.exe D:\comfyui\_hardcut_work\tools\pinned_memory_patch.py
+D:\comfyui\comfyenv\python.exe <本仓库>\tools\pinned_memory_patch.py
 ```
 
-（菜单 `1` 打补丁 / `2` 复原；改动记录见 `_hardcut_work/patches/README.md`。
+（细节与"升级后怎么重打"见 [`docs/PINNED_MEMORY.md`](docs/PINNED_MEMORY.md)；
 不要用 `--high-ram` —— 它会完全去掉上限，pinned 内存不能换页，在 32 GB 机器上
 跑 32.4 GB 的模型容易从"干净报错"变成掉页卡死。）
 
@@ -502,6 +502,7 @@ report 关键字段：`measured_turn_frame`（测得的转镜帧）/ `boundary_f
 | `tools/analyze_cut.py` | **成片体检**：量出画面实际在第几帧换镜，与理论切点差几帧 |
 | `tools/repair_seam.py` | **像素域修复**：`--locate` / `--replace` / `--blend` / `--dissolve` / `--fuse` |
 | `tools/check_widgets.py` | **体检工作流**：查本包节点的 `widgets_values` 是否与 schema 对得上 |
+| `tools/pinned_memory_patch.py` | **环境修补**（交互式）：抬高 aimdo host buffer 上限，解决二采中途 `hostbuf_grow` 被拒 |
 
 ```bash
 # 量实际转镜帧（--sheet 导出逐帧接触表方便肉眼复核）
@@ -513,6 +514,9 @@ python tools/repair_seam.py "成片.mp4" --seams 67 --strength 0.3 --out 修好�
 
 # 体检工作流（扫 user/default/workflows 下全部）
 python tools/check_widgets.py
+
+# 抬高 pinned-memory 上限（内存 <32GB 或二采中途报 hostbuf_grow 时用）
+python tools/pinned_memory_patch.py
 ```
 
 ### ★ `check_widgets.py` —— 槽位错位是沉默杀手
