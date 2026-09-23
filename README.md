@@ -506,12 +506,19 @@ report 关键字段：`measured_turn_frame`（测得的转镜帧）/ `boundary_f
 **所以唯一干净的 A/B 是「冻结一采」**：把它落盘、让二采读盘。二采输入因此逐位相同，
 而生成速度一点不损失 —— 一采 latent 只有 **约 4 MB（26 token）/ 17 MB（107 token）**。
 
+**首选做法 —— 不用加节点**：二采执行器 `MiniMaxH3HardCutUpscale`（#40）上有开关
+**`av_latent_cache`** + **`av_latent_cache_key`**。打开后它会**在采样之前**先把一采存下来，
+然后照常跑二采 —— 因为它本来就在一采下游，latent 就在手上，所以**不用加节点、不用改接线**。
+
 ```
-① 只存档（不改行为）：AV Latent Cache (Save) 串在「一采 → 二采」之间
-      —— 它是**直通**节点，不用改接线
-② 要跳过一采：把二采执行器的 latent 输入从「一采输出」改接 AV Latent Cache (Load)
-      —— 必须换接线：ComfyUI 会先算完所有输入才调用下游，光加存节点不会让一采停跑
+① 存档（开关在二采节点上）  av_latent_cache = true, av_latent_cache_key = seed786_s5_cam
+② 跳过一采做 A/B           把 #40 的 latent 输入改接 `AV Latent Cache (Load)`
+                           —— 必须换接线：ComfyUI 会先算完所有输入才调用下游
 ```
+
+> 也有独立的 `AV Latent Cache (Save)` 直通节点（串在「一采 → 二采」之间），用于需要单独
+> 存一份的场景。**两条路径共用同一份实现**，行为完全一致。
+> `av_latent_cache` 为 true 但 key 留空时，只打印一行提示并跳过缓存，不报错。
 
 ### 指纹：不需要你记得改 key
 
