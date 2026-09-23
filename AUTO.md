@@ -43,7 +43,7 @@
 | `multiple` | 32 | 画布取整倍数（H3 要 32），一般不动 |
 | `model_name` / `precision` / `release_policy` / `anchor_strength` / `second_pass_audio_policy` | — | 照抄上游 plan 节点，一般不动 |
 | `second_pass_sigma0` | 0.30 | 二采 denoise（σ₀），经 `sigma0` 口接 `BasicScheduler.denoise`。**缝幅度 ∝ σ₀** |
-| `seam_tolerance_frames` | 17 | `#40` 的 `auto_seam_hunt` 采纳检测结果时允许的偏差（帧） |
+| `seam_tolerance_frames` | **4** | 硬切 / 锚定的判据：**吸附后的边界与「测得转镜帧」的残差**超过本值 → 该缝转锚定 overlap。**量程只有 0~8**（边界只能落在 17 的整数倍上，残差最大 17/2）；**8 = 无条件硬切**（等于关掉这道门），>8 与 8 等价 |
 | **`prompt_shift_frames`** | **1** | **改写 `prompt` 输出**：把每个 `[Shot N] At MM:SS.mmm` 整体平移 N 帧（正 = 写晚一点）。见文末「时间戳自动改写」 |
 
 ---
