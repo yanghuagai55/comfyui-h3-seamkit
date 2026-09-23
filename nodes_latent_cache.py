@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
+"""把一采的联合 AV latent 落盘 / 读回，用来冻结二采的输入。
+
+为什么需要这两个节点
+--------------------
+分块二采的接缝好坏，必须在**同一份二采输入**上比较两次跑（A/B）。但本机实测
+（2026-09-23）：一采**不是逐位可复现的** —— 同 seed 同 prompt，跨会话跑出来的
+测得的转镜帧能差 9 帧。而"让采样可复现"这条路在 8GB 上走不通：
+
+* 关 `--use-sage-attention` → 一采直接 CUDA OOM（Sage 是 int8/fp8 量化注意力，
+  省的是显存，不是可选项）；
+* 钉 MATH 后端 → 注意力矩阵 O(n²) 内存，更不可能。
+
+所以唯一干净的 A/B 是**冻结一采**：把它落盘、让二采读盘。这样二采输入逐位相同，
+而生成速度一点不损失（一采 latent 只有约 17 MB，107 token / 0.4MP 实测）。
+
+怎么接
+------
+* 只**存档**（不改行为）：把 `AV Latent Save` 串在一采与二采之间即可 ——
+  它是直通的（LATENT 进、LATENT 出），二采照样从一采拿数据。
+* 要**跳过一采**做 A/B：把二采执行器的 `latent` 输入从「一采输出」改接
+  `AV Latent Load`。必须换接线 —— ComfyUI 会先算完所有输入才调用下游，
+  光加一个存节点是不会让一采停跑的。
+
+⚠️ ComfyUI 核心的 `SaveLatent`/`LoadLatent` 做不了这件事：它存的是
+`latent_tensor` 单张量、走 safetensors（`nodes.py:553/576`），读回来还是单张量，
+不是 NestedTensor。本文件的存法是把嵌套张量拆成普通张量再存 —— 实测
+`torch.load` 的默认严格模式（`weights_only=True`）也能读，且逐位一致。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from pathlib import Path
+
+import torch
+
+import folder_paths
+from comfy_api.latest import io
+
+
+CACHE_DIRNAME = "seamkit_latent_cache"
+_SAFE_KEY = re.compile(r"[^0-9A-Za-z._-]+")
+
+
+def _cache_dir(create: bool) -> Path | None:
+    try:
+        root = Path(folder_paths.get_output_directory()) / CACHE_DIRNAME
+        if create:
+            root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError:
+        return None
+
+
+def _file_stem(key: str) -> str:
+    """key -> 安全的文件名。
+
+    文件名 = 「安全化的可读前缀 + key 的哈希」，所以：
+    * 不同 key 撞车的概率可忽略；
+    * key 里带斜杠 / 中文 / 空格也不会写坏路径；
+    * 哈希只取 key 本身 —— 换 key 就是换缓存，不会误用旧数据。
+    """
+    safe = _SAFE_KEY.sub("_", (key or "").strip())[:48] or "unnamed"
+    digest = hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:12]
+    return f"{safe}.{digest}"
+
+
+def _av_to_plain(samples) -> list:
+    """NestedTensor -> 普通 CPU 张量列表（可被默认严格模式读回）。"""
+    if hasattr(samples, "unbind"):
+        return [p.detach().cpu().contiguous() for p in samples.unbind()]
+    return [samples.detach().cpu().contiguous()]
+
+
+def _plain_to_av(tensors: list):
+    import comfy.nested_tensor
+
+    if len(tensors) == 1:
+        return comfy.nested_tensor.NestedTensor((tensors[0],))
+    return comfy.nested_tensor.NestedTensor(tuple(tensors))
+
+
+class MiniMaxH3AVLatentSave(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3AVLatentSave",
+            display_name="MiniMax H3 AV Latent Cache (Save)",
+            description=(
+                "把联合 AV latent 落盘，用于冻结二采的输入（A/B 实验）。\n"
+                "**直通节点**：LATENT 进、LATENT 出，串在一采与二采之间即可，不用改接线。\n"
+                "同一 key 已存在时默认跳过（不重写 17 MB）。\n"
+                "要真正跳过一采，把二采执行器的 latent 输入改接 AV Latent Cache (Load)。"
+            ),
+            category="MiniMax H3 Hard Cut",
+            is_experimental=True,
+            inputs=[
+                io.Latent.Input("latent"),
+                io.String.Input(
+                    "key",
+                    default="run1",
+                    tooltip=(
+                        "缓存标识。换 key = 换缓存；同一个 key 再跑就是复用同一份 latent。\n"
+                        "建议写清来源，例如 `seed786_s5_t2.8_promptA`。\n"
+                        "文件落在 <输出目录>/seamkit_latent_cache/。"
+                    ),
+                ),
+                io.Boolean.Input(
+                    "overwrite",
+                    default=False,
+                    tooltip=(
+                        "关（默认）：同 key 已存在就跳过，只打印一行 —— 省一次 17 MB 写入。\n"
+                        "开：覆盖旧缓存（改了上游提示词/种子就该开）。"
+                    ),
+                ),
+            ],
+            outputs=[io.Latent.Output("latent")],
+        )
+
+    @classmethod
+    def execute(cls, latent, key: str, overwrite: bool):
+        samples = latent.get("samples") if isinstance(latent, dict) else None
+        if samples is None:
+            raise ValueError("MiniMaxH3AVLatentSave: expected a LATENT dict with 'samples'")
+
+        root = _cache_dir(create=True)
+        if root is None:
+            print("[SeamKit] latent cache dir unavailable; passing through without saving", flush=True)
+            return io.NodeOutput(latent)
+
+        stem = _file_stem(key)
+        pt_path = root / f"{stem}.pt"
+        meta_path = root / f"{stem}.json"
+
+        if pt_path.is_file() and not overwrite:
+            print(f"[SeamKit] latent cache HIT (skip write): {pt_path.name}", flush=True)
+            return io.NodeOutput(latent)
+
+        tensors = _av_to_plain(samples)
+        meta = {
+            "key": key,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tensor_count": len(tensors),
+            "shapes": [list(t.shape) for t in tensors],
+            "dtypes": [str(t.dtype) for t in tensors],
+            "nested": bool(getattr(samples, "is_nested", False)),
+        }
+        try:
+            tmp = root / f".{stem}.pt.tmp"
+            torch.save({"tensors": tensors, "meta": meta}, tmp)
+            tmp.replace(pt_path)
+            tmp_json = root / f".{stem}.json.tmp"
+            tmp_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_json.replace(meta_path)
+        except Exception as exc:  # 缓存失败绝不能影响生成
+            print(f"[SeamKit] latent cache write skipped ({exc}); passing through", flush=True)
+            return io.NodeOutput(latent)
+
+        size_mb = pt_path.stat().st_size / 1e6
+        print(
+            f"[SeamKit] latent cache SAVED: {pt_path.name}  "
+            f"{size_mb:.1f} MB  shapes={meta['shapes']}  dtypes={meta['dtypes']}",
+            flush=True,
+        )
+        return io.NodeOutput(latent)
+
+
+class MiniMaxH3AVLatentLoad(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3AVLatentLoad",
+            display_name="MiniMax H3 AV Latent Cache (Load)",
+            description=(
+                "读回冻结的联合 AV latent，用来**跳过一采**做干净的 A/B。\n"
+                "接到二采执行器的 latent 输入（替换原来那条一采连线）。\n"
+                "找不到缓存直接报错 —— 不会静默回退到别的 latent（那会让 A/B 悄悄失效）。"
+            ),
+            category="MiniMax H3 Hard Cut",
+            is_experimental=True,
+            inputs=[
+                io.String.Input(
+                    "key",
+                    default="run1",
+                    tooltip="与 Save 节点填的 key 一致。文件在 <输出目录>/seamkit_latent_cache/。",
+                ),
+            ],
+            outputs=[io.Latent.Output("latent")],
+        )
+
+    @classmethod
+    def execute(cls, key: str):
+        root = _cache_dir(create=False)
+        stem = _file_stem(key)
+        pt_path = (root / f"{stem}.pt") if root else None
+        if pt_path is None or not pt_path.is_file():
+            names = []
+            if root and root.is_dir():
+                names = sorted(p.name for p in root.glob("*.pt"))[:8]
+            raise ValueError(
+                f"MiniMaxH3AVLatentLoad: no cached latent for key={key!r} "
+                f"(looked for {pt_path}).\n"
+                f"  现有缓存: {names or '（空）'}\n"
+                "  先跑一次带 AV Latent Cache (Save) 的流程，或者核对 key 拼写。"
+            )
+
+        payload = torch.load(pt_path, map_location="cpu")  # 默认严格模式即可（普通张量）
+        if not isinstance(payload, dict) or "tensors" not in payload:
+            raise ValueError(f"MiniMaxH3AVLatentLoad: {pt_path.name} 格式不对（缺 'tensors'）")
+
+        tensors = list(payload["tensors"])
+        meta = payload.get("meta") or {}
+        _check_shapes(tensors, meta, pt_path.name)
+        samples = _plain_to_av(tensors)
+        print(
+            f"[SeamKit] latent cache LOADED: {pt_path.name}  "
+            f"tensors={len(tensors)}  saved_at={meta.get('saved_at', '?')}",
+            flush=True,
+        )
+        return io.NodeOutput({"samples": samples})
+
+
+def _check_shapes(tensors: list, meta: dict, name: str) -> None:
+    want = meta.get("shapes")
+    if not isinstance(want, list) or len(want) != len(tensors):
+        return
+    for i, (t, w) in enumerate(zip(tensors, want)):
+        if list(t.shape) != list(w):
+            raise ValueError(
+                f"MiniMaxH3AVLatentLoad: {name} 第 {i} 个张量形状不符 —— "
+                f"缓存是 {w}，读出来是 {list(t.shape)}。文件可能被截断或替换过。"
+            )
+
+
+NODES = [MiniMaxH3AVLatentSave, MiniMaxH3AVLatentLoad]

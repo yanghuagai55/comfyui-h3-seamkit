@@ -50,6 +50,7 @@ from .nodes_repair import (
     MiniMaxH3SeamFuse,
 )
 from .nodes_unload import MiniMaxH3UnloadTextEncoder
+from .nodes_latent_cache import MiniMaxH3AVLatentLoad, MiniMaxH3AVLatentSave
 
 __all__ = ["comfy_entrypoint"]
 
@@ -69,6 +70,8 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3SeamRepairAll,
             MiniMaxH3RedrawBridge,
             MiniMaxH3UnloadTextEncoder,
+            MiniMaxH3AVLatentSave,
+            MiniMaxH3AVLatentLoad,
         ]
 
 
