@@ -246,6 +246,12 @@ def do_write_launcher() -> bool:
     new_args = old_args.replace(b"--use-sage-attention", b"").replace(b"  ", b" ").strip()
     if b"--deterministic" not in new_args:
         new_args = new_args + b" --deterministic"
+    # ★ --cache-none：每次队列都重算所有节点 → 一采必然重跑，
+    #   于是「同 seed 跑两次」不再依赖重启，也顺带不再囤缓存张量（省内存）。
+    #   代价是每跑一次都要重算一采（约 10 分钟），但 A/B 本来就要跑两次。
+    #   注意：它与 --cache-ram/--cache-classic/--cache-lru 互斥（同一 mutually_exclusive_group）。
+    if b"--cache-none" not in new_args:
+        new_args = new_args + b" --cache-none"
 
     out = raw[: m.start(1)] + new_args + raw[m.end(1) :]
     out = out.replace(
