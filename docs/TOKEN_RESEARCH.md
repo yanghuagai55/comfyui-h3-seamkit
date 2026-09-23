@@ -253,6 +253,55 @@ cuBLAS 官方文档：**同一 GPU 架构 + 同一 SM 数 + 同一工具链 + �
 **阶段 0 的验证要这样设计**：同会话会被 ComfyUI 的节点缓存掩盖（一采命中缓存 → 两次跑的本质是同一份 latent），
 所以必须**中间重启**。为省时间与 I/O，用**短片**验证即可（见 §6 阶段 0）。
 
+### 4.4 ★★★ 8GB 实机结论：本报告的「阶段 0」原方案不可行（2026-09-23 实测）
+
+按原方案（关 `--use-sage-attention` + 钉 MATH）实跑，**一采刚起步就 OOM**：
+
+```
+!!! Exception during processing !!! aimdo memory compile error   ← 本机已知的假报错外壳
+  torch.AcceleratorError: CUDA error: out of memory               ← 真身
+  Sticky error detected                                           ← CUDA 上下文已污染，必须重启
+失败点：ops.py:377 cast_bias_weight → 223 cast_maybe_lowvram_patch
+        → model_management.py:1530 cast_to_gathered 的 dest_view.copy_()
+```
+
+**逐条否掉：**
+
+| 路线 | 8GB 上的结果 |
+|---|---|
+| 关 `--use-sage-attention` | **一采 OOM**。SageAttention 是 int8/fp8 量化注意力 —— **它不是优化，是「让注意力这层也量化」**。关掉 = 把一层量化退回 bf16，显存与速度双输。在 int8 底模成为主流的今天，**Sage 是结构性前提** |
+| 钉 MATH | 注意力矩阵 **O(n²) 内存**，8GB 更不可能 |
+| 换 `--use-split-cross-attention` | 纯 PyTorch 实现，非量化，同上 |
+| 指望 `--deterministic` 兜底 | 它是 `warn_only`，且看不见自定义 CUDA 扩展（§4.3） |
+
+**另一个实测到的配置陷阱**：KJNodes 的 `MiniMaxH3MemoryEfficientSageAttentionPatch`
+（自述用途：`reduce peak VRAM usage`）**并不依赖 `--use-sage-attention`** ——
+它只要求 `sageattention` 模块可 import（`ltxv_nodes.py:2182`）。
+所以「关 Sage 就该关它」是错的：**它必须留着**，它是 8GB 上峰值显存能压住的关键。
+实测那次它没执行（日志里 `Applying MiniMax H3 Memory Efficient Sage Attention Patch` 出现 0 次，
+而当天三次成功跑每次都有）—— 峰值显存随即失守：当时 nvidia-smi 显示已用 7.1 GiB，
+而**实际可用只有 7956 MiB（8188 − 232 驱动占用）**，只剩约 0.67 GiB，
+搬权重需要的是一整块连续显存，于是跨线。
+
+**⇒ 结论：8GB 上不存在「关掉优化换确定性」这条路。**
+唯一可行的干净 A/B 是**冻结一采**（见 §6 阶段 0 的改法）。
+
+### 4.5 ★ 由此得出的方法约束：判据应当建在一采 latent 上
+
+冻结一采能消掉**一采**的方差，但**消不掉二采自己的**：同一份输入跑两次二采，
+成片本底差实测 **2.8~4.5 灰阶**（这就是为什么今天所有跨成片比较都无效）。
+
+| 层级 | 方差 | 能否用来标定 |
+|---|---|---|
+| **一采 latent** | **可冻结到逐位一致** | ✅ **判据 A（对应性 × 持久性）应建在这一层** |
+| 二采 latent / 成片 | 本底 2.8~4.5 灰阶 | ⚠️ 只能测**大于噪声底**的效应 |
+
+实测例：安静缝上重去噪的效应 **≈8 灰阶**（可测 ✓）；
+而另外两处只有 **≈3 灰阶**（落在噪声底内，不可测 ✗）。
+
+这条约束反过来支持 §3 的方向：**在 latent 域建标注集做标定**，
+而不是靠像素域读数 —— 后者天生被二采的噪声底封顶。
+
 ---
 
 ## 5. 开源许可证一览（以仓库 LICENSE 原文核实）
@@ -278,33 +327,33 @@ cuBLAS 官方文档：**同一 GPU 架构 + 同一 SM 数 + 同一工具链 + �
 
 ## 6. 落地路线（RTX 4060 8GB，按依赖排序）
 
-**阶段 0（半天）——先把 A/B 变成逐位复现**
+**阶段 0（半天）——改为「冻结一采」**（原「让采样逐位复现」方案已被 §4.4 实测否定）
 
-本机现状：`启动ComfyUI.bat` 跑的是 `--use-sage-attention --output-directory "D:\共享"`。
-实验会话改成（**已在本机逐个核过旗标存在性，见 §4.3**）：
+**不要关任何优化。** 做法是把**一采的 AV latent 落盘**、让二采读盘 ——
+这样**二采的输入逐位相同**，A/B 的方差归零，而生成速度一点不损失。
 
-```bat
-set COMMANDLINE_ARGS=--deterministic --use-split-cross-attention --output-directory "D:\共享"
-rem ① 去掉 --use-sage-attention —— 这是前提不是可选项：
-rem    --deterministic 是 warn_only，且 Sage 是自定义 CUDA 扩展，旗标看不见它
-rem ② --deterministic 会自动设 CUBLAS_WORKSPACE_CONFIG，不用手设
-rem ③ --fast 本来就没开，无需处理
-rem ④ 若 --use-split-cross-attention 太慢：改回 --use-pytorch-cross-attention，
-rem    并改 comfy/ops.py:66-72 把 SDPABackend.MATH 提到首位（没有旗标能做这件事）
-```
+机制在 `ComfyUI_MiniMaxH3_Director` 里**已经现成**（`director/segment_cache.py`）：
 
-**★ 验证设计（这一步最容易做错）**：同一会话内连跑会被 ComfyUI 的节点缓存掩盖 ——
-一采命中缓存后，两次跑本质是同一份 latent，**永远测不出复现性**。
-所以必须**两次跑之间重启 ComfyUI**。为省时间与 I/O，用短片验就够：
+| 现成能力 | 对应函数 |
+|---|---|
+| 存/取一采 AV latent（按指纹） | `save_first_pass_cache()` / `load_first_pass_cache()` |
+| **检测缓存**（逐段 missing / valid / mismatch） | `inspect_first_pass_cache()` |
+| **分类清理**（一采 / 成片 / 全部） | `clear_segment_cache(kind="first_pass"\|"final"\|"all")` |
+| **序列化配方** | `unbind()` 成普通 CPU 张量，再包回 `NestedTensor` |
 
-```
-total_seconds = 5      target_segment_seconds ≈ 1.2      → 约 4 段，有 hunt 行可比
-每跑十几分钟；I/O 从几百 GB 降到几十 GB
-```
+⚠️ **ComfyUI 核心的 `SaveLatent`/`LoadLatent` 用不了**：`nodes.py:553` 存的是
+`latent_tensor` **单张量**、走 safetensors；`LoadLatent` 读回来也是单张量，不是 NestedTensor。
+（实测：`torch.load` 默认 `weights_only=True` 会拒绝 `NestedTensor`；
+`unbind` 成普通张量后，**默认严格加载也能过**，且逐位一致。）
 
-判据：两次的 `cut planned=… -> boundary=… measured=…` 几行**逐字相同 = 复现成功**
-（一采一变 hunt 必变，所以这几行就是 latent 的廉价指纹）。
-若仍不齐，按 §4.2 根因排序逐项排查 —— 第一嫌疑是 Sage 残留与**模型补丁路径**。
+本仓库要补的一对节点：`SaveAVLatent`（接一采输出 + 一个 key）与
+`LoadAVLatent`（key 命中出 latent，否则**报错**，不要静默回退）。
+
+⚠️ **必须换接线**：A/B 期间把 `#40.latent` 从「一采输出」改接「LoadAVLatent」。
+ComfyUI 会先算完所有输入才调用下游，所以**只加一个存节点救不了** —— 一采照样会跑。
+
+代价：一采 latent 约 **17 MB/段**（107 token / 0.4MP 实测），可忽略。
+收益：不再依赖「同会话连跑」这种靠缓存的技巧，也不必关 Sage。
 
 **阶段 1（1~2 天，CPU 为主）——标注集**
 用 TransNetV2（MIT）在现有成片上生成参照转镜标签 + 人工复核手挥特写等
