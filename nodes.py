@@ -847,6 +847,10 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         _hc["seam_blend"] = bool(seam_blend)
         _hc["calm_too_quiet_below"] = max(0.0, float(calm_too_quiet_below))
         _hc["calm_min_gain"] = max(0.0, float(calm_min_gain))
+        # 让下游的 MiniMaxH3HardCutValidate 也能看到 loose 口径 —— 它的入参只有
+        # prompt + plan（没有 loose_prompt 控件），不放进 plan 就会用严格模式，
+        # 于是同一个提示词在 #56 是 warning、在 Validate 却是 raise（实测：整图被拦）。
+        _hc["loose_prompt"] = bool(loose_prompt)
         # Canvas megapixels, so #40 can re-check the load guard after the calm
         # search moves a boundary (auto_plan sized the PLANNED windows only).
         _hc["canvas_mp"] = float(canvas_mp)
@@ -1027,6 +1031,13 @@ class MiniMaxH3HardCutValidate(io.ComfyNode):
     def execute(cls, prompt, plan=None):
         if plan is not None:
             geo = geometry_from_plan(plan)
+            # ★ 与 #56 的口径对齐。修之前这里 `loose` 与 `overlap_anchored` 两个都没传，
+            # 而 #56 传了 —— 同一个提示词在 #56 只是 warning，到这里却变成 raise，
+            # 整个图在 0.02 秒被拦住（实测：一条"单镜头连续长镜"的提示词）。
+            # 本节点入参只有 prompt + plan，所以从 plan 里读（#56 已写入 hardcut 字典）。
+            _hc = (plan.get("hardcut") or {}) if isinstance(plan, dict) else {}
+            _anchored = bool(geo.get("overlap") or 0) > 0 or bool(_hc.get("auto_calm_search"))
+            _loose = _anchored or bool(_hc.get("loose_prompt"))
             result = validate_prompt(
                 prompt,
                 total_seconds=geo.get("total_seconds"),
@@ -1034,7 +1045,9 @@ class MiniMaxH3HardCutValidate(io.ComfyNode):
                 canvas_mp=geo.get("canvas_mp"),
                 chunk_frames=geo.get("chunk"),
                 overlap_frames=geo.get("overlap") or 0,
+                overlap_anchored=_anchored,
                 segment_frames=geo.get("segment_frames"),
+                loose=_loose,
             )
         else:
             result = validate_prompt(prompt)

@@ -1258,10 +1258,23 @@ def validate_prompt(
             hits.append(f"line {line}: {why} — '{match.group(0)}'")
     if hits:
         extra = f"  (+{len(hits) - MAX_LISTED} more)" if len(hits) > MAX_LISTED else ""
-        errors.append(
+        _m = (
             "wording contradicts a hard cut (the model is told not to cut while the "
             "executor splits) -> " + "; ".join(hits[:MAX_LISTED]) + extra
         )
+        if overlap_anchored:
+            # 与上面时间戳那段同一个道理：开着锚定 overlap / calm 搜索时，窗口边界是
+            # 「从上一窗继续」的缝合处，不是硬断点 —— 所以「一镜到底 / 不换镜」的措辞
+            # 是**对的**（模型本来就不该换镜，是采样器跨过去），不该判错。
+            # 修之前这条不看 overlap_anchored，于是永远报错，和同一份报告里的 W3
+            # （「plan overlap 是 17 帧，是混合不是硬切」）自相矛盾。
+            warnings.append(
+                _m + "  — acceptable: overlap/calm-search is on, so the window boundary is "
+                "stitched with an anchored overlap rather than a hard break; a prompt that "
+                "describes one continuous take is correct in that case."
+            )
+        else:
+            errors.append(_m)
 
     # ---- 4. timestamps --------------------------------------------------
     cut_secs: list[float] = []
