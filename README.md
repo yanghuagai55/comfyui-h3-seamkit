@@ -56,6 +56,34 @@ git clone https://github.com/<你的账号>/comfyui-h3-seamkit.git
 | `comfyui-minimax-h3-audio-T8` | **必须**。本插件在运行时按模块名后缀定位它的放大器 / 采样 / plan 构建器 |
 | MiniMax H3 模型 | 底模 + Qwen3-VL 文本编码器 + video VAE + 3D latent upscaler，按上游说明安装 |
 
+### ⚠️ 内存：二采建议 ≥32 GB，并抬高 pinned 上限
+
+二采要把 DiT 权重驻留在**页锁定的主机内存**（aimdo host buffer），实测需要
+**~25.6 GiB**。ComfyUI 默认把这个上限设成 `min(模型大小, 内存×0.40) × 2`，
+即 **约 0.80 × 物理内存** —— 32 GB 机器上只有 ~25.3 GiB，**正好差一点**，
+表现为跑完前几段后中途报：
+
+```
+aimdo: src/hostbuf.c:46:ERROR:hostbuf_grow: requested ... beyond reserved host buffer ...
+```
+
+| 内存 | 默认上限（0.80×） | 改 0.45 后（0.90×） | 够不够（需求 25.6 GiB） |
+|---|---|---|---|
+| 32 GB | 25.3 GiB | **28.5 GiB** | 默认差 0.3 ✗ / 改后余 2.9 ✓ |
+| 24 GB | 18.8 GiB | 21.2 GiB | ✗ |
+| 16 GB | 12.5 GiB | 14.0 GiB | ✗ |
+
+修法是把 `ComfyUI/comfy/model_management.py` 里 Windows 分支的 `ram * 0.40`
+改成 `ram * 0.45`（**一行**）。本项目附带交互式工具与完整说明：
+
+```bash
+D:\comfyui\comfyenv\python.exe D:\comfyui\_hardcut_work\tools\pinned_memory_patch.py
+```
+
+（菜单 `1` 打补丁 / `2` 复原；改动记录见 `_hardcut_work/patches/README.md`。
+不要用 `--high-ram` —— 它会完全去掉上限，pinned 内存不能换页，在 32 GB 机器上
+跑 32.4 GB 的模型容易从"干净报错"变成掉页卡死。）
+
 装完**重启 ComfyUI**。若上游没装，`MiniMaxH3HardCutUpscale` 会直接报
 `upstream H3 upscale pack not loaded in this process`；plan 构建器找不到时会自动回退到
 内置 plan，并在 `cut_report` 里打一行 WARNING（此时仍可跑，但契约同步不再有保证）。
