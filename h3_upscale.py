@@ -909,6 +909,7 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
     _win = int(search_window) if int(search_window) > 0 else max(int(tolerance), 34)
 
     aligned, boundary_tokens = [], []
+    _diagnostics = []
     for cut in planned:
         # index, not unpack: the profile grew columns (|d3|, persistence)
         window = [
@@ -924,8 +925,18 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
             # rows, and combined with the persistence and flat-ratio gates the
             # hunt quietly finds nothing at all - which reads as "the detector
             # is broken" rather than "the window was too narrow".
-            notes.append(
-                f"cut {cut}: no candidate token within {tolerance}f "
+            # ★ This used to call `notes.append`, and `notes` exists nowhere in
+            # this function or the module: an empty window raised
+            # NameError('notes') and took the node down.  Reachable whenever
+            # `_latent_change_profile` skips a row (it drops tokens whose
+            # neighbourhood median is 0, i.e. a run of perfectly static tokens),
+            # so the cut's own row can be missing.  Same class as the
+            # `_SkipProbe` crash - a name that is never defined at all, which
+            # check_undefined.py cannot see (2026-09-23).
+            # Functionally this cut is already covered downstream: the caller
+            # treats "no entry / no boundary_frame" as "keep the planned frame".
+            _diagnostics.append(
+                f"[HardCut]   cut {cut}: no candidate token within {tolerance}f "
                 f"(one token spans ~{GRID_FRAMES_PER_TOKEN}f) -> increase "
                 f"seam_tolerance_frames or the hunt will find nothing here"
             )
@@ -1014,8 +1025,40 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
         if note:
             entry["note"] = note
         aligned.append(entry)
+    for _line in _diagnostics:
+        print(_line, flush=True)
     return aligned, boundary_tokens
 
+
+
+def _hunt_log_line(entry) -> str:
+    """Format one per-cut hunt result for the console.
+
+    Separated from the executor so it is unit-testable (see
+    `_hardcut_work/seamfix/e4_hardcut_policy_test.py`, cases L1-L4).  The console
+    is the ONLY window into where the seams landed - a 15s render runs for
+    minutes - and a declined cut used to print `ratio=None` with no reason,
+    which is indistinguishable between "the persistence gate fired", "the flat
+    gate fired" and "the window held no candidate at all".  The note also
+    carries the snap line for an ACCEPTED cut, which is what explains
+    `measured=73 -> boundary=68` (2026-09-23).
+    """
+    moved = entry.get("moved")
+    planned_cut = entry.get("planned_cut")
+    boundary = entry.get("boundary_frame")
+    if boundary is None:
+        text = (f"cut planned={planned_cut} -> boundary=None "
+                f"(NOT accepted, moved={moved}")
+    else:
+        offset = int(boundary) - int(planned_cut)
+        text = (f"cut planned={planned_cut} -> boundary={boundary} "
+                f"(offset={offset:+d}f, moved={moved}")
+    if entry.get("measured_turn_frame") is not None:
+        text += f", measured={entry['measured_turn_frame']}"
+    text += f", ratio={entry.get('ratio')}"
+    if entry.get("note"):
+        text += f", why: {entry['note']}"
+    return f"[HardCut]   {text})"
 
 
 def release_text_encoders() -> list:
@@ -1366,22 +1409,7 @@ def execute(
                 f"hunt={'on' if auto_seam_hunt else 'off'}"
             )
             for entry in seam_hunt.get("aligned") or []:
-                moved = entry.get("moved")
-                planned_cut = entry.get("planned_cut")
-                boundary = entry.get("boundary_frame")
-                if boundary is None:
-                    head = (f"[HardCut]   cut planned={planned_cut} -> boundary=None "
-                            f"(NOT accepted, moved={moved}")
-                else:
-                    offset = int(boundary) - int(planned_cut)
-                    head = (f"[HardCut]   cut planned={planned_cut} -> "
-                            f"boundary={boundary} (offset={offset:+d}f, moved={moved}")
-                tail = (
-                    (f", measured={entry.get('measured_turn_frame')}"
-                     if entry.get("measured_turn_frame") is not None else "")
-                    + f", ratio={entry.get('ratio')})"
-                )
-                _log_buf["hunt"].append(head + tail)
+                _log_buf["hunt"].append(_hunt_log_line(entry))
             if seam_hunt.get("note"):
                 _log_buf["hunt"].append(f"[HardCut]   note: {seam_hunt['note']}")
         for _section in ("cfg", "hunt", "calm", "overlap", "sum"):
