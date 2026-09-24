@@ -32,8 +32,26 @@ from .nodes_latent_cache import (
     fingerprint_from_node_inputs,
     load_av_latent,
     save_av_latent,
+    zero_audio_part,
 )
 from .nodes_guard import _attn_forward_name
+
+
+def _release_upstream_audio(latent_image) -> int:
+    """丢掉上游（#8/#41 那条线）送进来的音频分量，返回被丢弃的元素数。
+
+    HIT 时 `latent_image` 是**上游 conditioning 节点已经产出**的联合 AV latent ——
+    它的音频就是我们要扔掉的那份"前面采样出来的声音"。这里：
+      * 若为 nested 且恰好两分量（视频+音频），**就地清零音频**并返回其元素数；
+        上游张量此后若无人再引用即可被回收（我们不再持有它）。
+      * 单分量（纯视频）或形状不符：原样返回 0，不猜、不动。
+    永不抛异常。
+    """
+    n_video, n_audio = zero_audio_part(
+        (latent_image or {}).get("samples") if isinstance(latent_image, dict) else None,
+        label="上游 latent_image",
+    )
+    return n_audio
 
 
 def _cache_hit(key: str, fp: str):
@@ -71,6 +89,8 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 "use_cache 是**总开关**：\n"
                 "  开：同 key 且上游指纹一致 -> **直接读缓存、跳过采样**（省一次一采，"
                 "二采输入逐位相同，A/B 才干净）；没命中 -> 照常采样并保存缓存。\n"
+                "      HIT 时**丢弃采样音频**：上游 #8/#41 已产出的音轨被清零/丢弃，"
+                "流向下游的音频恒为零（二采拿到「干净视频 + 静音」）。\n"
                 "  关：**纯采样器** —— 不算指纹、不读不写缓存，行为与官方 "
                 "SamplerCustomAdvanced 一致（仅保留显存护栏打印，纯诊断不影响数值）。"
             ),
@@ -157,9 +177,18 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
             hit = _cache_hit(key, fp)
             if hit is not None:
                 samples, meta, fname = hit
+                # 加载缓存 = 丢掉上游 #8/#41 已采样出来的声音（用户定调：直接丢）。
+                # 音频 latent 极小（实测 [1,32,2,207] fp32 ≈ 53 KB），所以省的不是显存，
+                # 而是**语义**：流向下游的音频恒为零，二采拿到「干净视频 + 静音」，
+                # 不会被旧图上采样出来的音轨污染。
+                n_v, n_a = zero_audio_part(samples, label="一采缓存")
+                dropped = _release_upstream_audio(latent_image)
                 print(
                     f"[SeamKit] 一采缓存 HIT（跳过采样）: {fname}  fp={fp[:12]}  "
-                    f"saved_at={meta.get('saved_at')}",
+                    f"saved_at={meta.get('saved_at')}\n"
+                    f"[SeamKit]         已丢弃采样音频: 缓存音频 {n_a} 元素清零"
+                    + (f"，上游 latent_image 音频 {dropped} 元素丢弃" if dropped else "")
+                    + "（HIT 路径下游音频=静音）",
                     flush=True,
                 )
                 out = {"samples": samples}

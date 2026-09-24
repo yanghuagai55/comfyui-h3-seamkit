@@ -85,6 +85,35 @@ def _plain_to_av(tensors: list):
     return comfy.nested_tensor.NestedTensor(tuple(tensors))
 
 
+def zero_audio_part(samples, *, label: str = "") -> tuple[int, int]:
+    """把 AV latent 的**音频分量就地清零**，返回 (视频元素数, 音频元素数)。
+
+    用途：一采缓存 HIT 时丢弃上游（#8/#41）已经采样出来的声音 —— 让流向下游的
+    音频恒为零，二采拿到的就是「干净视频 + 静音」。
+
+    就地改写（`zero_()`）而不是新建张量，因为调用方返回的是**缓存刚读出来的**张量，
+    没有别的持有者；就地清零省一次分配，也立刻把内容抹掉。
+    * 只处理 nested（视频/音频两分量）的联合 AV latent；单分量（纯视频）原样返回。
+    * 张量布局约定与 `h3_t8.core.nested_av_parts` 一致：parts[1] 是音频。
+    * 永远不抛异常 —— 清不掉就如实返回 0，让调用方自己决定要不要吭声。
+    """
+    n_video = n_audio = 0
+    try:
+        if not getattr(samples, "is_nested", False):
+            return 0, 0
+        parts = list(samples.tensors)
+        if len(parts) != 2:
+            return 0, 0
+        video, audio = parts
+        n_video = video.numel()
+        n_audio = audio.numel()
+        audio.zero_()
+    except Exception as exc:  # 诊断信息比异常重要，别让缓存路径炸掉
+        print(f"[SeamKit] 音频清零失败（{label or 'av'}）: {exc}", flush=True)
+        return 0, 0
+    return n_video, n_audio
+
+
 class MiniMaxH3AVLatentSave(io.ComfyNode):
     @classmethod
     def define_schema(cls):
