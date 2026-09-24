@@ -13,6 +13,9 @@ ComfyUI 里的 `MiniMax H3 AV Latent Cache (Save/Load)` 负责存读；
     python tools/latent_cache.py purge <key>           # 删一个
     python tools/latent_cache.py purge --all           # 全删（会先列出来要确认）
     python tools/latent_cache.py dir                   # 只打印缓存目录路径
+
+所有子命令都接受 `--path <目录>`：节点里 `cache_path` 填了自定义目录时，
+这里也用 `--path` 指到同一个目录，否则工具会看着默认目录说"没有缓存"。
 """
 from __future__ import annotations
 
@@ -254,6 +257,11 @@ def cmd_dir(root: Path, _args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="一采 latent 缓存管理")
+    ap.add_argument(
+        "--path",
+        default=None,
+        help="缓存目录覆盖（与节点里 cache_path 填的一致）。留空 = 自动探测默认目录。",
+    )
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("list", help="列出全部（默认）")
     p_show = sub.add_parser("show", help="看一个的详情")
@@ -267,7 +275,9 @@ def main() -> int:
     sub.add_parser("dir", help="打印缓存目录")
 
     args = ap.parse_args()
-    root = cache_dir()
+    root = Path(args.path).expanduser() if args.path else cache_dir()
+    if args.path:
+        print(f"（--path 覆盖：{root}）")
     handlers = {
         None: cmd_list,
         "list": cmd_list,

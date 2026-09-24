@@ -47,9 +47,16 @@ CACHE_DIRNAME = "seamkit_latent_cache"
 _SAFE_KEY = re.compile(r"[^0-9A-Za-z._-]+")
 
 
-def _cache_dir(create: bool) -> Path | None:
+def _cache_dir(create: bool, path: str | None = None) -> Path | None:
+    """缓存目录。`path` 非空 = 用户指定的目录；否则 <输出目录>/seamkit_latent_cache。
+
+    用户可填绝对路径（本机可为 `D:\\共享\\seamkit_latent_cache`）放到任意盘 ——
+    8GB 机器上把缓存放到别处常见（输出盘可插拔）。填了就用填的，不再拼
+    `CACHE_DIRNAME` 子目录：用户给什么就是什么，避免"我以为它会在里面再套一层"。
+    """
     try:
-        root = Path(folder_paths.get_output_directory()) / CACHE_DIRNAME
+        raw = (path or "").strip()
+        root = Path(raw).expanduser() if raw else Path(folder_paths.get_output_directory()) / CACHE_DIRNAME
         if create:
             root.mkdir(parents=True, exist_ok=True)
         return root
@@ -149,13 +156,22 @@ class MiniMaxH3AVLatentSave(io.ComfyNode):
                         "二采参数不进指纹 —— 所以改二采不会让一采缓存失效，改一采则必然刷新。"
                     ),
                 ),
+                io.String.Input(
+                    "cache_path",
+                    default="",
+                    tooltip=(
+                        "缓存目录。留空 = 默认 `<输出目录>/seamkit_latent_cache/`。\n"
+                        "填绝对路径即可存到任意盘（本机例：`D:\\共享\\seamkit_latent_cache`）。\n"
+                        "**要用 Load（或一采节点）读回来时，两边的 cache_path 必须一致。**"
+                    ),
+                ),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[io.Latent.Output("latent")],
         )
 
     @classmethod
-    def execute(cls, latent, key: str, overwrite: bool):
+    def execute(cls, latent, key: str, overwrite: bool, cache_path: str = ""):
         samples = latent.get("samples") if isinstance(latent, dict) else None
         if samples is None:
             raise ValueError("MiniMaxH3AVLatentSave: expected a LATENT dict with 'samples'")
@@ -167,7 +183,7 @@ class MiniMaxH3AVLatentSave(io.ComfyNode):
         )
         # 真正的存盘逻辑在 save_av_latent()：二采执行器也调它（它本来就在一采下游，
         # 手上就有那份 latent），所以两处必须共用一份实现，避免行为漂移。
-        print(save_av_latent(samples, key, overwrite, fp, summary), flush=True)
+        print(save_av_latent(samples, key, overwrite, fp, summary, path=cache_path), flush=True)
         return io.NodeOutput(latent)
 
 
@@ -198,19 +214,29 @@ class MiniMaxH3AVLatentLoad(io.ComfyNode):
                 io.String.Input(
                     "key",
                     default="run1",
-                    tooltip="与 Save 节点填的 key 一致。文件在 <输出目录>/seamkit_latent_cache/。",
+                    tooltip="与 Save 节点填的 key 一致。文件在 `<cache_path>/<key>.<hash12>.pt`。",
+                ),
+                io.String.Input(
+                    "cache_path",
+                    default="",
+                    tooltip=(
+                        "缓存目录。留空 = 默认 `<输出目录>/seamkit_latent_cache/`。\n"
+                        "填绝对路径即可指到任意盘（本机例：`D:\\共享\\seamkit_latent_cache`）。\n"
+                        "**必须与 Save（或一采节点）填的完全一致**，否则读不到。"
+                    ),
                 ),
             ],
             outputs=[io.Latent.Output("latent")],
         )
 
     @classmethod
-    def execute(cls, key: str):
-        samples, meta, name = load_av_latent(key)
+    def execute(cls, key: str, cache_path: str = ""):
+        samples, meta, name = load_av_latent(key, path=cache_path)
         fp = meta.get("fingerprint") or "<无>"
         summary = meta.get("summary") or {}
+        where = (cache_path or "").strip() or "<默认输出目录>/seamkit_latent_cache"
         print(
-            f"[SeamKit] latent cache LOADED: {name}  "
+            f"[SeamKit] latent cache LOADED: {name}  (dir={where})  "
             f"tensors={meta.get('tensor_count')}  "
             f"saved_at={meta.get('saved_at', '?')}  fp={str(fp)[:12]}  "
             f"seed={summary.get('seeds')}  nodes={summary.get('nodes')}",
@@ -236,16 +262,21 @@ def _check_shapes(tensors: list, meta: dict, name: str) -> None:
             )
 
 
-def save_av_latent(samples, key: str, overwrite: bool, fp: str, summary: dict, *, tag: str = "") -> str:
+def save_av_latent(
+    samples, key: str, overwrite: bool, fp: str, summary: dict,
+    *, tag: str = "", path: str | None = None,
+) -> str:
     """把 AV latent 落盘。返回一行状态（供调用方打印）。
 
     抽成模块级函数，因为有两个调用方：
       * `MiniMaxH3AVLatentSave` 节点（独立存）
       * **二采执行器 `MiniMaxH3HardCutUpscale`** —— 它本来就在一采下游，
         手上就有那份 latent，所以由它存最省事：不用加节点、不用动接线。
+
+    `path` 非空 = 存到这个目录（否则默认 `<输出目录>/seamkit_latent_cache/`）。
     永不抛异常（缓存是尽力而为，不能影响生成）。
     """
-    root = _cache_dir(create=True)
+    root = _cache_dir(create=True, path=path)
     if root is None:
         return "[SeamKit] latent cache dir unavailable; skip"
     stem = _file_stem(key)
@@ -300,9 +331,12 @@ def save_av_latent(samples, key: str, overwrite: bool, fp: str, summary: dict, *
     return f"{hit}\n{line}" if hit else line
 
 
-def load_av_latent(key: str):
-    """按 key 读回 AV latent（`{"samples": NestedTensor}`）。读不到就抛。"""
-    root = _cache_dir(create=False)
+def load_av_latent(key: str, path: str | None = None):
+    """按 key 读回 AV latent（`{"samples": NestedTensor}`）。读不到就抛。
+
+    `path` 非空 = 从这个目录读（否则默认 `<输出目录>/seamkit_latent_cache/`）。
+    """
+    root = _cache_dir(create=False, path=path)
     stem = _file_stem(key)
     pt_path = (root / f"{stem}.pt") if root else None
     if pt_path is None or not pt_path.is_file():

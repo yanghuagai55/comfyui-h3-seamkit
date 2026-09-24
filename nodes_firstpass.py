@@ -54,15 +54,16 @@ def _release_upstream_audio(latent_image) -> int:
     return n_audio
 
 
-def _cache_hit(key: str, fp: str):
-    """指纹一致才命中；读不到/不一致返回 None。"""
+def _cache_hit(key: str, fp: str, path: str | None = None):
+    """指纹一致才命中；读不到/不一致返回 None。`path` 非空 = 从该目录读。"""
     try:
-        samples, meta, name = load_av_latent(key)
+        samples, meta, name = load_av_latent(key, path=path)
     except ValueError:
         # ★ miss 必须留痕：2026-09-24 跑 B 时 use_cache 没开/没存过，
         #   全程无日志线索，用户以为"节点没变化"。没命中要说出来。
+        where = (path or "").strip() or "<默认输出目录>/seamkit_latent_cache"
         print(
-            f"[SeamKit] 一采缓存 MISS（没有 key={key!r} 的存档），照常采样"
+            f"[SeamKit] 一采缓存 MISS（在 {where} 没有 key={key!r} 的存档），照常采样"
             "（本次采样结束后会写入缓存，下一次同 key 且上游没变才会 HIT）",
             flush=True,
         )
@@ -92,7 +93,9 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 "      HIT 时**丢弃采样音频**：上游 #8/#41 已产出的音轨被清零/丢弃，"
                 "流向下游的音频恒为零（二采拿到「干净视频 + 静音」）。\n"
                 "  关：**纯采样器** —— 不算指纹、不读不写缓存，行为与官方 "
-                "SamplerCustomAdvanced 一致（仅保留显存护栏打印，纯诊断不影响数值）。"
+                "SamplerCustomAdvanced 一致（仅保留显存护栏打印，纯诊断不影响数值）。\n\n"
+                "缓存目录可用 `cache_path` 改到任意盘（留空 = 输出目录下的 "
+                "`seamkit_latent_cache/`）。"
             ),
             category="MiniMax H3 Hard Cut",
             is_experimental=True,
@@ -121,6 +124,16 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                     default=True,
                     tooltip="开：没检测到 KJNodes 显存优化补丁就打醒目警告（8GB 卡强烈建议开）。",
                 ),
+                io.String.Input(
+                    "cache_path",
+                    default="",
+                    tooltip=(
+                        "缓存目录。留空 = 默认 `<输出目录>/seamkit_latent_cache/`。\n"
+                        "填绝对路径即可指到任意盘（本机例：`D:\\共享\\seamkit_latent_cache`）。\n"
+                        "HIT 从这个目录读、MISS 后往这个目录写；与独立 Load/Save 节点\n"
+                        "共用同一份目录时，三边填一致即可互相复用缓存。"
+                    ),
+                ),
             ],
             hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[
@@ -141,6 +154,7 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
         use_cache: bool = False,
         cache_key: str = "run1",
         require_sage_patch: bool = True,
+        cache_path: str = "",
     ):
         import torch
 
@@ -174,7 +188,7 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
 
         # ── 2. 缓存读取（在采样之前）──────────────────────────────────────
         if use_cache:
-            hit = _cache_hit(key, fp)
+            hit = _cache_hit(key, fp, path=cache_path)
             if hit is not None:
                 samples, meta, fname = hit
                 # 加载缓存 = 丢掉上游 #8/#41 已采样出来的声音（用户定调：直接丢）。
@@ -239,7 +253,7 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
         # ── 4. 缓存保存（采样之后；失败不影响生成）────────────────────────
         if use_cache:
             print(
-                save_av_latent(samples, key, False, fp, summary, tag="一采"),
+                save_av_latent(samples, key, False, fp, summary, tag="一采", path=cache_path),
                 flush=True,
             )
 
