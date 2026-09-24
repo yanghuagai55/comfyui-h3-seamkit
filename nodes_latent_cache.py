@@ -341,14 +341,7 @@ def upstream_subgraph(prompt, node_unique_id) -> dict:
     return seen
 
 
-def fingerprint_of(prompt, node_unique_id) -> tuple[str, dict]:
-    """返回 (哈希, 便于人看的摘要)。摘要用于 mismatch 时说清"变了什么"。"""
-    graph = upstream_subgraph(prompt, node_unique_id)
-    if not graph:
-        return "", {"note": "no upstream graph available"}
-    blob = json.dumps(graph, sort_keys=True, ensure_ascii=False, default=str)
-    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
+def _summarize(graph: dict) -> dict:
     seeds, texts, classes = [], [], []
     for node in graph.values():
         classes.append(str(node.get("t") or "?"))
@@ -357,13 +350,59 @@ def fingerprint_of(prompt, node_unique_id) -> tuple[str, dict]:
                 seeds.append(f"{v}")
             if k in _TEXT_KEYS and isinstance(v, str) and v.strip():
                 texts.append(v.strip().replace("\n", " ")[:70])
-    summary = {
+    return {
         "nodes": len(graph),
         "seeds": sorted(set(seeds))[:3],
         "texts": texts[:2],
         "has": sorted(set(classes))[:12],
     }
-    return digest, summary
+
+
+def fingerprint_of(prompt, node_unique_id) -> tuple[str, dict]:
+    """沿本节点 `latent` 输入反向上游（给 AV Latent Cache (Save) 用）。"""
+    graph = upstream_subgraph(prompt, node_unique_id)
+    if not graph:
+        return "", {"note": "no upstream graph available"}
+    blob = json.dumps(graph, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest(), _summarize(graph)
+
+
+def upstream_subgraph_from_inputs(prompt, node_unique_id) -> dict:
+    """从本节点**所有**链接输入反向收集上游子图。
+
+    一采节点（噪声/guider/sampler/sigmas/latent 全是输入）的身份 = 全部上游，
+    所以一采缓存用这个；AV Latent Save 只需要 latent 链，用 upstream_subgraph。
+    """
+    if not isinstance(prompt, dict):
+        return {}
+    me = prompt.get(str(node_unique_id))
+    if not isinstance(me, dict):
+        return {}
+    links = [v for v in (me.get("inputs") or {}).values() if _is_link(v)]
+    seen: dict = {}
+    stack = [str(v[0]) for v in links]
+    while stack:
+        nid = stack.pop()
+        if nid in seen:
+            continue
+        node = prompt.get(nid)
+        if not isinstance(node, dict):
+            continue
+        ins = node.get("inputs") or {}
+        literals = {k: v for k, v in ins.items() if not _is_link(v)}
+        lnks = {k: str(v[0]) for k, v in ins.items() if _is_link(v)}
+        seen[nid] = {"t": node.get("class_type"), "lit": literals, "lnk": lnks}
+        stack.extend(lnks.values())
+    return seen
+
+
+def fingerprint_from_node_inputs(prompt, node_unique_id) -> tuple[str, dict]:
+    """一采节点的指纹 = 全部输入的上游子图（噪声/提示词/guider/sampler/sigmas…）。"""
+    graph = upstream_subgraph_from_inputs(prompt, node_unique_id)
+    if not graph:
+        return "", {"note": "no upstream graph available"}
+    blob = json.dumps(graph, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest(), _summarize(graph)
 
 
 def fingerprint_diff(stored: dict, expected: dict) -> list:

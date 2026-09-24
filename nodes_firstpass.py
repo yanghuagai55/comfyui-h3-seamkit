@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
+"""一采采样节点：官方 `SamplerCustomAdvanced` 的薄壳 + 一采缓存 + 显存护栏。
+
+为什么要有这个节点
+------------------
+* 本机实测一采**不是逐位可复现的**（同 seed 跨会话，测得的转镜帧能差 9 帧），
+  而"让采样变确定"在 8GB 上走不通（关 Sage 会 OOM、钉 MATH 是 O(n²)）。
+* 唯一干净的 A/B = **冻结一采**。但独立 Save 节点放在一采后面，一采永远先跑，跳不过去。
+* ⇒ 把缓存装进**一采节点本身**：同一个节点两种模式，图不用改，切 `use_cache` 即可。
+
+实现方式（**不是 fork**）
+------------------------
+逐行复刻官方 `SamplerCustomAdvanced.execute`
+（comfy_extras/nodes_custom_sampler.py:1041-1075）的流程 ——
+`fix_empty_latent_channels` -> `guider.sample(noise.generate_noise(...), ...)` ->
+`process_latent_out` —— 只在外面包了：缓存读取（采样前）与缓存保存（采样后），
+外加显存护栏（在 `guider.sample` 的权重搬运**之前**打印，赶得上 OOM）。
+签名与官方完全一致，可直接替换。
+"""
+
+from __future__ import annotations
+
+import comfy.sample
+import comfy.model_management
+import latent_preview
+import comfy.utils
+from comfy_api.latest import io
+
+from .nodes_latent_cache import (
+    _file_stem,
+    fingerprint_from_node_inputs,
+    load_av_latent,
+    save_av_latent,
+)
+from .nodes_guard import _attn_forward_name
+
+
+def _cache_hit(key: str, fp: str):
+    """指纹一致才命中；读不到/不一致返回 None。"""
+    try:
+        samples, meta, name = load_av_latent(key)
+    except ValueError:
+        return None
+    old = (meta.get("fingerprint") or "")
+    if fp and old and old != fp:
+        print(
+            f"[SeamKit] 一采缓存指纹不一致 -> 不使用（存档 {old[:12]} vs 当前 {fp[:12]}），照常采样",
+            flush=True,
+        )
+        return None
+    return samples, meta, name
+
+
+class MiniMaxH3FirstPassSampler(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3FirstPassSampler",
+            display_name="MiniMax H3 First Pass (cacheable)",
+            description=(
+                "官方 `SamplerCustomAdvanced` 的薄壳 + 一采缓存 + 显存护栏。\n"
+                "输入输出签名与官方完全一致，可**直接替换**一采的 SamplerCustomAdvanced。\n\n"
+                "use_cache 开：同 key 且上游指纹一致 -> **直接读缓存、跳过采样**（省一次一采，"
+                "二采输入逐位相同，A/B 才干净）；指纹不一致 -> 照常采样并覆盖缓存。\n"
+                "use_cache 关：照常采样并保存缓存。\n\n"
+                "另外会在采样前检查显存优化注意力补丁是否在位 —— 本机两次 OOM 都是因为它没跑。"
+            ),
+            category="MiniMax H3 Hard Cut",
+            is_experimental=True,
+            inputs=[
+                io.Noise.Input("noise"),
+                io.Guider.Input("guider"),
+                io.Sampler.Input("sampler"),
+                io.Sigmas.Input("sigmas"),
+                io.Latent.Input("latent_image"),
+                io.Boolean.Input(
+                    "use_cache",
+                    default=False,
+                    tooltip="开：命中缓存就跳过采样（读回冻结的一采）。关：照常采样并保存。",
+                ),
+                io.String.Input(
+                    "cache_key",
+                    default="run1",
+                    tooltip="缓存标识。建议带来源，如 `seed342114_s5_cam_v4`。换 key = 换缓存。",
+                ),
+                io.Boolean.Input(
+                    "require_sage_patch",
+                    default=True,
+                    tooltip="开：没检测到 KJNodes 显存优化补丁就打醒目警告（8GB 卡强烈建议开）。",
+                ),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+            outputs=[
+                io.Latent.Output("output"),
+                io.Latent.Output("denoised_output"),
+                io.Boolean.Output("cache_hit"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        noise,
+        guider,
+        sampler,
+        sigmas,
+        latent_image,
+        use_cache: bool = False,
+        cache_key: str = "run1",
+        require_sage_patch: bool = True,
+    ):
+        import torch
+
+        # ── 0. 指纹：从本节点所有链接输入反向走上游子图（= 一采的完整身份）────────
+        _hidden = getattr(cls, "hidden", None)
+        fp, summary = fingerprint_from_node_inputs(
+            getattr(_hidden, "prompt", None), getattr(_hidden, "unique_id", None)
+        )
+        key = (cache_key or "").strip() or "run1"
+
+        # ── 1. 显存护栏：必须在 guider.sample 之前打，赶得上权重搬运阶段的 OOM ──
+        name = _attn_forward_name(guider.model_patcher)
+        if name and "sageattn" in name:
+            print(f"[SeamKit] 一采: 显存优化补丁在位（{name}）", flush=True)
+        else:
+            print(
+                f"[SeamKit] 一采: 注意力实现 = {name!r}"
+                + (
+                    "\n[SeamKit] ⚠⚠ 8GB 卡上少了显存优化补丁 -> 峰值显存压不住 -> 一采就 OOM\n"
+                    "          请确认 `MiniMax H3 Mem Eff Sage Attention Patch` 节点在图上、"
+                    "mode=0、输出接进 model 链。"
+                    if require_sage_patch and name
+                    else ""
+                ),
+                flush=True,
+            )
+
+        # ── 2. 缓存读取（在采样之前）──────────────────────────────────────
+        if use_cache:
+            hit = _cache_hit(key, fp)
+            if hit is not None:
+                samples, meta, fname = hit
+                print(
+                    f"[SeamKit] 一采缓存 HIT（跳过采样）: {fname}  fp={fp[:12]}  "
+                    f"saved_at={meta.get('saved_at')}",
+                    flush=True,
+                )
+                out = {"samples": samples}
+                return io.NodeOutput(out, dict(out), True)
+
+        # ── 3. 官方采样流程（逐行照抄 SamplerCustomAdvanced.execute）──────
+        latent = latent_image
+        li = latent["samples"]
+        latent = latent.copy()
+        li = comfy.sample.fix_empty_latent_channels(
+            guider.model_patcher, li,
+            latent.get("downscale_ratio_spacial", None),
+            latent.get("downscale_ratio_temporal", None),
+        )
+        latent["samples"] = li
+
+        noise_mask = latent.get("noise_mask")
+
+        x0_output = {}
+        callback = latent_preview.prepare_callback(
+            guider.model_patcher, sigmas.shape[-1] - 1, x0_output
+        )
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        samples = guider.sample(
+            noise.generate_noise(latent), li, sampler, sigmas,
+            denoise_mask=noise_mask, callback=callback,
+            disable_pbar=disable_pbar, seed=noise.seed,
+        )
+        samples = samples.to(comfy.model_management.intermediate_device())
+
+        out = latent.copy()
+        out.pop("downscale_ratio_spacial", None)
+        out.pop("downscale_ratio_temporal", None)
+        out["samples"] = samples
+        if "x0" in x0_output:
+            x0 = x0_output["x0"]
+            if samples.is_nested and not x0.is_nested:
+                latent_shapes = [x.shape for x in samples.unbind()]
+                x0 = comfy.nested_tensor.NestedTensor(
+                    comfy.utils.unpack_latents(x0, latent_shapes)
+                )
+            x0_out = guider.model_patcher.model.process_latent_out(x0.cpu())
+            out_denoised = latent.copy()
+            out_denoised["samples"] = x0_out
+        else:
+            out_denoised = out
+
+        # ── 4. 缓存保存（采样之后；失败不影响生成）────────────────────────
+        if use_cache:
+            print(
+                save_av_latent(samples, key, False, fp, summary, tag="一采"),
+                flush=True,
+            )
+
+        return io.NodeOutput(out, out_denoised, False)

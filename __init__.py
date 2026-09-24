@@ -52,6 +52,7 @@ from .nodes_repair import (
 from .nodes_unload import MiniMaxH3UnloadTextEncoder
 from .nodes_latent_cache import MiniMaxH3AVLatentLoad, MiniMaxH3AVLatentSave
 from .nodes_guard import MiniMaxH3VRamGuard
+from .nodes_firstpass import MiniMaxH3FirstPassSampler
 
 __all__ = ["comfy_entrypoint"]
 
@@ -74,6 +75,7 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3AVLatentSave,
             MiniMaxH3AVLatentLoad,
             MiniMaxH3VRamGuard,
+            MiniMaxH3FirstPassSampler,
         ]
 
 
