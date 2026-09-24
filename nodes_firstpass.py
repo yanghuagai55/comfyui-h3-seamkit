@@ -127,6 +127,7 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 io.String.Input(
                     "cache_path",
                     default="",
+                    optional=True,
                     tooltip=(
                         "缓存目录。留空 = 默认 `<输出目录>/seamkit_latent_cache/`。\n"
                         "填绝对路径即可指到任意盘（本机例：`D:\\共享\\seamkit_latent_cache`）。\n"
