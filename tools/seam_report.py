@@ -118,7 +118,16 @@ def evaluate(lum, d1, lap, seam):
     return step, med, ratio, pct, pre, post, dsharp
 
 
-def verdict(ratio, pct, step):
+def verdict(ratio, pct, step, hard_cut=False):
+    if hard_cut:
+        # ★ 硬切落在 17k「独占帧」上：台阶百分位高、锐度大涨都是**结构基线**
+        #   （17k 天生更锐/更暗，且内容在此真变了）—— 只按局部倍数判。
+        #   依据：SEAM_VISUAL_REVIEW_20260924.md §5（17k 基线）+ 00075 缝51/00078 缝51 实测
+        if ratio < CLEAN_RATIO:
+            return f"干净（硬切于 17k，倍数 {ratio:.2f}x；百分位/锐度为结构基线，豁免）"
+        if ratio < BAD_RATIO:
+            return f"可疑（看图确认；硬切 {ratio:.2f}x）"
+        return f"明显可见（硬切 {ratio:.2f}x）"
     if step < STEP_FLOOR:
         return f"干净（台阶 {step:.2f} 级 < {STEP_FLOOR}）"
     if ratio >= BAD_RATIO or pct >= BAD_PCT:
@@ -206,12 +215,14 @@ def main():
     ap.add_argument("--auto", action="store_true", help="自动找最可疑的台阶")
     ap.add_argument("--window", type=int, default=12, help="A/B 时自由区半径（帧）")
     ap.add_argument("--sheet", action="store_true", help="出看图素材（全帧/中心放大/差分）")
+    ap.add_argument("--hard-cut", default="", help="这些缝是 hunt 接受的硬切（残差小）：豁免 17k 结构基线（百分位/锐度）")
     ap.add_argument("--outdir", default=r"D:\comfyui\_hardcut_work\seam_sheets",
                     help="看图素材输出目录（默认 _hardcut_work\\seam_sheets）")
     args = ap.parse_args()
 
     paths = args.video
     seams = [int(s) for s in args.seams.split(",") if s.strip()]
+    hard_cuts = {int(s) for s in args.hard_cut.split(",") if s.strip()}
 
     print("=" * 78)
     print(f"接缝测量  |  局部倍数门槛 {CLEAN_RATIO}  |  全片百分位门槛 {CLEAN_PCT}%")
@@ -254,7 +265,7 @@ def main():
             grid = " [17k]" if is_grid_frame(s) else ""
             print(f"{s:>6} {step:>8.2f} {med:>9.2f} {ratio:>7.2f} {pct:>7.0f}% "
                   f"{pre:>8.1f} {post:>8.1f} {dsharp:>8.1f}%  "
-                  f"{verdict(ratio, pct, step)}{grid}")
+                  f"{verdict(ratio, pct, step, hard_cut=(s in hard_cuts))}{grid}")
         results[p] = rows
 
         if args.sheet:
