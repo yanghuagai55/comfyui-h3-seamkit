@@ -13,9 +13,13 @@
 
 它检查什么
 ----------
-KJNodes 的 `MiniMaxH3MemoryEfficientSageAttentionPatch` 会把
-`diffusion_model.blocks[*].attn.forward` 换成 `minimax_sageattn_forward`。
-没换 = 峰值显存压不住 = 一采起步就 CUDA out of memory。
+KJNodes 的 `MiniMaxH3MemoryEfficientSageAttentionPatch` 用
+`add_object_patch("diffusion_model.blocks.N.attn.forward", minimax_sageattn_forward)`
+把每个 block 的注意力前向**在采样时**动态替换成 `minimax_sageattn_forward`
+（挂在 ModelPatcher.object_patches，不动属性本身 —— 所以检测必须先查
+object_patches，只看 `blocks[0].attn.forward.__name__` 会永远读到原版
+'forward'，2026-09-24 实测误报过一次）。
+没打上 = 峰值显存压不住 = 一采起步就 CUDA out of memory。
 
 这个补丁**不依赖 `--use-sage-attention`**（那边只看 sageattention 模块能否 import），
 但名字里带 "Sage"，换配置时极易被误当"配套"旁路掉，而且**失效时完全静默**：
@@ -30,15 +34,41 @@ from comfy_api.latest import io
 
 
 def _attn_forward_name(model) -> str:
+    """检测注意力实现名。
+
+    ★ 两级检测（2026-09-24 修正误报）：
+    KJNodes 的补丁是 `model_clone.add_object_patch(
+    "diffusion_model.blocks.N.attn.forward", minimax_sageattn_forward)` ——
+    挂在 ModelPatcher.object_patches 字典里、**采样时**由 accessor 动态生效，
+    从不直接替换 `blocks[0].attn.forward` 属性。只看属性会永远读到原版
+    'forward'（当日实测：补丁节点正常执行、一采没 OOM，护栏却报
+    "注意力实现 = 'forward'"）。所以先查 object_patches，再兜底看直接替换。
+    """
+    # ---- 1) KJNodes 路径：object_patches 里的 "…attn.forward" 键 ----
+    patched_note = ""
+    try:
+        patches = dict(getattr(model, "object_patches", None) or {})
+    except Exception:
+        patches = {}
+    for key, fn in patches.items():
+        k = str(key)
+        if ".attn.forward" not in k:
+            continue
+        name = getattr(fn, "__name__", "") or ""
+        if not patched_note:
+            patched_note = f"patched({k.split('diffusion_model.')[-1]})={name!r}"
+        if "sageattn" in name:
+            return name
+    # ---- 2) 直接替换式补丁：看真实属性 ----
     try:
         dm = model.get_model_object("diffusion_model")
         blocks = getattr(dm, "blocks", None)
         if not blocks:
-            return ""
+            return patched_note
         fwd = getattr(getattr(blocks[0], "attn", None), "forward", None)
-        return getattr(fwd, "__name__", "") or ""
+        return getattr(fwd, "__name__", "") or patched_note
     except Exception:
-        return ""
+        return patched_note
 
 
 class MiniMaxH3VRamGuard(io.ComfyNode):
@@ -83,11 +113,23 @@ class MiniMaxH3VRamGuard(io.ComfyNode):
         )
         print(msg, flush=True)
         if require_sage_patch and name:
+            try:
+                from comfy.cli_args import args as _cli
+                _flag = bool(getattr(_cli, "use_sage_attention", False))
+            except Exception:
+                _flag = None
+            _flag_note = (
+                "（启动旗标 --use-sage-attention 已开，但**旗标≠补丁**："
+                "本机两次 OOM 都是旗标开、补丁没执行的组合 —— 压住峰值显存的是 MemEff 补丁）"
+                if _flag
+                else "（启动旗标 --use-sage-attention 未开）"
+            ) if _flag is not None else ""
             print(
                 "[SeamKit] ⚠⚠ 未检测到 KJNodes 的 MiniMax H3 显存优化注意力补丁\n"
                 "          8GB 卡上少了它 -> 峰值显存压不住 -> 一采起步就 CUDA out of memory\n"
                 "          （本机已因此失败两次，失败点一模一样：cast_to_gathered -> copy_from -> OOM）\n"
-                "          请确认工作流里的 `MiniMax H3 Mem Eff Sage Attention Patch` 节点：\n"
+                + (_flag_note + "\n" if _flag_note else "")
+                + "          请确认工作流里的 `MiniMax H3 Mem Eff Sage Attention Patch` 节点：\n"
                 "            1) 在图上  2) mode = 0（没被 mute/bypass）  3) 输出接进 model 链\n"
                 "          它不依赖 --use-sage-attention —— 关了旗标也要留着它。",
                 flush=True,
