@@ -21,9 +21,6 @@ import json
 import torch
 import comfy.model_management
 
-# 一采缓存（冻结二采输入做 A/B）：复用与节点同一份实现，避免行为漂移
-from .nodes_latent_cache import fingerprint_of, save_av_latent
-
 import comfy.nested_tensor
 
 from comfy_api.latest import io
@@ -1113,9 +1110,6 @@ def execute(
     seam_window_tokens: int = 10,
     seam_lock_tokens: int = 3,
     anchor_tokens: int = 1,
-    av_latent_cache: bool = False,
-    av_latent_cache_key: str = "",
-    hidden=None,
 ):
     core = _core()
     learned = _learned()
@@ -1129,47 +1123,10 @@ def execute(
     samples = latent.get("samples") if isinstance(latent, dict) else None
     if not getattr(samples, "is_nested", False) or len(samples.tensors) != 2:
         raise ValueError("expected a nested MiniMax H3 AV latent")
-    # ★ 一采缓存：先保存，再进行二采。
-    # 本节点本来就在一采下游，手上就有那份 latent —— 所以不用加节点、不用改接线。
-    if av_latent_cache:
-        _key = (av_latent_cache_key or "").strip()
-        if not _key:
-            print("[SeamKit] av_latent_cache 开着但 key 为空 —— 跳过缓存", flush=True)
-        else:
-            _fp, _summary = fingerprint_of(
-                getattr(hidden, "prompt", None), getattr(hidden, "unique_id", None)
-            )
-            print(
-                save_av_latent(samples, _key, False, _fp, _summary, tag="二采执行器"),
-                flush=True,
-            )
-
-    # ★ 显存护栏：8GB 卡上跑 MiniMax H3 必须挂着 KJNodes 的显存优化注意力补丁
-    #   （`MiniMaxH3MemoryEfficientSageAttentionPatch`，它会把 blocks.*.attn.forward
-    #   换成 minimax_sageattn_forward）。
-    #   实测它没执行时峰值显存压不住 -> **一采起步就 CUDA out of memory**，本机已因此失败两次
-    #   （2026-09-23 22:43、2026-09-24 20:18，失败点逐字相同）。
-    #   它**不依赖** --use-sage-attention，名字里又带 "Sage"，极易被误当"配套"旁路掉 ——
-    #   所以在运行时显式检测并提醒，别再靠人记。
-    try:
-        _dm = model.get_model_object("diffusion_model") if hasattr(model, "get_model_object") else None
-        _blocks = getattr(_dm, "blocks", None)
-        if _blocks:
-            _name = getattr(getattr(_blocks[0], "attn", None), "forward", None)
-            _name = getattr(_name, "__name__", "") or ""
-            if "sageattn" not in _name:
-                print(
-                    "[SeamKit] ⚠⚠ 警告：未检测到 KJNodes 的 MiniMax H3 显存优化注意力补丁"
-                    f"（blocks[0].attn.forward = {_name!r}）\n"
-                    "          8GB 卡上少了它 -> 峰值显存压不住 -> 一采起步就 CUDA out of memory"
-                    "（本机已因此失败两次，失败点一模一样）。\n"
-                    "          请确认工作流里的 `MiniMax H3 Mem Eff Sage Attention Patch` 节点：\n"
-                    "            1) 在图上；2) mode = 0（没被 mute/bypass）；3) 输出接进 model 链。\n"
-                    "          它**不依赖** --use-sage-attention —— 关了旗标也要留着它。",
-                    flush=True,
-                )
-    except Exception:
-        pass
+    # 注：一采缓存与显存护栏**不放在这里**。
+    #   本机 OOM 发生在 execution.py:306 process_inputs（搬权重阶段），采样没开始 -> 本节点那时还没执行，
+    #   写在这里等于死代码。现分别由 `MiniMaxH3AVLatentSave`（放在一采之后、二采之前）与
+    #   `MiniMaxH3VRamGuard`（放在加载完大模型之后）承担。
 
     video, audio = samples.tensors
     if (
@@ -1759,33 +1716,11 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "需 overlap > 0 才生效（无 overlap 无锚可锚）。"
                     ),
                 ),
-                io.Boolean.Input(
-                    "av_latent_cache",
-                    default=False,
-                    tooltip=(
-                        "【一采缓存】开：采样**之前**先把输入的一采 AV latent 落盘，然后照常跑二采。"
-                        "不用加节点、不用改接线 —— 本节点本来就在一采下游，手上就有那份 latent。\n"
-                        "存下来的 latent 供 `AV Latent Cache (Load)` 读回，用于跳过一采做干净的 A/B。\n"
-                        "指纹来自本节点的上游子图（提示词/种子/参考图/底模/LoRA/采样器）；"
-                        "指纹一致就跳过写入，不一致则自动覆盖并打印差异。约 4~17 MB，写失败不影响生成。"
-                    ),
-                ),
-                io.String.Input(
-                    "av_latent_cache_key",
-                    default="run1",
-                    tooltip=(
-                        "缓存标识，建议写清来源，例如 `seed786_s5_t2.8_camContrast`。换 key = 换缓存。\n"
-                        "文件落在 <输出目录>/seamkit_latent_cache/；同一 key 重复跑 = 复用同一份 latent。\n"
-                        "（开了 av_latent_cache 但这个留空 -> 打印一行提示并跳过缓存，不报错。）"
-                    ),
-                ),
             ],
-            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
             outputs=[io.Latent.Output("latent"), io.String.Output("report")],
         )
 
     @classmethod
     def execute(cls, **kwargs):
-        # 把运行时注入的隐藏输入（图 / 本节点 id）传给模块级 execute，用于算一采缓存的指纹
-        output, report = execute(hidden=getattr(cls, "hidden", None), **kwargs)
+        output, report = execute(**kwargs)
         return io.NodeOutput(output, report)

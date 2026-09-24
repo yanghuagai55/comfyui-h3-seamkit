@@ -506,19 +506,36 @@ report 关键字段：`measured_turn_frame`（测得的转镜帧）/ `boundary_f
 **所以唯一干净的 A/B 是「冻结一采」**：把它落盘、让二采读盘。二采输入因此逐位相同，
 而生成速度一点不损失 —— 一采 latent 只有 **约 4 MB（26 token）/ 17 MB（107 token）**。
 
-**首选做法 —— 不用加节点**：二采执行器 `MiniMaxH3HardCutUpscale`（#40）上有开关
-**`av_latent_cache`** + **`av_latent_cache_key`**。打开后它会**在采样之前**先把一采存下来，
-然后照常跑二采 —— 因为它本来就在一采下游，latent 就在手上，所以**不用加节点、不用改接线**。
+### 存档：`MiniMaxH3AVLatentSave`（直通节点，串在「一采 → 二采」之间）
 
 ```
-① 存档（开关在二采节点上）  av_latent_cache = true, av_latent_cache_key = seed786_s5_cam
-② 跳过一采做 A/B           把 #40 的 latent 输入改接 `AV Latent Cache (Load)`
-                           —— 必须换接线：ComfyUI 会先算完所有输入才调用下游
+一采输出 ──▶ AV Latent Cache (Save) ──▶ 二采执行器
+                 （key = seed786_s5_cam）
 ```
 
-> 也有独立的 `AV Latent Cache (Save)` 直通节点（串在「一采 → 二采」之间），用于需要单独
-> 存一份的场景。**两条路径共用同一份实现**，行为完全一致。
-> `av_latent_cache` 为 true 但 key 留空时，只打印一行提示并跳过缓存，不报错。
+**为什么是独立节点、不是二采执行器上的开关**：本机 OOM 发生在 `execution.py:306 process_inputs`
+（**搬权重的阶段**，采样还没开始）—— 写在二采执行器里等于死代码，那时它还没执行。
+独立节点放在一采之后、二采之前，就算二采中途挂了，一采也已经存好了 ✓
+
+### 跳过一采：`MiniMaxH3AVLatentLoad`
+
+把二采执行器的 `latent` 输入从「一采输出」**改接**这个节点。必须换接线 —— ComfyUI 会先算完
+所有输入才调用下游，光有缓存不会让一采停跑。
+
+### ★ 显存护栏：`MiniMaxH3VRamGuard`（插在**加载完大模型之后**）
+
+同样因为 OOM 发生在搬权重阶段，检测必须放在**拿到 model、还没开始重活**的地方：
+
+```
+LoRA 加载 ──▶ VRAM Guard ──▶ 各采样器
+```
+
+它检查 KJNodes 的 `MiniMax H3 Mem Eff Sage Attention Patch` 是否在位
+（看 `blocks[0].attn.forward` 是不是 `minimax_sageattn_forward`）；
+不在就打醒目警告。**只警告不阻断。**
+
+> 那个补丁**不依赖 `--use-sage-attention`**，但名字带 "Sage"，换配置时极易被误当"配套"旁路掉，
+> 而且失效时**完全静默**（既不报错也没日志）—— 本机两次 OOM 都是这么来的。
 
 ### 指纹：不需要你记得改 key
 
