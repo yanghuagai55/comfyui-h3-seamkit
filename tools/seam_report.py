@@ -62,10 +62,11 @@ BAD_PCT = 99.0
 #   ⚠️ 但下限不是免检：00070 缝 85 就是"数字干净、眼睛看到一条线"，目视终审不能省。
 STEP_FLOOR = 2.0
 
-# ★ 17k「独占帧」是结构性尖峰（同上报告 §5）：17 帧 token 组的首帧比邻居少一次
-#   时间维平均 -> 天生更锐(+27~35%)且更暗(-0.5~0.8 级)。硬切边界只能落在 17k 上，
-#   所以任何硬切缝都必然带这个基线。判读时必须先扣掉：邻域中位数里排除 17k，
-#   --auto 也不再把 17k 当作候选缝。
+# ★ 17k「独占帧」是结构性尖峰（同上报告 §5/§11.5）：17 帧 token 组的首帧比邻居少一次
+#   时间维平均 -> 天生更锐且更暗。幅度随片中位置衰减：片头 +34~35%、中后段 +9~33%，
+#   全片中位 ≈ +18%（00078 全 362 帧实测：17k 帧锐度/邻居中位 = 1.185x）；
+#   亮度差 21 格中 20 格为负。硬切边界只能落在 17k 上，所以任何硬切缝都必然带这个基线。
+#   判读时必须先扣掉：邻域中位数里排除 17k，--auto 也不再把 17k 当作候选缝。
 def is_grid_frame(f, grid=17):
     """f 是 17 的整数倍帧（窗口边界只能落在这里）"""
     return f % grid == 0
@@ -112,8 +113,13 @@ def evaluate(lum, d1, lap, seam):
     step = float(d1[i])
     ratio = step / med if med > 1e-6 else 99.0
     pct = float((d1 < step).mean() * 100)
-    pre = float(lap[max(0, i - 6):i + 1].mean())
-    post = float(lap[i + 1:min(len(lap), i + 8)].mean())
+    # ★ 锐度窗口也排除 17k 帧（§11.4）：post 窗 [seam, seam+7) 必含缝帧自己——
+    #   缝帧=独占帧=结构性锐度尖峰（+10~35%），不过滤则 dsharp 被系统性抬高。
+    #   pre 窗 [seam-7, seam) 按 17 网格落在 ≡10..16，本就含不到 17k，过滤只是防御。
+    pre_i = [k for k in range(max(0, i - 6), i + 1) if not is_grid_frame(k)]
+    post_i = [k for k in range(i + 1, min(len(lap), i + 8)) if not is_grid_frame(k)]
+    pre = float(lap[pre_i].mean()) if pre_i else 0.0
+    post = float(lap[post_i].mean()) if post_i else 0.0
     dsharp = (post - pre) / pre * 100 if pre > 1e-6 else 0.0
     return step, med, ratio, pct, pre, post, dsharp
 
@@ -155,6 +161,35 @@ def auto_suspects(d1, k=5):
         cand.append((float(d1[i] / med), f, float(d1[i])))
     cand.sort(reverse=True)
     return cand[:k]
+
+
+def seg_percentile(d1, seam, segments):
+    """同段百分位（§10.7/§11.7）：缝台阶 vs 缝两侧相邻段内部的 d1 分布。
+
+    全片百分位在两个方向都失效（两份复核报告实测）：
+    - 全程剧烈片：真缝被抬到 96%（00078/51 假阳性）
+    - 剧烈+静止混合片：真台阶被稀释到 65%（00076/68）
+    取缝两侧相邻段的台阶（不含缝自己那一步 d1[seam-1]、不含进 17k 帧的台阶），
+    首/末缝自然只用单侧。样本 <8 时返回 None（段太短没有统计意义）。
+    """
+    bs = sorted({int(b) for b in segments})
+    prev = 0
+    for b in bs:
+        if b >= seam:
+            break
+        prev = b
+    nxt = len(d1) + 1
+    for b in bs:
+        if b > seam:
+            nxt = b
+            break
+    idx = list(range(prev, max(prev, seam - 1))) + \
+        list(range(seam, min(nxt - 1, len(d1))))
+    idx = [k for k in idx if k != seam - 1 and not is_grid_frame(k + 1)]
+    if len(idx) < 8:
+        return None
+    vals = d1[idx]
+    return float((vals < d1[seam - 1]).mean() * 100)
 
 
 def _strip(F, lo, hi, scale, crop=None, label=None):
@@ -216,6 +251,9 @@ def main():
     ap.add_argument("--window", type=int, default=12, help="A/B 时自由区半径（帧）")
     ap.add_argument("--sheet", action="store_true", help="出看图素材（全帧/中心放大/差分）")
     ap.add_argument("--hard-cut", default="", help="这些缝是 hunt 接受的硬切（残差小）：豁免 17k 结构基线（百分位/锐度）")
+    ap.add_argument("--segments", default="",
+                    help="边界帧号逗号分隔（如 51,187,272）；给了就多算一列「同段百分位」——"
+                         "全片百分位在剧烈/混合片两个方向都失效（§10.6/§11.6）")
     ap.add_argument("--outdir", default=r"D:\comfyui\_hardcut_work\seam_sheets",
                     help="看图素材输出目录（默认 _hardcut_work\\seam_sheets）")
     args = ap.parse_args()
@@ -223,9 +261,13 @@ def main():
     paths = args.video
     seams = [int(s) for s in args.seams.split(",") if s.strip()]
     hard_cuts = {int(s) for s in args.hard_cut.split(",") if s.strip()}
+    segments = [int(s) for s in args.segments.split(",") if s.strip()]
 
     print("=" * 78)
     print(f"接缝测量  |  局部倍数门槛 {CLEAN_RATIO}  |  全片百分位门槛 {CLEAN_PCT}%")
+    if segments:
+        print(f"同段百分位已启用（边界 {segments}）——信息列：整体位移型变化"
+              f"（目视不可见）在同段里也会很高，判读仍以倍数+台阶+看图为准")
     print("=" * 78)
 
     data = []
@@ -249,7 +291,8 @@ def main():
         return 0
 
     print()
-    hdr = f"{'缝':>6} {'台阶':>8} {'局部中位':>9} {'倍数':>7} {'百分位':>8} {'锐度前':>8} {'锐度后':>8} {'锐度变化':>9}  判定"
+    hdr = (f"{'缝':>6} {'台阶':>8} {'局部中位':>9} {'倍数':>7} {'百分位':>8} "
+           f"{'段百分位':>8} {'锐度前':>8} {'锐度后':>8} {'锐度变化':>9}  判定")
     print(hdr)
     print("-" * len(hdr))
 
@@ -261,9 +304,12 @@ def main():
             if e is None:
                 continue
             step, med, ratio, pct, pre, post, dsharp = e
+            pct_seg = seg_percentile(d1, s, segments) if segments else None
             rows.append((s, ratio, pct))
             grid = " [17k]" if is_grid_frame(s) else ""
+            seg_txt = f"{pct_seg:7.0f}%" if pct_seg is not None else "      — "
             print(f"{s:>6} {step:>8.2f} {med:>9.2f} {ratio:>7.2f} {pct:>7.0f}% "
+                  f"{seg_txt} "
                   f"{pre:>8.1f} {post:>8.1f} {dsharp:>8.1f}%  "
                   f"{verdict(ratio, pct, step, hard_cut=(s in hard_cuts))}{grid}")
         results[p] = rows

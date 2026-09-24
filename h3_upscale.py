@@ -1093,6 +1093,64 @@ def release_text_encoders() -> list:
     return freed
 
 
+# ---- seam re-denoise auto gate（策略树 §4.1 B1 前置门 v1，TOKEN_RESEARCH.md）----
+# 证据链：
+#   * E-3(00068)：静缝重去噪有效（187 台阶 5.30x -> 1.72x）；闹处/细节密处
+#     （85/272）重去噪**注入伪纹理**。
+#   * 00078：静止锁定窗的锚定 overlap 本来就不可见（187/272 零重影）；
+#     运动窗的锚定 overlap 磨糊（00076/68 背景 -32%）—— 但 E-3 说闹处恰是
+#     重去噪会注入的地方。
+#   * ⇒ v1 门控：跳过"已证实危险"的闹缝，其余放行。静缝是否也该省掉
+#     （00078 显示纯 overlap 已干净）交给标定跑片决定，不拍脑袋。
+# 度量：缝邻域的 latent 变化分 —— 与 calm 搜索排序同口径（每 token 取
+# max(global, jerk)），除以全片中位 -> busy 度。这是 §4.1 像素域 B1
+# （锚间高频一致性）的 latent 域替身，零额外计算；标定后若相关性差再升级。
+REDENOISE_BUSY_SKIP_RATIO = 1.5
+
+
+def gate_seam_redenoise(profile, seam_marks,
+                        busy_skip_ratio: float = REDENOISE_BUSY_SKIP_RATIO,
+                        span: int = 2):
+    """对每个 overlap 缝算锚定窗 busy 度，闹缝跳过重去噪。
+
+    `seam_marks` 是累积时间轴的 token 位；`profile` 行 = (idx, local, glob,
+    jerk[, pers])，score = max(glob, jerk)（与 find_calm_boundaries 同口径）。
+
+    返回 (eligible_tokens, info)，info 每缝一条 {"token", "busy_ratio",
+    "gated"}。**profile 为空 -> 全部放行**：测量不到时不静默改变语义
+    （静默少干活=条件写入式陷阱），由调用方打日志提醒。
+    """
+    marks = [int(t) for t in seam_marks or []]
+    if not marks:
+        return [], []
+    score = {}
+    for row in profile or ():
+        try:
+            idx, glob = int(row[0]), float(row[2])
+            jerk = float(row[3]) if len(row) > 3 else glob
+        except (TypeError, IndexError, ValueError):
+            continue
+        score[idx] = max(glob, jerk)
+    if not score:
+        return list(marks), [
+            {"token": t, "busy_ratio": None, "gated": False, "why": "no score"}
+            for t in marks
+        ]
+    vals = sorted(score.values())
+    n = len(vals)
+    med = vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+    eligible, info = [], []
+    for t in marks:
+        nb = [score[i] for i in range(t - span, t + span + 1) if i in score]
+        nb_mean = sum(nb) / len(nb) if nb else 0.0
+        ratio = (nb_mean / med) if med > 1e-9 else 0.0
+        gated = bool(ratio >= busy_skip_ratio)
+        info.append({"token": t, "busy_ratio": round(ratio, 3), "gated": gated})
+        if not gated:
+            eligible.append(t)
+    return eligible, info
+
+
 def execute(
     model,
     conditioning,
@@ -1107,6 +1165,7 @@ def execute(
     show_memory_log: bool = True,
     seam_redenoise: bool = False,
     seam_redenoise_frames: str = "",
+    seam_redenoise_gate: str = "off",
     seam_window_tokens: int = 10,
     seam_lock_tokens: int = 3,
     anchor_tokens: int = 1,
@@ -1155,6 +1214,7 @@ def execute(
     tolerance = max(0, int((plan.get("hardcut") or {}).get("seam_tolerance", 17)))
     segment_frames = planned or None
     seam_hunt = None
+    profile = None  # 门控在 hunt 关着时也要能问；None -> gate 全放行并打日志
     if auto_seam_hunt:
         # Threshold-based detection died on busy footage: a fight moves every
         # token, so the real shot change never clears a fixed ratio while a
@@ -1562,40 +1622,73 @@ def execute(
         )
 
     seam_redenoise_entries = None
+    redenoise_gate_info = None
     if seam_redenoise and seam_marks:
-        only_frames = None
-        raw = (seam_redenoise_frames or "").strip()
-        if raw:
-            only_frames = []
-            for part in raw.replace(";", ",").split(","):
-                part = part.strip()
-                if part:
-                    only_frames.append(int(part))
-        print(
-            f"[HardCut] seam re-denoise: {len(seam_marks)} seam(s) at tokens "
-            f"{seam_marks}, window {seam_window_tokens} tok, lock {seam_lock_tokens} tok"
-            + (f", selected frames {only_frames}" if only_frames else ""),
-            flush=True,
-        )
-        accumulated, seam_redenoise_entries = _redenoise_seam_windows(
-            core,
-            sampling,
-            accumulated,
-            audio,
-            conditioning,
-            model,
-            noise,
-            sampler,
-            sigmas,
-            negative,
-            cfg,
-            seam_marks,
-            int(seam_window_tokens),
-            int(seam_lock_tokens),
-            only_frames,
-            global_video_noise,
-            global_audio_noise,
-        )
+        if seam_redenoise_gate == "auto":
+            # 策略树 B1 前置门 v1：闹缝跳过（E-3 实测闹处重去噪注入伪纹理）
+            eligible, redenoise_gate_info = gate_seam_redenoise(profile, seam_marks)
+            _kept = [t for t in seam_marks if t in set(eligible)]
+            _skip = [t for t in seam_marks if t not in set(eligible)]
+            print(
+                f"[HardCut] seam re-denoise AUTO gate "
+                f"(busy >= median x {REDENOISE_BUSY_SKIP_RATIO:g} -> skip): "
+                f"redenoise {_kept} / skip {_skip}",
+                flush=True,
+            )
+            for g in redenoise_gate_info:
+                print(
+                    f"[HardCut]   seam tok {g['token']}: busy {g['busy_ratio']} -> "
+                    + ("SKIP（闹处重去噪会注入伪纹理，E-3 实测）" if g["gated"]
+                       else "redenoise"),
+                    flush=True,
+                )
+            if not profile:
+                print(
+                    "[HardCut]   ⚠ 无 latent profile（auto_seam_hunt 关着？）"
+                    "-> busy 度测不了，全部放行（保持旧语义，不静默少干活）",
+                    flush=True,
+                )
+            if (seam_redenoise_frames or "").strip():
+                print("[HardCut]   note: auto 门控下 seam_redenoise_frames 被忽略",
+                      flush=True)
+            seam_marks = _kept
+        else:
+            only_frames = None
+            raw = (seam_redenoise_frames or "").strip()
+            if raw:
+                only_frames = []
+                for part in raw.replace(";", ",").split(","):
+                    part = part.strip()
+                    if part:
+                        only_frames.append(int(part))
+        if seam_marks:
+            print(
+                f"[HardCut] seam re-denoise: {len(seam_marks)} seam(s) at tokens "
+                f"{seam_marks}, window {seam_window_tokens} tok, lock {seam_lock_tokens} tok",
+                flush=True,
+            )
+            accumulated, seam_redenoise_entries = _redenoise_seam_windows(
+                core,
+                sampling,
+                accumulated,
+                audio,
+                conditioning,
+                model,
+                noise,
+                sampler,
+                sigmas,
+                negative,
+                cfg,
+                seam_marks,
+                int(seam_window_tokens),
+                int(seam_lock_tokens),
+                None,
+                global_video_noise,
+                global_audio_noise,
+            )
+        else:
+            print("[HardCut] seam re-denoise: 门控后没有剩余缝，跳过重去噪",
+                  flush=True)
     elif seam_redenoise:
         print("[HardCut] seam re-denoise requested but no interior seams recorded", flush=True)
 
@@ -1614,6 +1707,12 @@ def execute(
         report["seam_hunt"] = seam_hunt
     if seam_redenoise_entries is not None:
         report["seam_redenoise"] = seam_redenoise_entries
+    if redenoise_gate_info is not None:
+        report["seam_redenoise_gate"] = {
+            "mode": "auto",
+            "busy_skip_ratio": REDENOISE_BUSY_SKIP_RATIO,
+            "seams": redenoise_gate_info,
+        }
     return output, json.dumps(report)
 
 
@@ -1714,6 +1813,22 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "2/5 = 把锚扩到前块输出的前 2/5 个 token（≈7/17 帧）。"
                         "keyframe 格式原生支持多 token，仅切片宽度不同。"
                         "需 overlap > 0 才生效（无 overlap 无锚可锚）。"
+                    ),
+                ),
+                io.Combo.Input(
+                    "seam_redenoise_gate",
+                    options=["off", "auto"],
+                    default="off",
+                    tooltip=(
+                        "每缝门控（策略树 §4.1 B1 前置门 v1，见 docs/TOKEN_RESEARCH.md）。\n"
+                        "off = 手动模式（现状）：seam_redenoise 开 = 全部 overlap 缝重去噪，"
+                        "可用 seam_redenoise_frames 挑缝。\n"
+                        "auto = 按锚定窗 busy 度自动挑缝：缝邻域 latent 变化分"
+                        "（与 calm 搜索同口径 max(global, jerk)，±2 token ≈ ±7 帧）"
+                        "≥ 全片中位 × 1.5 的缝跳过 —— E-3 实测闹处重去噪会注入伪纹理；"
+                        "其余缝重去噪（静处有效：E-3 缝 187 台阶 5.30x→1.72x）。\n"
+                        "需 auto_seam_hunt 开着才有测量；关着退化为全部放行并打日志。\n"
+                        "报告 seam_redenoise_gate.seams 有每缝 busy 度，供标定阈值用。"
                     ),
                 ),
             ],

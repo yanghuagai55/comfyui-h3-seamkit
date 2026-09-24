@@ -61,10 +61,11 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
             description=(
                 "官方 `SamplerCustomAdvanced` 的薄壳 + 一采缓存 + 显存护栏。\n"
                 "输入输出签名与官方完全一致，可**直接替换**一采的 SamplerCustomAdvanced。\n\n"
-                "use_cache 开：同 key 且上游指纹一致 -> **直接读缓存、跳过采样**（省一次一采，"
-                "二采输入逐位相同，A/B 才干净）；指纹不一致 -> 照常采样并覆盖缓存。\n"
-                "use_cache 关：照常采样并保存缓存。\n\n"
-                "另外会在采样前检查显存优化注意力补丁是否在位 —— 本机两次 OOM 都是因为它没跑。"
+                "use_cache 是**总开关**：\n"
+                "  开：同 key 且上游指纹一致 -> **直接读缓存、跳过采样**（省一次一采，"
+                "二采输入逐位相同，A/B 才干净）；没命中 -> 照常采样并保存缓存。\n"
+                "  关：**纯采样器** —— 不算指纹、不读不写缓存，行为与官方 "
+                "SamplerCustomAdvanced 一致（仅保留显存护栏打印，纯诊断不影响数值）。"
             ),
             category="MiniMax H3 Hard Cut",
             is_experimental=True,
@@ -77,7 +78,11 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 io.Boolean.Input(
                     "use_cache",
                     default=False,
-                    tooltip="开：命中缓存就跳过采样（读回冻结的一采）。关：照常采样并保存。",
+                    tooltip=(
+                        "总开关。开：命中缓存就跳过采样（读回冻结的一采），"
+                        "没命中就采样并写缓存。\n"
+                        "关：纯采样 —— 不算指纹、不读不写缓存（= 官方采样器行为）。"
+                    ),
                 ),
                 io.String.Input(
                     "cache_key",
@@ -112,12 +117,16 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
     ):
         import torch
 
-        # ── 0. 指纹：从本节点所有链接输入反向走上游子图（= 一采的完整身份）────────
-        _hidden = getattr(cls, "hidden", None)
-        fp, summary = fingerprint_from_node_inputs(
-            getattr(_hidden, "prompt", None), getattr(_hidden, "unique_id", None)
-        )
-        key = (cache_key or "").strip() or "run1"
+        # ── 0. 总开关：use_cache=False = 纯采样器 ─────────────────────────
+        #    不算指纹（指纹要走完整上游子图 + sha256）、不读不写缓存。
+        fp = summary = None
+        key = ""
+        if use_cache:
+            _hidden = getattr(cls, "hidden", None)
+            fp, summary = fingerprint_from_node_inputs(
+                getattr(_hidden, "prompt", None), getattr(_hidden, "unique_id", None)
+            )
+            key = (cache_key or "").strip() or "run1"
 
         # ── 1. 显存护栏：必须在 guider.sample 之前打，赶得上权重搬运阶段的 OOM ──
         name = _attn_forward_name(guider.model_patcher)
