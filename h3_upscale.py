@@ -1144,6 +1144,33 @@ def execute(
                 flush=True,
             )
 
+    # ★ 显存护栏：8GB 卡上跑 MiniMax H3 必须挂着 KJNodes 的显存优化注意力补丁
+    #   （`MiniMaxH3MemoryEfficientSageAttentionPatch`，它会把 blocks.*.attn.forward
+    #   换成 minimax_sageattn_forward）。
+    #   实测它没执行时峰值显存压不住 -> **一采起步就 CUDA out of memory**，本机已因此失败两次
+    #   （2026-09-23 22:43、2026-09-24 20:18，失败点逐字相同）。
+    #   它**不依赖** --use-sage-attention，名字里又带 "Sage"，极易被误当"配套"旁路掉 ——
+    #   所以在运行时显式检测并提醒，别再靠人记。
+    try:
+        _dm = model.get_model_object("diffusion_model") if hasattr(model, "get_model_object") else None
+        _blocks = getattr(_dm, "blocks", None)
+        if _blocks:
+            _name = getattr(getattr(_blocks[0], "attn", None), "forward", None)
+            _name = getattr(_name, "__name__", "") or ""
+            if "sageattn" not in _name:
+                print(
+                    "[SeamKit] ⚠⚠ 警告：未检测到 KJNodes 的 MiniMax H3 显存优化注意力补丁"
+                    f"（blocks[0].attn.forward = {_name!r}）\n"
+                    "          8GB 卡上少了它 -> 峰值显存压不住 -> 一采起步就 CUDA out of memory"
+                    "（本机已因此失败两次，失败点一模一样）。\n"
+                    "          请确认工作流里的 `MiniMax H3 Mem Eff Sage Attention Patch` 节点：\n"
+                    "            1) 在图上；2) mode = 0（没被 mute/bypass）；3) 输出接进 model 链。\n"
+                    "          它**不依赖** --use-sage-attention —— 关了旗标也要留着它。",
+                    flush=True,
+                )
+    except Exception:
+        pass
+
     video, audio = samples.tensors
     if (
         video.ndim != 5
