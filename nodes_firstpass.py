@@ -41,6 +41,13 @@ def _cache_hit(key: str, fp: str):
     try:
         samples, meta, name = load_av_latent(key)
     except ValueError:
+        # ★ miss 必须留痕：2026-09-24 跑 B 时 use_cache 没开/没存过，
+        #   全程无日志线索，用户以为"节点没变化"。没命中要说出来。
+        print(
+            f"[SeamKit] 一采缓存 MISS（没有 key={key!r} 的存档），照常采样"
+            "（本次采样结束后会写入缓存，下一次同 key 且上游没变才会 HIT）",
+            flush=True,
+        )
         return None
     old = (meta.get("fingerprint") or "")
     if fp and old and old != fp:
