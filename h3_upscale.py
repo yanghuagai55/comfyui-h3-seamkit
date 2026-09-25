@@ -17,6 +17,7 @@ upstream *executor*, only its learned-upscaler / sampler / conditioning helpers.
 from __future__ import annotations
 
 import json
+import os
 
 import torch
 import comfy.model_management
@@ -511,6 +512,28 @@ def _sample_fullframe(
         prepared_noise=prepared_noise,
     )
     return sampled.tensors[0]
+
+
+def _dump_av_latent(path, video, audio=None, meta=None):
+    """诊断用（dump_latents=true 时）：AV latent 落盘（fp16 contiguous + 元数据）。
+
+    绝不打断采样：任何 dump 失败只打日志。落盘的是 CPU 副本，不占显存。
+    """
+    try:
+        import os
+
+        os.makedirs(str(os.path.dirname(str(path))) or ".", exist_ok=True)
+        payload = {
+            "video": video.detach().to(torch.float16).contiguous().cpu(),
+        }
+        if audio is not None:
+            payload["audio"] = audio.detach().to(torch.float16).contiguous().cpu()
+        if meta:
+            payload["meta"] = meta
+        torch.save(payload, str(path))
+        print(f"[HardCut]   dump -> {path}", flush=True)
+    except Exception as _dump_exc:  # pragma: no cover - 诊断路径绝不打断采样
+        print(f"[HardCut]   dump FAILED ({path}): {_dump_exc}", flush=True)
 
 
 def _redenoise_seam_windows(
@@ -1169,6 +1192,8 @@ def execute(
     seam_window_tokens: int = 10,
     seam_lock_tokens: int = 3,
     anchor_tokens: int = 1,
+    dump_latents: bool = False,
+    dump_dir: str = "",
 ):
     core = _core()
     learned = _learned()
@@ -1553,6 +1578,31 @@ def execute(
             chunk_noise_video,
             chunk_noise_audio,
         )
+        if dump_latents:
+            _w = len(segment_reports)
+            _dump_av_latent(
+                os.path.join(dump_dir, f"upscaled_W{_w}.pt"),
+                chunk_video,
+                chunk_audio,
+                {
+                    "stage": "upscaled_input",
+                    "window": _w,
+                    "tokens": [int(start_token), int(end_token)],
+                    "frames": [int(start_frame), int(end_frame)],
+                },
+            )
+            _sampled_tensors = getattr(sampled, "tensors", None)
+            _dump_av_latent(
+                os.path.join(dump_dir, f"window_W{_w}.pt"),
+                _sampled_tensors[0] if _sampled_tensors is not None else sampled,
+                _sampled_tensors[1] if _sampled_tensors is not None and len(_sampled_tensors) > 1 else None,
+                {
+                    "stage": "sampled_output",
+                    "window": _w,
+                    "tokens": [int(start_token), int(end_token)],
+                    "frames": [int(start_frame), int(end_frame)],
+                },
+            )
         # Blend or freeze?  Both are upstream paths over the SAME overlap frames:
         #   _append_video                  -> linear crossfade across the overlap
         #   _append_video_guarded_overlap  -> keep the published frames verbatim
@@ -1692,6 +1742,22 @@ def execute(
     elif seam_redenoise:
         print("[HardCut] seam re-denoise requested but no interior seams recorded", flush=True)
 
+    if dump_latents:
+        _dump_av_latent(
+            os.path.join(dump_dir, "accumulated.pt"),
+            accumulated,
+            audio,
+            {
+                "stage": "assembled_final",
+                "anchor_tokens": int(anchor_tokens),
+                "frame_grid": int(FRAME_GRID),
+                "segments": [
+                    [int(s), int(sf), int(e), int(ef)]
+                    for s, sf, e, ef in segments
+                ],
+                "note": "seed 见工作流 noise 节点；帧<->token 映射用 core.tokens_for_frames / frames_for_tokens",
+            },
+        )
     output = {"samples": comfy.nested_tensor.NestedTensor((accumulated, audio))}
     report = {
         "schema": "h3.hardcut.upscale.v1",
@@ -1830,6 +1896,22 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "需 auto_seam_hunt 开着才有测量；关着退化为全部放行并打日志。\n"
                         "报告 seam_redenoise_gate.seams 有每缝 busy 度，供标定阈值用。"
                     ),
+                ),
+                io.Boolean.Input(
+                    "dump_latents",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "诊断用：把二采中间 latent 落盘（每窗 upscale 输入 + 每窗采样输出 + "
+                        "最终装配结果，fp16），供离线解码实验台使用（熔化机制判决 V0-V4）。"
+                        "默认关，正常跑零开销、零数值影响。"
+                    ),
+                ),
+                io.String.Input(
+                    "dump_dir",
+                    default="D:\\comfyui\\_hardcut_work\\latent_dump\\",
+                    optional=True,
+                    tooltip="dump_latents 的输出目录（建议带运行标签，如 ...\\latent_dump\\A2_20260925\\）。",
                 ),
             ],
             outputs=[io.Latent.Output("latent"), io.String.Output("report")],
