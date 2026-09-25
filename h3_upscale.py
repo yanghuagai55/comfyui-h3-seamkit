@@ -517,17 +517,19 @@ def _sample_fullframe(
 def _dump_av_latent(path, video, audio=None, meta=None):
     """诊断用（dump_latents=true 时）：AV latent 落盘（fp16 contiguous + 元数据）。
 
-    绝不打断采样：任何 dump 失败只打日志。落盘的是 CPU 副本，不占显存。
+    绝不打断采样：任何 dump 失败只打日志。**CPU 优先**——先 .cpu() 再转 fp16，
+    全程不在 GPU 上分配新显存（aimdo 的内存计划之外绝不碰显存，教训：2026-09-25
+    21:03 进程在 W2 加载时无声死亡，当日 WER 有三个 LiveKernelEvent 141/117）。
     """
     try:
         import os
 
         os.makedirs(str(os.path.dirname(str(path))) or ".", exist_ok=True)
         payload = {
-            "video": video.detach().to(torch.float16).contiguous().cpu(),
+            "video": video.detach().cpu().to(torch.float16).contiguous(),
         }
         if audio is not None:
-            payload["audio"] = audio.detach().to(torch.float16).contiguous().cpu()
+            payload["audio"] = audio.detach().cpu().to(torch.float16).contiguous()
         if meta:
             payload["meta"] = meta
         torch.save(payload, str(path))
