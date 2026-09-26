@@ -1991,18 +1991,6 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     optional=True,
                     tooltip="dump_latents 的输出目录（建议带运行标签，如 ...\\latent_dump\\A2_20260925\\）。",
                 ),
-                io.Boolean.Input(
-                    "seam_blend",
-                    default=False,
-                    optional=True,
-                    tooltip=(
-                        "锚定缝用 latent 域线性交叉淡化（普通 overlap）替代冻结式："
-                        "重叠 17 帧内两窗 latent 线性溶解后再解码。静止/慢速镜头适用"
-                        "（无重影风险，背景跳变摊成柔和过渡）；运动镜头会重影。"
-                        "★ 放在本节点（下游）而在规划节点上——改这里**不会击穿一采缓存**"
-                        "（规划节点在一采上游链里，改它的开关会触发重采样）。"
-                    ),
-                ),
                 io.Int.Input(
                     "upscale_pad_tokens",
                     default=3,
@@ -2015,6 +2003,18 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "分块尾时间感受野单侧 → 尾部 ~8 帧轻度软，二采再加深为锁入口脱焦带。"
                         "此参数让 upscale 输入向两侧各借 N 个一采 token（全片连续无接缝），"
                         "上采样后裁回窗口范围。默认 3（≈10 帧，已验收）；0=旧行为。"
+                    ),
+                ),
+                io.Boolean.Input(
+                    "seam_blend",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "锚定缝用 latent 域线性交叉淡化（普通 overlap）替代冻结式："
+                        "重叠 17 帧内两窗 latent 线性溶解后再解码。静止/慢速镜头适用"
+                        "（无重影风险，背景跳变摊成柔和过渡）；运动镜头会重影。"
+                        "★ 放在本节点（下游）而在规划节点上——改这里**不会击穿一采缓存**"
+                        "（规划节点在一采上游链里，改它的开关会触发重采样）。"
                     ),
                 ),
             ],
