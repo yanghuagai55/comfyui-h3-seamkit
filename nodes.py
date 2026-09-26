@@ -1112,6 +1112,8 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             category="MiniMax H3 Hard Cut",
             is_experimental=True,
             inputs=[
+                io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=0.1,
+                               tooltip="二采 CFG（原在 #40 上，挪来统一管）。"),
                 io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.001,
                                tooltip="锚定强度（接口兼容保留）。"),
                 io.Combo.Input("second_pass_audio_policy", options=list(AUDIO_POLICIES),
@@ -1164,7 +1166,7 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, anchor_strength: float = 0.999,
+    def execute(cls, cfg: float = 1.0, anchor_strength: float = 0.999,
                 second_pass_audio_policy: str = None, seam_tolerance_frames: int = 4,
                 calm_search_window: int = 34, calm_policy: str = "calm_overlap",
                 profile_camera_compensate: bool = False, profile_reduce: str = "mean",
@@ -1179,6 +1181,7 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                 dump_dir: str = "", show_memory_log: bool = True):
         plan = {
             "schema": PASS2_TYPE_STRING,
+            "cfg": float(cfg),
             "anchor_strength": float(anchor_strength),
             "second_pass_audio_policy": str(second_pass_audio_policy or AUDIO_POLICIES[0]),
             "seam_tolerance": int(seam_tolerance_frames),
