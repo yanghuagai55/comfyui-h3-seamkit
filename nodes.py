@@ -470,6 +470,8 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
                 io.String.Input(
                     "cache_key", default="s15_cam",
                     tooltip="一采缓存 key（与指纹共同决定命中）。"),
+                io.String.Input("cache_path", default="",
+                                tooltip="一采缓存目录（留空 = 输出目录下的 seamkit_latent_cache/）。"),
                 io.Boolean.Input(
                     "require_sage_patch", default=True,
                     tooltip="要求显存补丁在位（原在采样器节点上）。"),
@@ -645,6 +647,7 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         use_cache: bool = True,
         cache_key: str = "s15_cam",
         require_sage_patch: bool = True,
+        cache_path: str = "",
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -717,6 +720,11 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         # prompt + plan（没有 loose_prompt 控件），不放进 plan 就会用严格模式，
         # 于是同一个提示词在 #56 是 warning、在 Validate 却是 raise（实测：整图被拦）。
         _hc["loose_prompt"] = bool(loose_prompt)
+        # 一采开关随 plan 下发（#93 只收 plan 口，2026-09-26）
+        _hc["use_cache"] = bool(use_cache)
+        _hc["cache_key"] = str(cache_key or "s15_cam")
+        _hc["require_sage_patch"] = bool(require_sage_patch)
+        _hc["cache_path"] = str(cache_path or "")
         # Canvas megapixels, so #40 can re-check the load guard after the calm
         # search moves a boundary (auto_plan sized the PLANNED windows only).
         _hc["canvas_mp"] = float(canvas_mp)

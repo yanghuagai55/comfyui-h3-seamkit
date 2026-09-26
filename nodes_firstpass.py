@@ -27,6 +27,7 @@ import latent_preview
 import comfy.utils
 from comfy_api.latest import io
 
+from .bridge import PLAN_TYPE_STRING
 from .nodes_latent_cache import (
     _file_stem,
     fingerprint_from_node_inputs,
@@ -35,6 +36,9 @@ from .nodes_latent_cache import (
     zero_audio_part,
 )
 from .nodes_guard import _attn_forward_name
+
+
+PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
 
 
 def _release_upstream_audio(latent_image) -> int:
@@ -107,33 +111,13 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 io.Sampler.Input("sampler"),
                 io.Sigmas.Input("sigmas"),
                 io.Latent.Input("latent_image"),
-                io.Boolean.Input(
-                    "use_cache",
+                PLAN_TYPE.Input(
+                    "plan",
                     optional=True,
                     tooltip=(
-                        "总开关。开：命中缓存就跳过采样（读回冻结的一采），"
-                        "没命中就采样并写缓存。\n"
-                        "关：纯采样 —— 不算指纹、不读不写缓存（= 官方采样器行为）。"
-                    ),
-                ),
-                io.String.Input(
-                    "cache_key",
-                    optional=True,
-                    tooltip="缓存标识。建议带来源，如 `seed342114_s5_cam_v4`。换 key = 换缓存。",
-                ),
-                io.Boolean.Input(
-                    "require_sage_patch",
-                    optional=True,
-                    tooltip="开：没检测到 KJNodes 显存优化补丁就打醒目警告（8GB 卡强烈建议开）。",
-                ),
-                io.String.Input(
-                    "cache_path",
-                    optional=True,
-                    tooltip=(
-                        "缓存目录。留空 = 默认 `<输出目录>/seamkit_latent_cache/`。\n"
-                        "填绝对路径即可指到任意盘（本机例：`D:\\共享\\seamkit_latent_cache`）。\n"
-                        "HIT 从这个目录读、MISS 后往这个目录写；与独立 Load/Save 节点\n"
-                        "共用同一份目录时，三边填一致即可互相复用缓存。"
+                        "上游规划节点的 plan（MiniMaxH3HardCutFirstPassPlan）。交了它，"
+                        "一采开关（use_cache / cache_key / require_sage_patch / cache_path）"
+                        "全部从 plan 里取；不交则用本节点签名里的默认值（纯采样器模式）。"
                     ),
                 ),
             ],
@@ -157,8 +141,18 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
         cache_key: str = "run1",
         require_sage_patch: bool = True,
         cache_path: str = "",
+        plan=None,
     ):
         import torch
+
+        # ── plan 口优先（方案 A，2026-09-26）────────────────────────────
+        # 上游规划节点把一采开关写进 plan.hardcut；交了 plan 就全从它取。
+        if isinstance(plan, dict):
+            _h = plan.get("hardcut") or {}
+            use_cache = bool(_h.get("use_cache", use_cache))
+            cache_key = str(_h.get("cache_key", cache_key) or "run1")
+            require_sage_patch = bool(_h.get("require_sage_patch", require_sage_patch))
+            cache_path = str(_h.get("cache_path", cache_path) or "")
 
         # ── 0. 总开关：use_cache=False = 纯采样器 ─────────────────────────
         #    不算指纹（指纹要走完整上游子图 + sha256）、不读不写缓存。
