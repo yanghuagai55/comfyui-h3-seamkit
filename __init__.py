@@ -34,6 +34,7 @@ from comfy_api.latest import ComfyExtension
 
 from .nodes import (
     MiniMaxH3HardCutAuto,
+    MiniMaxH3HardCutPass2Plan,
     MiniMaxH3HardCutPlan,
     MiniMaxH3HardCutShotPrompt,
     MiniMaxH3HardCutValidate,
@@ -62,6 +63,7 @@ class H3HardCutExtension(ComfyExtension):
         return [
             MiniMaxH3HardCutPlan,
             MiniMaxH3HardCutAuto,
+            MiniMaxH3HardCutPass2Plan,
             MiniMaxH3HardCutValidate,
             MiniMaxH3HardCutShotPrompt,
             MiniMaxH3HardCutUpscale,

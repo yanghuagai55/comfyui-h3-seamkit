@@ -29,6 +29,7 @@ from comfy_api.latest import io
 from .bridge import (
     AUDIO_POLICIES,
     PLAN_TYPE_STRING,
+    PASS2_TYPE_STRING,
     PRECISIONS,
     RELEASE_POLICIES,
     build_hardcut_plan,
@@ -1210,3 +1211,135 @@ class MiniMaxH3HardCutShotPrompt(io.ComfyNode):
         audit.append("model's cut lands on the exact frame the executor splits on.")
 
         return io.NodeOutput(detailed, "\n".join(audit))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 下游二采规划（2026-09-26 拆分）
+# 只影响二采的参数集中到这里，接进 MiniMaxH3HardCutUpscale 的 pass2_plan。
+# 动机：规划节点挂在一采上游链里（其输出改写条件中的提示词时间戳），它身上每个
+# 控件的值都进一采缓存指纹 —— 在它上面动二采参数会击穿缓存、逼一采重采样。
+# 搬到本节点（纯下游）后：随便改，不再触发重采样。
+# ═══════════════════════════════════════════════════════════════════════════
+PASS2_TYPE = io.Custom(PASS2_TYPE_STRING)
+
+
+class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3HardCutPass2Plan",
+            display_name="MiniMax H3 Pass-2 Plan (downstream)",
+            description=(
+                "把所有**只影响二采**的参数集中到这一个节点，`pass2_plan` 输出接到 "
+                "`MiniMaxH3HardCutUpscale` 的 `pass2_plan` 输入；`sigma0` 输出接到 "
+                "BasicScheduler 的 denoise（原先从规划节点接的那个）。\n\n"
+                "为什么拆出来：规划节点在一采上游链里，它身上所有控件值都会进一采缓存指纹；"
+                "二采参数搬到这里后，**随便改都不再触发一采重采样**。"
+            ),
+            category="MiniMax H3 Hard Cut",
+            is_experimental=True,
+            inputs=[
+                io.Float.Input("second_pass_sigma0", default=0.30, min=0.0, max=1.0, step=0.01,
+                               tooltip="二采 denoise (sigma0)。接 BasicScheduler.denoise。"),
+                io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.001,
+                               tooltip="锚定强度（接口兼容保留）。"),
+                io.Combo.Input("second_pass_audio_policy", options=list(AUDIO_POLICIES),
+                               default=AUDIO_POLICIES[0], tooltip="二采音频策略。"),
+                io.Int.Input("seam_tolerance_frames", default=4, min=0, max=8, step=1,
+                             tooltip="hunt 残差容差（帧）。"),
+                io.Int.Input("calm_search_window", default=34, min=0, max=170, step=17,
+                             tooltip="平缓搜索半径（帧）。"),
+                io.Combo.Input("calm_policy", options=["calm_overlap", "jerk_hardcut"],
+                               default="calm_overlap", tooltip="hunt 不可靠时怎么放这条缝。"),
+                io.Boolean.Input("profile_camera_compensate", default=False,
+                                 tooltip="latent profile 镜头补偿。"),
+                io.Combo.Input("profile_reduce", options=["mean", "max", "top-decile"], default="mean",
+                               tooltip="profile 空间聚合方式。"),
+                io.Float.Input("calm_abstain_below", default=0.0, min=0.0, max=10.0, step=0.05,
+                               tooltip="放弃门（0=关）。"),
+                io.Float.Input("calm_min_quality", default=0.8, min=0.0, max=3.0, step=0.05,
+                               tooltip="逐缝质量门（0=关）。"),
+                io.Boolean.Input("hunt_persistence", default=True, tooltip="hunt profile 持久性。"),
+                io.Float.Input("hunt_min_persistence", default=0.8, min=0.0, max=1.0, step=0.02,
+                               tooltip="hunt 采纳门（0=关）。"),
+                io.Int.Input("hunt_search_window", default=34, min=0, max=170, step=17,
+                             tooltip="hunt 搜索半径（帧）。"),
+                io.Float.Input("calm_too_quiet_below", default=0.05, min=0.0, max=1.0, step=0.01,
+                               tooltip="平缓搜索下限门（0=关）。"),
+                io.Float.Input("calm_min_gain", default=0.15, min=0.0, max=1.0, step=0.01,
+                               tooltip="挪动收益门（0=关）。"),
+                io.Boolean.Input("auto_seam_hunt", default=False,
+                                 tooltip="自动找切镜挪边界；关=分析照跑、切点回退计划位置（锚定 overlap）。"),
+                io.Int.Input("anchor_tokens", default=1, min=1, max=5, tooltip="锚定 keyframe token 数。"),
+                io.Int.Input("upscale_pad_tokens", default=3, min=0, max=8,
+                             tooltip="上采样分块时间重叠（熔化修复，默认 3；0=旧行为）。"),
+                io.Boolean.Input("seam_blend", default=False,
+                                 tooltip="锚定缝 latent 线性交叉淡化（静止镜头适用；运动镜头会重影）。"),
+                io.Boolean.Input("seam_redenoise", default=False, tooltip="缝窗重去噪（E-3）。"),
+                io.String.Input("seam_redenoise_frames", default="",
+                                tooltip="只重去噪指定帧附近的缝（逗号分隔；空=自动）。"),
+                io.Int.Input("seam_window_tokens", default=10, min=4, max=30, tooltip="缝窗 token 数。"),
+                io.Int.Input("seam_lock_tokens", default=3, min=1, max=10, tooltip="缝窗两侧锁定 token 数。"),
+                io.Combo.Input("seam_redenoise_gate", options=["off", "auto"], default="off",
+                               tooltip="门控：auto=按 busy 度跳过闹缝。"),
+                io.Boolean.Input("dump_latents", default=False, tooltip="诊断：中间 latent 落盘。"),
+                io.String.Input("dump_dir", default="D:\\comfyui\\_hardcut_work\\latent_dump\\",
+                                tooltip="dump 输出目录。"),
+                io.Boolean.Input("show_memory_log", default=True, tooltip="每窗采样后打印显存。"),
+            ],
+            outputs=[
+                PASS2_TYPE.Output("pass2_plan"),
+                io.Float.Output("sigma0"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, second_pass_sigma0: float = 0.30, anchor_strength: float = 0.999,
+                second_pass_audio_policy: str = None, seam_tolerance_frames: int = 4,
+                calm_search_window: int = 34, calm_policy: str = "calm_overlap",
+                profile_camera_compensate: bool = False, profile_reduce: str = "mean",
+                calm_abstain_below: float = 0.0, calm_min_quality: float = 0.8,
+                hunt_persistence: bool = True, hunt_min_persistence: float = 0.8,
+                hunt_search_window: int = 34, calm_too_quiet_below: float = 0.05,
+                calm_min_gain: float = 0.15, auto_seam_hunt: bool = False,
+                anchor_tokens: int = 1, upscale_pad_tokens: int = 3, seam_blend: bool = False,
+                seam_redenoise: bool = False, seam_redenoise_frames: str = "",
+                seam_window_tokens: int = 10, seam_lock_tokens: int = 3,
+                seam_redenoise_gate: str = "off", dump_latents: bool = False,
+                dump_dir: str = "", show_memory_log: bool = True):
+        plan = {
+            "schema": PASS2_TYPE_STRING,
+            "second_pass_sigma0": float(second_pass_sigma0),
+            "anchor_strength": float(anchor_strength),
+            "second_pass_audio_policy": str(second_pass_audio_policy or AUDIO_POLICIES[0]),
+            "seam_tolerance_frames": int(seam_tolerance_frames),
+            "calm_search_window": int(calm_search_window),
+            "calm_policy": str(calm_policy),
+            "profile_camera_compensate": bool(profile_camera_compensate),
+            "profile_reduce": str(profile_reduce),
+            "calm_abstain_below": float(calm_abstain_below),
+            "calm_min_quality": float(calm_min_quality),
+            "hunt_persistence": bool(hunt_persistence),
+            "hunt_min_persistence": float(hunt_min_persistence),
+            "hunt_search_window": int(hunt_search_window),
+            "calm_too_quiet_below": float(calm_too_quiet_below),
+            "calm_min_gain": float(calm_min_gain),
+            "auto_seam_hunt": bool(auto_seam_hunt),
+            "anchor_tokens": int(anchor_tokens),
+            "upscale_pad_tokens": int(upscale_pad_tokens),
+            "seam_blend": bool(seam_blend),
+            "seam_redenoise": bool(seam_redenoise),
+            "seam_redenoise_frames": str(seam_redenoise_frames or ""),
+            "seam_window_tokens": int(seam_window_tokens),
+            "seam_lock_tokens": int(seam_lock_tokens),
+            "seam_redenoise_gate": str(seam_redenoise_gate),
+            "dump_latents": bool(dump_latents),
+            "dump_dir": str(dump_dir or ""),
+            "show_memory_log": bool(show_memory_log),
+        }
+        print("[SeamKit] Pass-2 plan: sigma0=%.2f hunt=%s pad=%d blend=%s redenoise=%s(%s)"
+              % (plan["second_pass_sigma0"], "on" if plan["auto_seam_hunt"] else "off",
+                 plan["upscale_pad_tokens"], plan["seam_blend"],
+                 "on" if plan["seam_redenoise"] else "off", plan["seam_redenoise_gate"]),
+              flush=True)
+        return io.NodeOutput(plan, float(second_pass_sigma0))

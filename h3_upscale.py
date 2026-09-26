@@ -26,11 +26,12 @@ import comfy.nested_tensor
 
 from comfy_api.latest import io
 
-from .bridge import PLAN_TYPE_STRING, find_upstream_module
+from .bridge import PASS2_TYPE_STRING, PLAN_TYPE_STRING, find_upstream_module
 from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL
 
 CATEGORY = "MiniMax H3/SeamKit"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
+PASS2_TYPE = io.Custom(PASS2_TYPE_STRING)
 
 PLAN_SCHEMA_LOW_SIGMA_V3 = "t8.minimax_h3.chunked_two_pass.low_sigma.v3"
 
@@ -1217,7 +1218,34 @@ def execute(
     dump_dir: str = "",
     upscale_pad_tokens: int = 0,
     seam_blend: bool = False,
+    pass2_plan=None,
 ):
+    # ── 下游二采规划优先层（2026-09-26 拆分）────────────────────────────
+    # pass2_plan（MiniMaxH3HardCutPass2Plan 的输出）> 本节点自己的控件（旧路径回退）。
+    # 下游节点不在一采上游链里，改它的参数不击穿一采缓存指纹。
+    if isinstance(pass2_plan, dict) and pass2_plan:
+        def _p2(key, fallback):
+            v = pass2_plan.get(key)
+            return fallback if v is None else v
+        auto_seam_hunt = bool(_p2("auto_seam_hunt", auto_seam_hunt))
+        show_memory_log = bool(_p2("show_memory_log", show_memory_log))
+        seam_redenoise = bool(_p2("seam_redenoise", seam_redenoise))
+        seam_redenoise_frames = str(_p2("seam_redenoise_frames", seam_redenoise_frames))
+        seam_window_tokens = int(_p2("seam_window_tokens", seam_window_tokens))
+        seam_lock_tokens = int(_p2("seam_lock_tokens", seam_lock_tokens))
+        anchor_tokens = int(_p2("anchor_tokens", anchor_tokens))
+        seam_redenoise_gate = str(_p2("seam_redenoise_gate", seam_redenoise_gate))
+        dump_latents = bool(_p2("dump_latents", dump_latents))
+        dump_dir = str(_p2("dump_dir", dump_dir))
+        upscale_pad_tokens = int(_p2("upscale_pad_tokens", upscale_pad_tokens))
+        seam_blend = bool(_p2("seam_blend", seam_blend))
+        if isinstance(plan, dict):
+            _hc0 = plan.get("hardcut")
+            if isinstance(_hc0, dict):
+                _hc1 = dict(_hc0)
+                _hc1.update({k: v for k, v in pass2_plan.items() if k != "schema"})
+                plan = dict(plan)
+                plan["hardcut"] = _hc1
     core = _core()
     learned = _learned()
     sampling = _sampling()
@@ -1884,6 +1912,15 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                 io.Sampler.Input("sampler"),
                 io.Sigmas.Input("sigmas"),
                 PLAN_TYPE.Input("plan"),
+                PASS2_TYPE.Input(
+                    "pass2_plan",
+                    optional=True,
+                    tooltip=(
+                        "下游二采规划（MiniMaxH3HardCutPass2Plan 的输出）。接了它，二采参数以它为准"
+                        "（本节点上的同名控件退为回退，已折进高级）；不接则维持旧行为。\n"
+                        "为什么：执行器在一采下游，从这里改二采参数**不击穿一采缓存指纹**。"
+                    ),
+                ),
                 io.Conditioning.Input("negative", optional=True),
                 io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=0.1),
                 io.Boolean.Input(
@@ -1900,6 +1937,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "报告给出 measured_turn_frame（测得转镜帧）与 boundary_frame（最终边界）。\n"
                         "会覆盖 plan 里的 segment_frames。"
                     ),
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "show_memory_log",
@@ -1911,6 +1949,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "reserved 涨=显存池碎片，只有 device-free 掉=pinned/其它进程。"
                         "关掉只保留必要的进度日志。"
                     ),
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "seam_redenoise",
@@ -1923,6 +1962,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "过渡由模型在双侧上下文里自己补出——是生成，不是混合。"
                         "默认关闭，行为与旧版完全一致。"
                     ),
+                    advanced=True,
                 ),
                 io.String.Input(
                     "seam_redenoise_frames",
@@ -1931,6 +1971,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "只重去噪指定帧附近的缝（逗号分隔，如 \"187\" 或 \"187,254\"）。"
                         "留空 = 全部内缝。帧号按 17 帧 token 网格吸附到最近的缝。"
                     ),
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "seam_window_tokens",
@@ -1938,6 +1979,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     min=4,
                     max=30,
                     tooltip="缝窗宽度（token，1 token ≈ 3.4 帧），缝居中。",
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "seam_lock_tokens",
@@ -1945,6 +1987,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     min=1,
                     max=10,
                     tooltip="缝窗两端各锁定多少 token（≈10 帧/侧）为已发布 latent。",
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "anchor_tokens",
@@ -1958,6 +2001,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "keyframe 格式原生支持多 token，仅切片宽度不同。"
                         "需 overlap > 0 才生效（无 overlap 无锚可锚）。"
                     ),
+                    advanced=True,
                 ),
                 io.Combo.Input(
                     "seam_redenoise_gate",
@@ -1974,6 +2018,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "需 auto_seam_hunt 开着才有测量；关着退化为全部放行并打日志。\n"
                         "报告 seam_redenoise_gate.seams 有每缝 busy 度，供标定阈值用。"
                     ),
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "dump_latents",
@@ -1984,12 +2029,14 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "最终装配结果，fp16），供离线解码实验台使用（熔化机制判决 V0-V4）。"
                         "默认关，正常跑零开销、零数值影响。"
                     ),
+                    advanced=True,
                 ),
                 io.String.Input(
                     "dump_dir",
                     default="D:\\comfyui\\_hardcut_work\\latent_dump\\",
                     optional=True,
                     tooltip="dump_latents 的输出目录（建议带运行标签，如 ...\\latent_dump\\A2_20260925\\）。",
+                    advanced=True,
                 ),
                 io.Int.Input(
                     "upscale_pad_tokens",
@@ -2004,6 +2051,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "此参数让 upscale 输入向两侧各借 N 个一采 token（全片连续无接缝），"
                         "上采样后裁回窗口范围。默认 3（≈10 帧，已验收）；0=旧行为。"
                     ),
+                    advanced=True,
                 ),
                 io.Boolean.Input(
                     "seam_blend",
@@ -2016,6 +2064,7 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                         "★ 放在本节点（下游）而在规划节点上——改这里**不会击穿一采缓存**"
                         "（规划节点在一采上游链里，改它的开关会触发重采样）。"
                     ),
+                    advanced=True,
                 ),
             ],
             outputs=[io.Latent.Output("latent"), io.String.Output("report")],

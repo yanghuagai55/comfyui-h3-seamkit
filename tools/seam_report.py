@@ -12,6 +12,10 @@
     # ③ A/B 对照：两份成片，判"重去噪有没有注入伪纹理"
     python seam_report.py <关> <开> --seams 85,187,272 --window 12
 
+    # ④ 硬切漂移验收：--hard-cut 标记的缝会多打一块「成片实测转镜 vs 边界」的漂移
+    #    （seam_tolerance_frames 管不了二采重生成的转镜漂移，这里事后量化）
+    python seam_report.py <video> --seams 51 --hard-cut 51
+
 判据（阈值是**用本机已知好坏的片子标定**出来的，不是拍的）
 ------------------------------------------------------
 单片自检对每条缝给两个数：
@@ -192,6 +196,38 @@ def seg_percentile(d1, seam, segments):
     return float((vals < d1[seam - 1]).mean() * 100)
 
 
+def hardcut_drift(d1, seam, radius=10):
+    """硬切漂移验收（信息列，不驱动判定）——2026-09-25 新增（00079 缝 51 案例）。
+
+    背景：seam_tolerance_frames 管的是「一采测量 vs 边界」的残差（0~8，网格量化），
+    管不了**二采重生成的转镜漂移**（±1~10 帧，判定时结构性不可知）。
+    本块在**成片**上实测真实转镜位置量化漂移，再配边界邻域运动度分档：
+      |漂移| ≤ 4f          -> 贴合（tolerance 内）
+      漂移 >4f + 邻域高运动 -> 缝被运动盖住（安全倾向，仍建议目视）
+      漂移 >4f + 邻域静止  -> ⚠ 危险：硬切两侧内容可能可见撕裂，必须逐帧看
+    返回 (peak_j, drift, busy, verdict)：
+      peak_j = d1 下标，实测转镜台阶 = 帧 peak_j -> peak_j+1（落点 peak_j+1）
+      drift  = 落点 - seam（正 = 切在边界之后，如 00079：边界 51、实测 57->58 → +7）
+      busy   = 边界 ±radius 帧中位 d1（排除边界台阶自己）÷ 全片中位
+    """
+    lo = max(0, seam - 1 - radius)
+    hi = min(len(d1) - 1, seam - 1 + radius)
+    win = list(range(lo, hi + 1))
+    peak_j = max(win, key=lambda j: d1[j])
+    drift = (peak_j + 1) - seam
+    others = [j for j in win if j != seam - 1]
+    nb = float(np.median(d1[others])) if others else 0.0
+    gmed = float(np.median(d1))
+    busy = nb / gmed if gmed > 1e-6 else 0.0
+    if abs(drift) <= 4:
+        v = "贴合（|漂移| ≤ 4f，tolerance 内）"
+    elif busy >= 1.5:
+        v = "漂移 >4f 但邻域高运动：缝被运动盖住（安全倾向，仍请目视边界 ±3 帧）"
+    else:
+        v = "⚠ 漂移 >4f 且邻域静止：硬切可能可见撕裂，必须逐帧看"
+    return peak_j, drift, busy, v
+
+
 def _strip(F, lo, hi, scale, crop=None, label=None):
     tiles = []
     for i in range(lo, hi):
@@ -313,6 +349,15 @@ def main():
                   f"{pre:>8.1f} {post:>8.1f} {dsharp:>8.1f}%  "
                   f"{verdict(ratio, pct, step, hard_cut=(s in hard_cuts))}{grid}")
         results[p] = rows
+
+        hc = [s for s in seams if s in hard_cuts]
+        if hc:
+            print(f"★ 硬切漂移验收（信息列，不驱动判定；漂移 = 成片实测转镜落点 − 边界，"
+                  f"邻域运动 = 边界 ±10 帧中位 ÷ 全片中位 {np.median(d1):.2f}）：")
+            for s in hc:
+                peak_j, drift, busy, v = hardcut_drift(d1, s)
+                print(f"   缝{s:>4}: 实测转镜台阶 {peak_j}->{peak_j + 1} (d1 {d1[peak_j]:.2f})"
+                      f"  漂移 {drift:+d} 帧  邻域运动 {busy:.1f}x  → {v}")
 
         if args.sheet:
             outdir = Path(args.outdir)

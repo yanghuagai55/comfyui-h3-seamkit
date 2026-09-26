@@ -24,6 +24,8 @@ _MODULE_SUFFIX = "chunked_two_pass_upscale_advanced"
 
 PLAN_SCHEMA_LOW_SIGMA_V3 = "t8.minimax_h3.chunked_two_pass.low_sigma.v3"
 PLAN_TYPE_STRING = "T8_H3_CHUNKED_TWO_PASS_PLAN"
+# 下游二采规划类型（2026-09-26 拆分）：只影响二采的参数集中在 MiniMaxH3HardCutPass2Plan
+PASS2_TYPE_STRING = "T8_H3_PASS2_PLAN"
 
 PRECISIONS = ("fp16", "bf16", "fp32")
 RELEASE_POLICIES = ("keep_loaded", "offload_after", "clear_after")
