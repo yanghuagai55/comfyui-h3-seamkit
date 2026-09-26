@@ -21,10 +21,8 @@
 
 | 文档 | 用途 |
 |---|---|
-| **`MANUAL.md`** | ★ **作业手册** —— 跨模型协作全流程（定切点 → 喂 LLM → 抄回 ComfyUI）+ 可复制的 LLM 约束块 |
-| **`AUTO.md`** | 自动版节点 `MiniMaxH3HardCutAuto` 的使用与排查 |
-| `templates/hardcut-prompt-template.md` | 提示词模板（六段骨架 + 硬切改写实例 + 常见错误） |
-| `templates/auto-prompt-template.md` | 纯 LLM 用的模板（只要一句约束就能写镜头） |
+| **[`docs/GUIDE.md`](docs/GUIDE.md)** | ★ **完整说明书**：第一章工作原理（线框图 + hunt/calm/overlap 实现）、第二章逐参数怎么用 |
+| **[`templates/prompt-template.md`](templates/prompt-template.md)** | 提示词模板（官方六段骨架 + 硬切 4 条注意事项） |
 
 ## 目录
 
@@ -384,7 +382,7 @@ so the model would not cut where the executor cuts.
 `chunk_step × 0.708` 秒」。
 
 **给 LLM 的模板**：`templatesuto-prompt-template.md`（六段骨架 + chunk_step 换算）。
-节点使用与排查：详见 `AUTO.md`。
+节点使用与排查：详见 `docs/GUIDE.md`。
 
 ### `MiniMaxH3HardCutUpscale`  ★ 二采执行器（可不等长分段）
 
@@ -754,8 +752,6 @@ D:\comfyui\comfyenv\python.exe toolsnalyze_cut.py "<成片.mp4>" --cuts 4.958,8
 | `nodes_repair_all.py` | `MiniMaxH3SeamRepairAll` —— 全包修复节点。 |
 | `tools/` | 命令行工具：成片体检、像素域修复、工作流槽位体检。 |
 | `__init__.py` | `comfy_entrypoint`（V3 注册，与上游同机制）。 |
-| `MANUAL.md` | **跨模型作业手册**：定切点 → 喂 LLM → 校验 → 跑。 |
-| `AUTO.md` | 自动版节点的使用与排查。 |
 | `templates/` | 提示词骨架 + 实例 + 常见错误表。 |
 
 ---
