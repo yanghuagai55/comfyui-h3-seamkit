@@ -29,14 +29,28 @@
 
 ### ① 一采（#93）与缓存
 
-![时间轴与窗口划分：15s → 4 个窗口，边界只能落 17 的倍数](img/timeline.png)
+```text
+   上游有任何变化 ──► 指纹变 ──► 缓存 MISS ──► 重新采样并写缓存
+   上游完全一致   ──► 指纹同 ──► 缓存 HIT  ──► 直接读回一采 latent（跳过采样）
+```
 
-<sub>时间轴与窗口划分：15s → 4 个窗口，边界只能落 17 的倍数</sub>
+**指纹怎么算**（`nodes_latent_cache.py` → `upstream_subgraph_from_inputs`）：
 
-- **指纹** = 从 #93 的**全部输入**反向上游，逐节点哈希（类名 + 字面量 + 连线）的 sha256
-- 因为上游规划节点的 plan 会改写条件节点里的提示词时间戳，**规划节点的每个控件都在指纹里** →
-  所以"一采开关"和"画布/切点"放上游（改它们本来就该重采），**二采参数全部搬去了下游节点**
-  （改它们不触发重采）
+1. 从 #93 的**每一个链接输入**出发（noise / guider / sampler / sigmas / latent_image / plan）
+2. 沿连线反向遍历整张上游子图，每个节点记录三样：**类名** + **全部字面量输入**（控件值 / 文本 / 文件名 / 种子）+ **连线的目标节点 id**
+3. 按 key 排序后序列化成 JSON → **sha256**（取前 12 位做文件名）
+
+**关键推论**：上游规划节点（#102）的输出会改写条件节点里的**提示词时间戳** → 它确实在 #93 的上游 →
+**它身上 16 个控件的值全部进指纹**。这正是"二采参数必须搬去下游"的原因：
+下游节点不在 #93 的上游子图里，改它看不见。
+
+缓存文件 = `<key>.<指纹前12位>.pt` + 同名 `.json`（记录 seed / shapes / 节点清单），三个分支：
+
+| 情况 | 行为 |
+|---|---|
+| key 存在 + 指纹一致 | **HIT**：读出 latent，整段跳过采样（约省 9 分钟） |
+| key 不存在 | **MISS**：正常采样，结束后写缓存 |
+| key 存在 + 指纹不一致 | **不使用**：正常采样；保存时覆盖旧档，并打印"哪里变了"（文本前 70 字 / 种子 / 节点类清单） |
 
 ### ② 二采执行器（#40）逐窗做什么
 
@@ -44,16 +58,40 @@
 
 <sub>二采执行器逐窗六步：切片 → 上采样 → 锚定 → 采样 → 装配 → 可选去噪</sub>
 
+窗口 = `[start_frame, end_frame)`，帧号（起点必须是 17 的倍数）。token ↔ 帧：**1 token = 17 帧 = 5 个 latent 槽**。
+
+| 步 | token 级的具体动作 |
+|---|---|
+| **1 切片** | 取 `video[:, :, start_token:end_token]` |
+| **2 上采样** | 输入**向外扩**：`pt_lo = max(0, start_token − pad)`、`pt_hi = min(T, end_token + pad)`；升完裁回本窗：`chunk[:, :, _trim : _trim + 本窗 token 数]`（`_trim = start_token − pt_lo`）。音频按 `frames_for_tokens` 换算区间直通 |
+| **3 锚定** | 本窗开头 `anchor_tokens` 个 token 以 keyframe 条件钉在上一窗输出上（`noise_aug 0.999`）。只在**有重叠的缝**上生效；硬切的窗口不带锚定 |
+| **4 采样** | 整窗重新生成（DualClock 采样器）；显存 ≈ 段帧数 × 二采 MP，有负载护栏 |
+| **5 装配** | 见 ③ |
+| **6 去噪** | 见 ⑥（默认关） |
+
 ### ③ 拼缝：hard cut / anchor overlap / blend
 
 ![拼缝三态：硬切 / 冻结锚定 / 交叉淡化](img/seam.png)
 
 <sub>拼缝三态：硬切 / 冻结锚定 / 交叉淡化</sub>
 
-| 缝类型 | 何时 | 观感 |
-|---|---|---|
-| **硬切** | hunt 测到的转镜正好压在边界（残差 ≤ `seam_tolerance_frames`） | 内容本来就该断 → 看不出 |
-| **锚定 overlap** | hunt 拒绝 / 网格推离 / calm 挪过界 | 静态镜头不可见；运动内容轻度软化 |
+装配函数 `_append_video_guarded_overlap(accumulated, chunk, start_token, locked_overlap_tokens)`：
+
+```text
+   overlap    = 已发布 token 数 − start_token      ← 与上一窗重叠多少（默认 17 帧 = 5 token）
+   locked     = min(locked_overlap_tokens, overlap)
+   transition = overlap − locked
+
+   发布 = 上一窗 的 [start+locked, start+overlap)  ← 用本窗 chunk[locked:overlap] **硬替换**（不是混合）
+          本窗 chunk[overlap:] 追加到末尾
+```
+
+- **默认 `locked = overlap`（整段 17 帧）→ transition = 0**：重叠区**一个 token 都不取本窗** →
+  一次硬接。好处是零重影；代价是两窗渲染有差异时，接缝处表现为**跳变**
+- `transition > 0` 时，重叠区尾部若干 token 用本窗值**硬替换**——注意仍然是替换而非混合，
+  所以"可见交界"落在 `start_token + locked` 这个 token 上（写进报告作 `seam_marks`）
+- `seam_blend=true` 改走 `_append_video`：同一区间做 **latent 域线性溶解**
+  `left + (right − left) × linspace(0,1)`，再统一解码 → 静止内容平滑，运动内容可能重影
 
 ### ④ hunt：找"模型真正换镜头的那一帧"
 
@@ -61,37 +99,82 @@
 
 <sub>hunt 与 calm：一条缝怎么定形（流程 + 门禁）</sub>
 
-### ⑤ calm：hunt 不可靠时"挪到最平缓的地方"
+**变化剖面**（`_latent_change_profile`）——对**每个 token 边界**算 5 个数，全程无阈值：
 
 ```text
-   在 计划切点 ± calm_search_window 内，找 global/jerk 最安静的 17k 独占帧
-        │
-        ▼
-   4 道门：
-     calm_min_gain(0.15)     候选必须比计划点安静 ≥15%，否则不动
-     calm_too_quiet_below   候选过于静止(<0.05) → 不动（防量化顿挫）
-     calm_min_quality(0.8)  候选仍不够安静 → 退回计划点硬切
-     calm_abstain_below     整片 jerk 对比度太低 → 全程不搜
-        │
-        ▼
-   挪动 → 该缝给 calm_overlap_frames 的锚定 overlap
-   （另有负载护栏：挪动若会把窗口撑过负载线 → 撤销挪动）
+   d[i]      = |latent[i+1] − latent[i]| 在 H×W 按 profile_reduce 聚合（mean / max / top-decile）
+   local[i]  = d[i] ÷ median(d[i−2 … i+2])            ← 相对自己的邻域
+   global[i] = d[i] ÷ median(d)                        ← 相对全片（排序用它）
+   jerk[i]   = |latent[i+3] − 3·latent[i+2] + 3·latent[i+1] − latent[i]| ÷ 同式中位   ← 三阶差分
+   pers[i]   = |after − before| ÷ ½(|after| + |before|)      ← 变化前后各 10 token 的平均状态之差，再按全片峰值归一化
 ```
+
+为什么是这 5 个数：
+
+- **排序用 `global` 不用 `local`**：软化的转镜会抬高自己邻域的中位数，反而把自己的 local 压低（实测 2026-09-20）
+- **`jerk` 比一阶差更接近"平静"**：值域一阶差被运动能量污染（纹理划过就会脉冲），三阶差量的是"运动变化得多突然"
+- **`pers` 区分"真切断"与"闪烁/抖动/遮挡"**：真切断留在**另一个稳态**，闪烁会回落到原趋势
+- 候选排序分 = `global × (0.25 + 0.75 × pers)`（pers 不可用时退化为纯 global）
+
+**取峰与门禁**：在 `计划切点 ± hunt_search_window` 内取排序分最大者 → 依次过
+`pers ≥ hunt_min_persistence(0.8)` → `global ≥ FLAT_RATIO(1.6)` → `global ≥ HUNT_MIN_CUT_RATIO(2.0)` →
+吸附到最近 17k 帧 → 残差 ≤ `seam_tolerance_frames` 才判"压在转镜上" → 硬切。
+
+### ⑤ calm：hunt 不可靠时"挪到最平缓的地方"
+
+**取分**：与 hunt 同源的 `score[i] = max(global[i], jerk[i])`（两个视角都安静才算真安静）。
+**扫描**：在 `计划切点 ± calm_search_window`（默认 34，你的配置 51）内逐 17k 独占帧评估，取分数最低者为候选。
+
+四道门（任一不过就退回计划点）：
+
+| 门 | 默认 | 语义 |
+|---|---|---|
+| `calm_min_gain` | 0.15 | 候选分数必须比计划点低 ≥15%（防"压线抖动"：0.09 分之差就会翻结论） |
+| `calm_too_quiet_below` | 0.05 | 候选过于静止 → 不挪（4 帧量化的顿挫会显眼） |
+| `calm_min_quality` | 0.8 | 候选分数仍 > 0.8 × 全片中位 → 不值得搜 → 退回计划点**硬切** |
+| `calm_abstain_below` | 0（关） | 全片 jerk 对比度 max/mean 低于本值 → 整片不搜、全保计划 |
+
+另有**负载护栏**：挪动若使某段 `帧数 × canvas_mp ≥ 负载线` → 撤销挪动、退回计划点。
 
 ### ⑥ 缝窗重去噪（`seam_redenoise`，默认关）
 
+![缝窗重去噪：取哪一段、锁哪两端](img/redenoise.png)
+
+<sub>缝窗重去噪：取哪一段、锁哪两端</sub>
+
+**取窗**（对 `seam_marks` 里的每条缝各执行一次）：
+
 ```text
-   对选中的缝：以缝为中心开一个缝窗（seam_window_tokens），
-   两端各锁 seam_lock_tokens 个 token 钉回锚点 → 只重采样缝窗内部
-   → 台阶可减；但运动内容可能注入伪纹理（用 stroke_check 事后否决）
+   half = seam_window_tokens // 2               ← 默认 10 // 2 = 5
+   w0   = max(0, seam_token − half)             ← 窗口起点（token）
+   w1   = min(总 token 数, w0 + seam_window_tokens)   ← 默认 10 个 token ≈ 34 帧
 ```
+
+**遮罩**：`video_mask[0 : lock_tokens] = 0`、`video_mask[span−lock_tokens : span] = 0`
+（默认各 3 个 token）——两端**锁回已发布 latent**；中间 `window − 2×lock`（默认 4 个 token ≈ 14 帧）自由生成。
+**窗口内音频全自由**（mask 全 1）。
+
+**锁端怎么保持**：不是只在开头注入一次，而是**采样每一步都把锁端重注入一次**
+（`KSamplerX0Inpaint`，时间步 0.999）→ 模型始终在"两侧都是干净关键帧"的条件下解中间区域
+（RePaint 思路；ComfyUI 核心已实现，本包未搬运其代码）。
+噪声用全局噪声切片 `[w0:w1]`（与首轮同相，不引入新随机性）。实测锁端收敛到已发布 latent，误差 ~2e-7。
+
+**前置门**（`seam_redenoise_gate=auto`）：每条缝算"闹度" =
+缝邻域 5 个 token 的 `max(global, jerk)` 均值 ÷ 全片中位；**≥ 1.5 直接跳过**（闹处重画容易生伪纹理）。
+`seam_redenoise_frames` 可指定只做某几条缝（逗号分隔帧号，±17 帧内匹配）。
+
+**事后否决**：`stroke_check.py A.mp4 B.mp4` → 裂纹笔画比 B/A > 1.2 即判注入伪纹理，回退。
 
 ### ⑦ 上采样分块时间重叠（`upscale_pad_tokens`，默认 3）
 
 ```text
-   pad=0（旧行为）   [ 窗口 token 区间 ]            → 尾部~8帧单侧感受野 → 轻度软化
-   pad=3（默认）  [借 3] [ 窗口区间 ] [借 3]  → 上采样后裁回窗口区间 → 尾部锐利
+   pad = 0（旧行为）               [ 窗口 token 区间 ]              → 分块尾单侧感受野 → 尾 ~8 帧轻度软化
+   pad = 3（默认）      [借3][ 窗口 token 区间 ][借3]              → 上采样后裁回窗口区间 → 尾部锐利
+                        ↑pt_lo=start−3      pt_hi=end+3            ↑ 裁掉 [_trim : _trim + 本窗 token 数]
 ```
+
+一采 latent 是整片**连续生成**的（无接缝），所以"借"是免费的：只是多算几个 token 的上采样。
+音频直通不经 upscaler，采样用的音频仍取窗口自身区间。
 
 ---
 
