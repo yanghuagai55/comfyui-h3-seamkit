@@ -1196,6 +1196,7 @@ def execute(
     anchor_tokens: int = 1,
     dump_latents: bool = False,
     dump_dir: str = "",
+    upscale_pad_tokens: int = 0,
 ):
     core = _core()
     learned = _learned()
@@ -1518,15 +1519,39 @@ def execute(
         # how much this window re-reads from the published output: > 0 only when
         # a seam asked for an anchored prefix (the calm search sets it per cut)
         seg_overlap = max(0, (prev_end_frame or 0) - int(start_frame)) if prev_end_frame is not None else 0
-        chunk_video = video[:, :, start_token:end_token].contiguous()
+        # ── 上采样时间 padding（熔化修复 ③，2026-09-26）─────────────────
+        # 3D learned upscaler 逐窗独立处理，分块尾的时间感受野只有单侧
+        # → 尾部 ~8 帧（= 下一窗的锚定源）轻度软化（0.85-0.9x，UP_W1 判别实证），
+        #   二采采样再加深为 0.67x 的"锁入口脱焦带"。
+        # 修法：upscale 输入向两侧各借 pad_t 个一采 token（全片连续、无接缝），
+        #   上采样后裁回窗口 own 范围 —— 尾部拿到双侧上下文，与片尾不熔一致。
+        # 音频直通不经 upscaler：采样用的 chunk_audio 保持窗口 own 范围不变。
+        pad_t = max(0, int(upscale_pad_tokens))
+        pt_lo = max(0, start_token - pad_t)
+        pt_hi = min(video.shape[2], end_token + pad_t)
+        chunk_video = video[:, :, pt_lo:pt_hi].contiguous()
         audio_start = round(start_frame * core.FRAME_RESCALE)
         audio_end = min(audio.shape[-1], round(end_frame * core.FRAME_RESCALE))
         chunk_audio = audio[..., audio_start:audio_end].contiguous()
-        chunk_latent = {
-            "samples": comfy.nested_tensor.NestedTensor((chunk_video, chunk_audio))
-        }
+        if pad_t:
+            pf_lo = core.frames_for_tokens(pt_lo)
+            pf_hi = core.frames_for_tokens(pt_hi)
+            pa_s = round(pf_lo * core.FRAME_RESCALE)
+            pa_e = min(audio.shape[-1], max(pa_s + 1, round(pf_hi * core.FRAME_RESCALE)))
+            pad_audio = audio[..., pa_s:pa_e].contiguous()
+            chunk_latent = {
+                "samples": comfy.nested_tensor.NestedTensor((chunk_video, pad_audio))
+            }
+        else:
+            chunk_latent = {
+                "samples": comfy.nested_tensor.NestedTensor((chunk_video, chunk_audio))
+            }
 
         chunk_video = _upscale_chunk(learned, chunk_latent, plan)
+        if pad_t:
+            _trim_lo = start_token - pt_lo          # 头部要裁掉的 padding token 数
+            _n_tok = end_token - start_token        # 窗口 own token 数
+            chunk_video = chunk_video[:, :, _trim_lo:_trim_lo + _n_tok].contiguous()
         chunk_conditioning = core.reanchor_conditioning(
             conditioning, start_frame, end_frame, tuple(chunk_video.shape[-2:])
         )
@@ -1914,6 +1939,20 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     default="D:\\comfyui\\_hardcut_work\\latent_dump\\",
                     optional=True,
                     tooltip="dump_latents 的输出目录（建议带运行标签，如 ...\\latent_dump\\A2_20260925\\）。",
+                ),
+                io.Int.Input(
+                    "upscale_pad_tokens",
+                    default=0,
+                    min=0,
+                    max=8,
+                    optional=True,
+                    tooltip=(
+                        "熔化修复③：上采样分块时间重叠。3D upscaler 逐窗独立处理，"
+                        "分块尾时间感受野单侧 → 尾部 ~8 帧轻度软（0.85-0.9x），"
+                        "二采再加深为锁入口脱焦带。此参数让 upscale 输入向两侧各借"
+                        "N 个一采 token（全片连续无接缝），上采样后裁回窗口范围。"
+                        "0=关（旧行为）；建议 3（≈10 帧）。"
+                    ),
                 ),
             ],
             outputs=[io.Latent.Output("latent"), io.String.Output("report")],
