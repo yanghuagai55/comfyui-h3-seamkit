@@ -89,7 +89,7 @@ def aspect_options() -> list[str]:
 def default_aspect() -> str:
     return _DEFAULT_ASPECT if _DEFAULT_ASPECT in aspect_ratios() else aspect_options()[0]
 
-CATEGORY = "MiniMax H3/SeamKit"
+CATEGORY = "MiniMax H3 Hard Cut"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
 NO_CUT = -1.0
 
@@ -426,7 +426,7 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="MiniMaxH3HardCutFirstPassPlan",
-            display_name="MiniMax H3 Hard-Cut Auto (Plan + Prompt)",
+            display_name="MiniMax H3 Plan (upstream / first-pass)",
             description=(
                 "One node for the whole hard-cut setup: it plans the split, checks "
                 "your prompt against it, and doubles as both resolution selectors and "

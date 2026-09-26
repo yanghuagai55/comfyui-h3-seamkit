@@ -29,7 +29,7 @@ from comfy_api.latest import io
 from .bridge import PASS2_TYPE_STRING, PLAN_TYPE_STRING, find_upstream_module
 from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL
 
-CATEGORY = "MiniMax H3/SeamKit"
+CATEGORY = "MiniMax H3 Hard Cut"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
 PASS2_TYPE = io.Custom(PASS2_TYPE_STRING)
 
