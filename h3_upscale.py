@@ -882,6 +882,11 @@ def _hunt_shot_changes(video, sens: float = 2.0, win: int = 2) -> list:
 # Measured on the convrot weights: real turns score 1.82-1.91, a false one (motion peak) scored 1.51.  1.6 splits them with margin - 1.8 sat right on
 # top of the real turns and risked dropping them too.
 FLAT_RATIO = 1.6     # below this a tolerance window counts as featureless
+# ★ 硬切的转镜置信门（2026-09-26，exp_4v10a_00086 @51 事故）：真实的 latent
+#   变化不一定是转镜——实测 v4 真转镜（pan->lock）~2.2x，而已锁定镜头内的
+#   姿势跳变 ~1.7x；对后者硬切会发布用户可见的无动机跳切。低于此值的变化
+#   照实记录但拒绝硬切，由 calm 搜索 / 锚定 overlap 藏接缝。n=2 标定。
+HUNT_MIN_CUT_RATIO = 2.0
 # One 17-frame block carries 5 tokens: 1 exclusive (a single frame) + 4 shared
 # (each covering 4 frames).  So a tolerance below ~4 frames cannot even reach
 # the neighbouring candidate row - worth saying out loud in the log.
@@ -1002,6 +1007,20 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
                 "moved": False,
                 "note": (f"latent is flat near the cut "
                          f"(peak ratio {peak_ratio:.2f} < {FLAT_RATIO})"),
+                "top_candidates": top,
+            })
+            continue
+
+        # ---- turn-confidence gate (RATIO) ----------------------------------
+        # 见 HUNT_MIN_CUT_RATIO：真实变化 ≠ 转镜。低于置信门的变化照实记录、
+        # 拒绝硬切 —— 计划位置保留，calm 搜索 / 锚定 overlap 藏接缝。
+        if peak_ratio < HUNT_MIN_CUT_RATIO:
+            aligned.append({
+                "planned_cut": cut,
+                "moved": False,
+                "note": (f"local change is real but below turn confidence "
+                         f"(ratio {peak_ratio:.2f} < {HUNT_MIN_CUT_RATIO:.2f}) "
+                         f"-> kept the plan, anchored overlap"),
                 "top_candidates": top,
             })
             continue
@@ -1243,7 +1262,14 @@ def execute(
     segment_frames = planned or None
     seam_hunt = None
     profile = None  # 门控在 hunt 关着时也要能问；None -> gate 全放行并打日志
-    if auto_seam_hunt:
+    aligned, boundary_tokens = None, None
+    if planned and isinstance(plan.get("hardcut"), dict):
+        # ★ 解耦（2026-09-26）：profile 与对齐分析**总是跑** —— calm 搜索和
+        #   熔化 gate 都吃它们的输出，不该被 auto_seam_hunt 连坐。
+        #   auto_seam_hunt 现在只控制一件事：**是否按测得的转镜移动切点/接受
+        #   硬切**。关掉 = 分析照跑，但全部切点回退计划位置 + 锚定 overlap
+        #   （教训 exp_4v10a_00086 @51：hunt 把锁定镜头内的姿势跳变误判为
+        #   转镜，ratio 1.69 切出用户可见的跳切）。
         # Threshold-based detection died on busy footage: a fight moves every
         # token, so the real shot change never clears a fixed ratio while a
         # hard action beat does (measured: the only hit was the finale, 119
@@ -1265,6 +1291,25 @@ def execute(
             ),
             search_window=int((plan.get("hardcut") or {}).get("hunt_search_window", 0)),
         )
+        if not auto_seam_hunt:
+            # hunt 关（用户手动选择）：全部已接受的切点转成 declined 形态
+            # （与 persistence/flat 门同构），回退计划位置 + 锚定 overlap。
+            boundary_tokens = []
+            for entry in aligned:
+                if entry.get("boundary_token") is not None:
+                    entry["moved"] = False
+                    entry["note"] = "; ".join(
+                        x
+                        for x in (
+                            entry.get("note"),
+                            f"hunt off -> declined the measured turn "
+                            f"{entry.get('measured_turn_frame')} (anchored overlap)",
+                        )
+                        if x
+                    )
+                    entry.pop("boundary_token", None)
+                    entry.pop("boundary_frame", None)
+                    entry.pop("measured_turn_frame", None)
         if boundary_tokens:
             boundary_tokens.sort()
             cand = [core.frames_for_tokens(t) for t in boundary_tokens]
@@ -1302,7 +1347,11 @@ def execute(
                 segment_frames = cand
                 seam_hunt_note = None
         else:
-            seam_hunt_note = "no latent change found within tolerance of any planned cut"
+            seam_hunt_note = (
+                "hunt off -> all planned cuts kept as anchored overlaps"
+                if not auto_seam_hunt
+                else "no latent change found within tolerance of any planned cut"
+            )
         seam_hunt = {
             "tolerance_frames": tolerance,
             "planned_cuts": planned,
@@ -1347,8 +1396,9 @@ def execute(
 
     # ---- adaptive: if the hunt could not vouch for a cut, move that boundary to
     # the CALMEST frame nearby and give that seam an anchored overlap, instead of
-    # cutting through continuous content.  Needs the hunt's profile, so it only
-    # runs when auto_seam_hunt is on.
+    # cutting through continuous content.  Runs whenever a plan exists - the
+    # profile/alignment are computed unconditionally (decoupled from
+    # auto_seam_hunt, 2026-09-26).
     calm_boundaries = None
     # Log lines are buffered and emitted in READING order at the end, not in
     # code order: the flow is params -> per-cut detection -> decisions ->
@@ -1357,7 +1407,7 @@ def execute(
     # detections they came from.
     _log_buf = {"cfg": [], "hunt": [], "calm": [], "overlap": [], "sum": []}
     calm_overlaps = None
-    if auto_seam_hunt and planned and isinstance(plan.get("hardcut"), dict):
+    if planned and isinstance(plan.get("hardcut"), dict):
         _hc = plan["hardcut"]
         if _hc.get("auto_calm_search"):
             calm_boundaries, calm_overlaps, _calm_notes = find_calm_boundaries(
