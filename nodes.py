@@ -419,13 +419,13 @@ class MiniMaxH3HardCutPlan(io.ComfyNode):
         return io.NodeOutput(plan, cuts_csv, report)
 
 
-class MiniMaxH3HardCutAuto(io.ComfyNode):
+class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
     """One-node automatic planner + prompt writer (replaces Plan + Validate)."""
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="MiniMaxH3HardCutAuto",
+            node_id="MiniMaxH3HardCutFirstPassPlan",
             display_name="MiniMax H3 Hard-Cut Auto (Plan + Prompt)",
             description=(
                 "One node for the whole hard-cut setup: it plans the split, checks "
@@ -464,6 +464,15 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     step=0.5,
                     tooltip="Clip length in seconds. Snapped to the 17n+5 frame grid.",
                 ),
+                io.Boolean.Input(
+                    "use_cache", default=True,
+                    tooltip="一采缓存总开关（原在采样器节点上，挪到本节点统一管）。关=纯采样器。"),
+                io.String.Input(
+                    "cache_key", default="s15_cam",
+                    tooltip="一采缓存 key（与指纹共同决定命中）。"),
+                io.Boolean.Input(
+                    "require_sage_patch", default=True,
+                    tooltip="要求显存补丁在位（原在采样器节点上）。"),
                 io.Boolean.Input(
                     "loose_prompt",
                     default=True,
@@ -533,60 +542,8 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     default="clear_after",
                     advanced=True,
                 ),
-                io.Float.Input(
-                    "anchor_strength",
-                    default=0.999,
-                    min=0.0,
-                    max=1.0,
-                    step=0.001,
-                    tooltip="No effect at overlap 0; kept for interface compatibility.",
-                    advanced=True,
-                ),
-                io.Combo.Input(
-                    "second_pass_audio_policy",
-                    options=list(AUDIO_POLICIES),
-                    default="joint_av_preserve_input",
-                    advanced=True,
-                ),
-                io.Float.Input(
-                    "second_pass_sigma0",
-                    default=0.30,
-                    min=0.0,
-                    max=1.0,
-                    step=0.01,
-                    tooltip=(
-                        "二采 denoise (σ₀) — 从本节点的 `sigma0` 输出口接到 BasicScheduler 的 "
-                        "`denoise`。**接缝幅度 ∝ σ₀**：调小它，段边界那道缝会更淡（代价是"
-                        "二采引入的细节变少）。本机实测 0.30 能用，可试 0.20~0.25。"
-                    ),
-                    advanced=True,
-                ),
-                io.Int.Input(
-                    "seam_tolerance_frames",
-                    default=4,
-                    min=0,
-                    max=8,
-                    step=1,
-                    tooltip=(
-                        "★ 自动找缝的容差（帧）：交给 `#40` 的 `auto_seam_hunt` 用。\n"
-                        "二采在 latent 上找模型真正的转镜帧，再把它**吸附到最近的独占帧**"
-                        "（17 的倍数）作为窗口边界。本值管的是**吸附后的残差**：\n"
-                        "    `|边界 − 测得转镜|` ≤ 本值 → 缝正压在转镜上 → **硬切**（overlap 0）\n"
-                        "    `|边界 − 测得转镜|` > 本值 → 缝落在镜头内部，硬切会露台阶 → "
-                        "该缝改走**锚定 overlap**\n"
-                        "    （搜索没找到转镜 / 持续性门拒绝时，同样走锚定 overlap）\n"
-                        "\n"
-                        "**★ 量程只有 0~8**，因为边界只能落在 17 的整数倍上 —— "
-                        "转镜帧到最近合法帧的距离最大就是 17/2 = 8。所以：\n"
-                        "    0 = 只有转镜正好压在网格上才硬切（很罕见）\n"
-                        "    4 = 接受中间一半（**推荐**）\n"
-                        "    8 = 无条件硬切（等于关掉这道门）\n"
-                        "    >8 与 8 完全等价，没有意义。\n"
-                        "\n"
-                        "注意：这里**不再**拿它和计划切点比 —— 边界该落在哪由**测得转镜**决定，"
-                        "不是由计划决定。（旧版这里是规划漂移容差，量程 17 才有意义，已废弃。）"
-                    ),
-                ),
+
+
                 io.Int.Input(
                     "overlap_frames",
                     default=0,
@@ -615,15 +572,7 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                         "目的：接缝既不落在内容剧变处，也不用两条独立结果硬拼。"
                     ),
                 ),
-                io.Int.Input(
-                    "calm_search_window",
-                    default=34,
-                    min=0,
-                    max=170,
-                    step=17,
-                    tooltip="平缓搜索半径（帧）：在 `切点 ± 本值` 内找最平缓的独占帧。",
-                    advanced=True,
-                ),
+
                 io.Int.Input(
                     "calm_overlap_frames",
                     default=17,
@@ -636,93 +585,18 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                     ),
                     advanced=True,
                 ),
-                io.Combo.Input(
-                    "calm_policy",
-                    options=["calm_overlap", "jerk_hardcut"],
-                    default="calm_overlap",
-                    tooltip=(
-                        "hunt 判定不可靠时怎么放这条缝。"
-                        "calm_overlap：边界挪到最平缓的独占帧，并给这条缝加锚定重叠（靠内容连续+锚定把缝缝住）。"
-                        "jerk_hardcut：反过来，把边界放在 jerk 最高（运动最剧烈/模型最容易糊）的独占帧上并硬切，"
-                        "靠运动掩蔽藏缝，不用重叠。"
-                    ),
-                ),
-                io.Boolean.Input(
-                    "profile_camera_compensate",
-                    default=False,
-                    tooltip="先按整数位移把每帧对齐到前一帧，再做变化剖面。纯运镜(平移/摇镜)会被读成静止，只有相对相机的运动留下。提示词里有运镜时打开它。",
-                    advanced=True,
-                ),
-                io.Combo.Input(
-                    "profile_reduce",
-                    options=["mean", "max", "top-decile"],
-                    default="mean",
-                    tooltip="空间聚合方式：mean=全网平均(默认)；max=取最热的一点；top-decile=最热10%的均值。后两者不会把局部热点平均掉。",
-                    advanced=True,
-                ),
-                io.Float.Input(
-                    "calm_abstain_below",
-                    default=0.0,
-                    min=0.0,
-                    max=10.0,
-                    step=0.05,
-                    tooltip="放弃门：jerk 的对比度(max/mean)低于本值就整片不做搜索、保持计划切点。0=关闭。",
-                    advanced=True,
-                ),
-                io.Float.Input(
-                    "calm_min_quality",
-                    default=0.8,
-                    min=0.0,
-                    max=3.0,
-                    step=0.05,
-                    tooltip="逐缝质量门：窗内最优点的分数仍高于它就退回计划点硬切。分数以全片中位为 1.0，0.8 表示「至少比平时安静两成」。0 = 关闭。",
-                    advanced=True,
-                ),
-                io.Int.Input(
-                    "hunt_search_window",
-                    default=34,
-                    min=0,
-                    max=170,
-                    step=17,
-                    tooltip="hunt 的搜索半径（帧）。模型实际转镜的位置可能离计划点很远（实测 1~17 帧，甚至更多），窗口太小就什么都检测不到，残差判据也就无从触发。0 = 用 max(seam_tolerance_frames, 34)。",
-                    advanced=True,
-                ),
-                io.Float.Input(
-                    "hunt_min_persistence",
-                    default=0.8,
-                    min=0.0,
-                    max=1.0,
-                    step=0.02,
-                    tooltip="hunt 采纳门：检测到的局部变化若持久性低于本值，判为假信号（闪烁/抖动/纹理划过）不予采纳，退回计划点。0 = 关闭。",
-                    advanced=True,
-                ),
-                io.Float.Input(
-                    "calm_min_gain",
-                    default=0.15,
-                    min=0.0,
-                    max=1.0,
-                    step=0.01,
-                    tooltip="挪动收益门：候选点必须比计划点安静至少这个比例才值得挪。避免「压线抖动」（0.09 分之差决定两种成片）。0 = 关闭，退回旧的绝对门限。",
-                    advanced=True,
-                ),
-                io.Float.Input(
-                    "calm_too_quiet_below",
-                    default=0.05,
-                    min=0.0,
-                    max=1.0,
-                    step=0.01,
-                    tooltip="平缓搜索的下限门：窗内最优点若过于静止（分数低于本值），4 帧量化的顿挫会显眼，此时不挪边界、直接硬切。0 = 关闭。",
-                    advanced=True,
-                ),
-                io.Boolean.Input(
-                    "hunt_persistence",
-                    default=True,
-                    tooltip="hunt 排序时加入「持久性」判据：真转场 = 变化后停在新状态；闪烁/抖动/纹理划过 = 变化后回到原状态。关掉则退回旧的纯局部变化排序。",
-                    advanced=True,
-                ),
+
+
+
+
+
+
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
+            io.Boolean.Output("use_cache"),
+            io.String.Output("cache_key"),
+            io.Boolean.Output("require_sage_patch"),
                 io.String.Output("prompt"),
                 io.String.Output("report"),
                 io.Int.Output("first_width", tooltip="First-pass width (from first_megapixels)."),
@@ -732,10 +606,6 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
                 io.Int.Output(
                     "length",
                     tooltip="Clip length in frames, on the 17n+5 grid — feed both conditioning nodes.",
-                ),
-                io.Float.Output(
-                    "sigma0",
-                    tooltip="Raw passthrough of second_pass_sigma0 → wire into BasicScheduler.denoise.",
                 ),
             ],
         )
@@ -772,6 +642,9 @@ class MiniMaxH3HardCutAuto(io.ComfyNode):
         hunt_search_window: int = 34,
             calm_too_quiet_below: float = 0.05,
         calm_min_gain: float = 0.15,
+        use_cache: bool = True,
+        cache_key: str = "s15_cam",
+        require_sage_patch: bool = True,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -1239,8 +1112,6 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             category="MiniMax H3 Hard Cut",
             is_experimental=True,
             inputs=[
-                io.Float.Input("second_pass_sigma0", default=0.30, min=0.0, max=1.0, step=0.01,
-                               tooltip="二采 denoise (sigma0)。接 BasicScheduler.denoise。"),
                 io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.001,
                                tooltip="锚定强度（接口兼容保留）。"),
                 io.Combo.Input("second_pass_audio_policy", options=list(AUDIO_POLICIES),
@@ -1289,12 +1160,11 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             ],
             outputs=[
                 PASS2_TYPE.Output("pass2_plan"),
-                io.Float.Output("sigma0"),
             ],
         )
 
     @classmethod
-    def execute(cls, second_pass_sigma0: float = 0.30, anchor_strength: float = 0.999,
+    def execute(cls, anchor_strength: float = 0.999,
                 second_pass_audio_policy: str = None, seam_tolerance_frames: int = 4,
                 calm_search_window: int = 34, calm_policy: str = "calm_overlap",
                 profile_camera_compensate: bool = False, profile_reduce: str = "mean",
@@ -1309,10 +1179,9 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                 dump_dir: str = "", show_memory_log: bool = True):
         plan = {
             "schema": PASS2_TYPE_STRING,
-            "second_pass_sigma0": float(second_pass_sigma0),
             "anchor_strength": float(anchor_strength),
             "second_pass_audio_policy": str(second_pass_audio_policy or AUDIO_POLICIES[0]),
-            "seam_tolerance_frames": int(seam_tolerance_frames),
+            "seam_tolerance": int(seam_tolerance_frames),
             "calm_search_window": int(calm_search_window),
             "calm_policy": str(calm_policy),
             "profile_camera_compensate": bool(profile_camera_compensate),
@@ -1337,9 +1206,9 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             "dump_dir": str(dump_dir or ""),
             "show_memory_log": bool(show_memory_log),
         }
-        print("[SeamKit] Pass-2 plan: sigma0=%.2f hunt=%s pad=%d blend=%s redenoise=%s(%s)"
-              % (plan["second_pass_sigma0"], "on" if plan["auto_seam_hunt"] else "off",
+        print("[SeamKit] Pass-2 plan: hunt=%s pad=%d blend=%s redenoise=%s(%s)"
+              % ("on" if plan["auto_seam_hunt"] else "off",
                  plan["upscale_pad_tokens"], plan["seam_blend"],
                  "on" if plan["seam_redenoise"] else "off", plan["seam_redenoise_gate"]),
               flush=True)
-        return io.NodeOutput(plan, float(second_pass_sigma0))
+        return io.NodeOutput(plan)

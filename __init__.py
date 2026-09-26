@@ -33,7 +33,7 @@ Nodes
 from comfy_api.latest import ComfyExtension
 
 from .nodes import (
-    MiniMaxH3HardCutAuto,
+    MiniMaxH3HardCutFirstPassPlan,
     MiniMaxH3HardCutPass2Plan,
     MiniMaxH3HardCutPlan,
     MiniMaxH3HardCutShotPrompt,
@@ -62,7 +62,7 @@ class H3HardCutExtension(ComfyExtension):
     async def get_node_list(self):
         return [
             MiniMaxH3HardCutPlan,
-            MiniMaxH3HardCutAuto,
+            MiniMaxH3HardCutFirstPassPlan,
             MiniMaxH3HardCutPass2Plan,
             MiniMaxH3HardCutValidate,
             MiniMaxH3HardCutShotPrompt,

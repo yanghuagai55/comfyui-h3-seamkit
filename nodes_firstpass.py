@@ -109,7 +109,7 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 io.Latent.Input("latent_image"),
                 io.Boolean.Input(
                     "use_cache",
-                    default=False,
+                    optional=True,
                     tooltip=(
                         "总开关。开：命中缓存就跳过采样（读回冻结的一采），"
                         "没命中就采样并写缓存。\n"
@@ -118,17 +118,16 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 ),
                 io.String.Input(
                     "cache_key",
-                    default="run1",
+                    optional=True,
                     tooltip="缓存标识。建议带来源，如 `seed342114_s5_cam_v4`。换 key = 换缓存。",
                 ),
                 io.Boolean.Input(
                     "require_sage_patch",
-                    default=True,
+                    optional=True,
                     tooltip="开：没检测到 KJNodes 显存优化补丁就打醒目警告（8GB 卡强烈建议开）。",
                 ),
                 io.String.Input(
                     "cache_path",
-                    default="",
                     optional=True,
                     tooltip=(
                         "缓存目录。留空 = 默认 `<输出目录>/seamkit_latent_cache/`。\n"
