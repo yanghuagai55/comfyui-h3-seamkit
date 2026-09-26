@@ -1138,7 +1138,7 @@ def release_text_encoders() -> list:
     return freed
 
 
-# ---- seam re-denoise auto gate（策略树 §4.1 B1 前置门 v1，TOKEN_RESEARCH.md）----
+# ---- seam re-denoise auto gate（策略树 §4.1 B1 前置门；见 docs/GUIDE.md §1.2⑥）----
 # 证据链：
 #   * E-3(00068)：静缝重去噪有效（187 台阶 5.30x -> 1.72x）；闹处/细节密处
 #     （85/272）重去噪**注入伪纹理**。
