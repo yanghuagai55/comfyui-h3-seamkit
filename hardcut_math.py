@@ -1202,23 +1202,28 @@ def validate_prompt(
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Official Ref2VA retention tags are exactly these four; anything else
-    # (a common one being "fully_preserved") is not what the text encoder
-    # was trained on.
-    _OFFICIAL_RETENTION = ("fully_copy", "partially_copy", "reference", "weak_reference")
+    # 官方 ref guide：retention 标签分两族，两族都合法（2026-09-26 订正：旧版只认
+    # 音频族，把官方画面族的 fully_preserved 误报成"非官方标签"）。
+    _OFFICIAL_RETENTION = (
+        # 画面类（<Subject> / <Picture> / <Video>）
+        "fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference",
+        # 音频类（<Audio>）
+        "fully_copy", "partially_copy", "reference",
+    )
+    _TAG_SHAPE = re.compile(r"^(?:fully|partially|attribute|weak)_[a-z]{2,}$")
     _ret = re.search(r"retention_analysis\s*:(.*?)(?=\n[a-z_]+\s*:|\Z)", prompt, re.S | re.I)
     if _ret:
         _tags = set(re.findall(r"\b([a-z_]{3,})\b", _ret.group(1)))
         _bad = sorted(
             t for t in _tags
-            if (t.endswith("_copy") or t == "weak_reference" or t == "fully_preserved")
-            and t not in _OFFICIAL_RETENTION
+            if _TAG_SHAPE.match(t) and t not in _OFFICIAL_RETENTION
         )
         if _bad:
             warnings.append(
                 "retention_analysis uses unofficial tag(s) "
                 + ", ".join(_bad)
-                + " - the official set is fully_copy / partially_copy / reference / weak_reference"
+                + " - 画面类: fully_preserved / partially_preserved / attribute_transfer / "
+                "weak_reference；音频类: fully_copy / partially_copy / reference / weak_reference"
             )
     info: dict = {"canvas_mp": float(canvas_mp) if canvas_mp else None}
 
