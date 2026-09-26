@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{width:1440px;padding:36px 44px;background:#FBF8F3;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#2B2622}
+  h1{font-size:22px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13px;color:#7A7268;margin-bottom:26px}
+  .row{display:flex;align-items:stretch;gap:14px}
+  .col{display:flex;flex-direction:column;gap:12px}
+  .card{background:#fff;border:1.5px solid #E7E1D8;border-radius:12px;padding:14px 16px;
+        box-shadow:0 1px 2px rgba(43,38,34,.04)}
+  .card.hi{border-color:#C2410C;box-shadow:0 0 0 3px rgba(194,65,12,.08)}
+  .t{font-size:14px;font-weight:700;margin-bottom:4px}
+  .n{font-size:11.5px;color:#7A7268;line-height:1.5}
+  .tag{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:20px;
+       background:#FDF0E7;color:#C2410C;border:1px solid #F3D9C6;margin-left:6px;vertical-align:2px}
+  .tag.g{background:#F1F5F4;color:#0F766E;border-color:#D7E5E2}
+  .arrow{display:flex;align-items:center;justify-content:center;color:#C2410C;
+         font-size:20px;font-weight:700;padding:0 2px;min-width:26px}
+  .vline{width:2px;background:#E7E1D8;margin:0 auto}
+  .lane{background:#F5F1EA;border-radius:14px;padding:14px;display:flex;gap:12px;align-items:stretch}
+  .lane-title{writing-mode:vertical-rl;font-size:12px;font-weight:700;color:#8A8178;
+              letter-spacing:3px;display:flex;align-items:center;justify-content:center;padding:0 2px}
+  .foot{margin-top:22px;font-size:12px;color:#7A7268;line-height:1.7}
+  code{background:#F5F1EA;padding:1px 6px;border-radius:5px;font-size:11.5px;color:#8A4B1D}
+</style></head>
+<body>
+  <h1>总流程 · MiniMax H3 硬切二采</h1>
+  <div class="sub">提示词写"哪一秒换镜头" → 执行器按 17 帧网格切成窗口 → 逐窗重生成 → 拼接成片</div>
+
+  <div class="row" style="align-items:center;gap:0">
+    <div class="col" style="flex:0 0 210px">
+      <div class="card"><div class="t">参考图 ×N</div><div class="n">角色 / 场景（&lt;Subject&gt;）</div></div>
+      <div class="card"><div class="t">提示词</div><div class="n">官方六段 · 含切点时间戳</div></div>
+      <div class="card"><div class="t">画布规格</div><div class="n">宽高比 / MP / 片长</div></div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:0 0 250px">
+      <div class="card hi">
+        <div class="t">上游规划<span class="tag">#102</span></div>
+        <div class="n">画布 + 切点规划 + 一采开关<br>
+        输出 <code>plan</code> / prompt / 宽度 / length</div>
+      </div>
+      <div class="card" style="border-style:dashed">
+        <div class="t" style="color:#7A7268">提示词校验</div>
+        <div class="n">时间戳对不上 → 拦停并给出正确值</div>
+      </div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:1">
+      <div class="lane">
+        <div class="lane-title">一 采</div>
+        <div class="card" style="flex:1">
+          <div class="t">一采采样器<span class="tag g">#93</span><span class="tag">可缓存</span></div>
+          <div class="n">
+            指纹命中 → 直接读回一采 latent（跳过采样，省 ~9 分钟）<br>
+            未命中 → 采样并写缓存<br>
+            <span style="color:#0F766E">开关全部来自 plan，节点本身零控件</span>
+          </div>
+        </div>
+      </div>
+      <div style="text-align:center;color:#C2410C;font-size:18px;font-weight:700;margin:2px 0">▼ 一采 latent</div>
+      <div class="lane" style="background:#FDF6EF">
+        <div class="lane-title">二 采</div>
+        <div class="card" style="flex:1">
+          <div class="t">二采执行器<span class="tag">#40</span></div>
+          <div class="n">
+            逐窗：切片 → 上采样(时间重叠) → 锚定 → 采样 → 装配(拼缝) → 可选缝窗重去噪<br>
+            <span style="color:#C2410C">全部二采参数来自「下游规划」pass2_plan</span>
+          </div>
+        </div>
+        <div class="card" style="flex:0 0 190px;border-style:dashed">
+          <div class="t" style="color:#7A7268">下游规划<span class="tag">#100</span></div>
+          <div class="n">27 个二采参数<br>改了不触发一采重采</div>
+        </div>
+      </div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:0 0 150px">
+      <div class="card"><div class="t">解码</div><div class="n">AVDecodeT8</div></div>
+      <div class="card"><div class="t">合成</div><div class="n">VHS_VideoCombine</div></div>
+      <div class="card hi" style="text-align:center"><div class="t" style="font-size:15px">成片 mp4</div></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>两条铁律：</b>① 上游规划的任何改动 → 一采指纹变 → <b>必须重采</b>（画布/切点/开关本就在于一采）；
+    ② 下游规划的任何改动 → <b>不重采</b>（它在一采下游，指纹看不见它）。
+  </div>
+</body></html>

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{width:1440px;padding:36px 44px;background:#FBF8F3;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#2B2622}
+  h1{font-size:22px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13px;color:#7A7268;margin-bottom:30px}
+  .axis{position:relative;height:150px;margin:10px 0 6px}
+  .bar{position:absolute;top:56px;height:34px;border-radius:7px;display:flex;
+       align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff}
+  .w0{left:0;width:23.5%;background:#C2410C}
+  .w1{left:23.5%;width:28.2%;background:#D97757}
+  .w2{left:51.7%;width:23.5%;background:#C2410C}
+  .w3{left:75.2%;width:24.8%;background:#D97757}
+  .tick{position:absolute;top:44px;width:2px;height:58px;background:#2B2622}
+  .lbl{position:absolute;top:112px;font-size:12px;color:#57534E;transform:translateX(-50%)}
+  .frame{position:absolute;top:26px;font-size:12px;font-weight:700;color:#2B2622;transform:translateX(-50%)}
+  .note{position:absolute;top:130px;font-size:11px;color:#C2410C;transform:translateX(-50%);white-space:nowrap}
+  .row{display:flex;gap:14px;margin-top:16px}
+  .card{background:#fff;border:1.5px solid #E7E1D8;border-radius:12px;padding:13px 15px;flex:1}
+  .t{font-size:13.5px;font-weight:700;margin-bottom:5px}
+  .n{font-size:11.5px;color:#7A7268;line-height:1.6}
+  code{background:#F5F1EA;padding:1px 6px;border-radius:5px;font-size:11px;color:#8A4B1D}
+  .hi{border-color:#C2410C}
+</style></head>
+<body>
+  <h1>时间轴与窗口划分</h1>
+  <div class="sub">示例：15 秒 / 24fps = 362 帧，<code>target_segment_seconds=4.96</code> → 切点 85 / 187 / 272（只能落 17 的倍数）</div>
+
+  <div class="axis">
+    <div class="frame" style="left:0">帧 0</div>
+    <div class="frame" style="left:23.5%">85</div>
+    <div class="frame" style="left:51.7%">187</div>
+    <div class="frame" style="left:75.2%">272</div>
+    <div class="frame" style="left:100%">362</div>
+    <div class="bar w0">窗口 0</div>
+    <div class="bar w1">窗口 1</div>
+    <div class="bar w2">窗口 2</div>
+    <div class="bar w3">窗口 3</div>
+    <div class="tick" style="left:23.5%"></div>
+    <div class="tick" style="left:51.7%"></div>
+    <div class="tick" style="left:75.2%"></div>
+    <div class="lbl" style="left:23.5%">3.542s</div>
+    <div class="lbl" style="left:51.7%">7.792s</div>
+    <div class="lbl" style="left:75.2%">11.333s</div>
+    <div class="note" style="left:23.5%">↑ 缝 1</div>
+    <div class="note" style="left:51.7%">↑ 缝 2</div>
+    <div class="note" style="left:75.2%">↑ 缝 3</div>
+  </div>
+
+  <div class="row">
+    <div class="card hi">
+      <div class="t">每个缝隙怎么处理</div>
+      <div class="n">hunt 测到真转镜压在边界 → <b>硬切</b>；测不到/对不上 → calm 在 ±窗内找最平缓的独占帧挪过去 → <b>锚定 overlap</b>；都不行 → 保计划点 + overlap</div>
+    </div>
+    <div class="card">
+      <div class="t">17 帧网格从哪来</div>
+      <div class="n">H3 的时间 token = 17 帧一组（17f→5 token）。边界落在 17 的倍数上，模型才有一个"干净的独占帧"可以放转镜</div>
+    </div>
+    <div class="card">
+      <div class="t">你只需要管两件事</div>
+      <div class="n">① <code>total_seconds</code> 片长　② <code>target_segment_seconds</code> 每段上限——切点由节点算出来写进报告，提示词照抄它的 <code>cut points</code></div>
+    </div>
+  </div>
+</body></html>

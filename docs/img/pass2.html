@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{width:1440px;padding:36px 44px;background:#FBF8F3;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#2B2622}
+  h1{font-size:22px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13px;color:#7A7268;margin-bottom:28px}
+  .steps{display:flex;align-items:stretch;gap:10px}
+  .step{flex:1;background:#fff;border:1.5px solid #E7E1D8;border-radius:12px;padding:13px 14px;position:relative}
+  .step.hi{border-color:#C2410C;box-shadow:0 0 0 3px rgba(194,65,12,.08)}
+  .num{display:inline-flex;width:22px;height:22px;border-radius:50%;background:#C2410C;color:#fff;
+       align-items:center;justify-content:center;font-size:12px;font-weight:700;margin-bottom:8px}
+  .t{font-size:13.5px;font-weight:700;margin-bottom:5px}
+  .n{font-size:11.5px;color:#7A7268;line-height:1.6}
+  .n b{color:#2B2622}
+  .arrow{display:flex;align-items:center;color:#C2410C;font-size:18px;font-weight:700}
+  code{background:#F5F1EA;padding:1px 5px;border-radius:5px;font-size:11px;color:#8A4B1D}
+  .foot{margin-top:20px;background:#FDF6EF;border:1.5px solid #F3D9C6;border-radius:12px;padding:14px 16px;
+        font-size:12.5px;color:#7A4A22;line-height:1.7}
+</style></head>
+<body>
+  <h1>二采执行器 · 每个窗口做六件事</h1>
+  <div class="sub">窗口 = 时间轴上的一个切片（例：窗口 1 = 帧 68→203）；步骤按顺序执行，窗口之间共享同一套参数</div>
+
+  <div class="steps">
+    <div class="step">
+      <div class="num">1</div>
+      <div class="t">切片</div>
+      <div class="n">取本窗 token 区间<br>锚定的缝会带上<b>前缀 token</b></div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="step hi">
+      <div class="num">2</div>
+      <div class="t">上采样</div>
+      <div class="n">3D upscaler 逐窗处理<br><b>向两侧各借 3 个一采 token</b>，升完裁回本窗<br><span style="color:#0F766E">← 时间重叠，治"分块尾软化"</span></div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="step">
+      <div class="num">3</div>
+      <div class="t">锚定</div>
+      <div class="n">本窗开头的 <code>anchor_tokens</code> 个 token 钉在上一窗输出上（keyframe 条件，不去噪）</div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="step">
+      <div class="num">4</div>
+      <div class="t">采样</div>
+      <div class="n">DualClock 采样器整窗重生成<br>显存 = 段帧数 × 二采 MP（有负载护栏）</div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="step hi">
+      <div class="num">5</div>
+      <div class="t">装配</div>
+      <div class="n">本窗输出接进累积结果：<br><b>硬切</b> / <b>冻结锚定</b> / <b>交叉淡化</b>（见下一图）</div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="step">
+      <div class="num">6</div>
+      <div class="t">（可选）缝窗重去噪</div>
+      <div class="n">只对选中的缝重采样缝窗内部<br>默认关闭；用 <code>stroke_check</code> 事后否决伪纹理</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>这一步之后</b>：整条 latent 交给解码节点（AVDecodeT8）→ 合成节点写 mp4。
+    <b>窗口之间没有上下文传递</b>——除了第 3 步的锚定 keyframe 和第 5 步的重叠区，两个窗口是各自独立生成的：这就是"拼缝"要专门处理的根本原因。
+  </div>
+</body></html>

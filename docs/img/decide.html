@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{width:1440px;padding:34px 44px;background:#FBF8F3;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#2B2622}
+  h1{font-size:22px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13px;color:#7A7268;margin-bottom:24px}
+  .grid{display:grid;grid-template-columns:1fr 60px 1fr;gap:0;align-items:start}
+  .card{background:#fff;border:1.5px solid #E7E1D8;border-radius:12px;padding:13px 15px;margin-bottom:11px}
+  .card.hi{border-color:#C2410C;box-shadow:0 0 0 3px rgba(194,65,12,.08)}
+  .card.g{background:#F5F8F7;border-color:#D7E5E2}
+  .t{font-size:13.5px;font-weight:700;margin-bottom:4px}
+  .n{font-size:11.5px;color:#7A7268;line-height:1.6}
+  .n b{color:#2B2622}
+  code{background:#F5F1EA;padding:1px 5px;border-radius:5px;font-size:11px;color:#8A4B1D}
+  .arw{display:flex;align-items:center;justify-content:center;font-size:20px;color:#C2410C;font-weight:700;height:100%}
+  .head{font-size:12px;font-weight:700;letter-spacing:2px;color:#8A8178;margin-bottom:10px}
+</style></head>
+<body>
+  <h1>hunt 与 calm · 一条缝怎么定形</h1>
+  <div class="sub">每个计划切点独立走一遍这条流程；两个搜索都只看一采 latent（不用 VAE，秒级）</div>
+
+  <div class="grid">
+    <div>
+      <div class="head">HUNT —— 找"模型真正换镜头的那一帧"</div>
+      <div class="card">
+        <div class="t">① 变化剖面</div>
+        <div class="n">一采 latent 逐 token 算变化量（全局变化 与 jerk 取更差者）</div>
+      </div>
+      <div class="card">
+        <div class="t">② 在 ±<code>hunt_search_window</code> 内取最大峰</div>
+        <div class="n">转镜 = 整片最剧烈的 latent 变化</div>
+      </div>
+      <div class="card hi">
+        <div class="t">③ 两道门禁</div>
+        <div class="n">
+          <b>持续性</b> ≥ <code>hunt_min_persistence</code>（0.8）<br>
+          真切断要"留在别处"；闪烁/抖动过不了<br><br>
+          <b>转镜置信</b> ≥ <code>2.0</code>（内置）<br>
+          防"锁定镜头里的姿势跳变"被误判为转镜
+        </div>
+      </div>
+      <div class="card g">
+        <div class="t">④ 通过 → 吸附到最近 17k 帧 → 硬切</div>
+        <div class="n">残差 ≤ <code>seam_tolerance_frames</code> 才算"压在转镜上"</div>
+      </div>
+    </div>
+
+    <div class="arw">➜</div>
+
+    <div>
+      <div class="head">CALM —— hunt 不可靠时挪到"最平缓的地方"</div>
+      <div class="card">
+        <div class="t">① 在 ±<code>calm_search_window</code> 内找最安静的 17k 独占帧</div>
+        <div class="n">用同一份剖面；<code>profile_camera_compensate</code> 可先把纯运镜抵消</div>
+      </div>
+      <div class="card hi">
+        <div class="t">② 四道门（任一不过就退回计划点）</div>
+        <div class="n">
+          <code>calm_min_gain</code> 0.15 —— 候选要比计划点安静 ≥15%<br>
+          <code>calm_too_quiet_below</code> 0.05 —— 过于静止不动（防顿挫）<br>
+          <code>calm_min_quality</code> 0.8 —— 仍不够安静 → 退回硬切<br>
+          <code>calm_abstain_below</code> 0 —— 整片太平淡 → 全程不搜
+        </div>
+      </div>
+      <div class="card g">
+        <div class="t">③ 挪动 → 该缝给锚定 overlap</div>
+        <div class="n">另有负载护栏：挪动若把窗口撑过负载线 → 撤销挪动</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:14px;background:#FDF6EF;border:1.5px solid #F3D9C6;border-radius:12px;padding:13px 16px;font-size:12.5px;color:#7A4A22;line-height:1.65">
+    <b>为什么这样分工：</b>hunt 回答"这里能不能硬切"——它对就一刀下去，接缝消失在内容本该断的地方；
+    hunt 拿不准时，calm 回答"那挪到哪儿最不容易被看见"。两者都靠一采 latent 的同一份变化剖面，零额外显存。
+  </div>
+</body></html>

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{width:1440px;padding:36px 44px;background:#FBF8F3;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#2B2622}
+  h1{font-size:22px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13px;color:#7A7268;margin-bottom:26px}
+  .panels{display:flex;gap:16px}
+  .p{flex:1;background:#fff;border:1.5px solid #E7E1D8;border-radius:13px;padding:15px 16px}
+  .p.hi{border-color:#C2410C;box-shadow:0 0 0 3px rgba(194,65,12,.08)}
+  .t{font-size:14px;font-weight:700;margin-bottom:3px}
+  .when{font-size:11px;color:#C2410C;margin-bottom:12px}
+  .strip{display:flex;height:44px;border-radius:7px;overflow:hidden;border:1px solid #E7E1D8;margin-bottom:8px}
+  .seg{display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff}
+  .a{background:#C2410C}.b{background:#D97757}
+  .mix{background:linear-gradient(90deg,#C2410C 0%,#D97757 35%,#D97757 65%,#D97757 100%);color:#fff}
+  .n{font-size:11.5px;color:#7A7268;line-height:1.65;margin-top:8px}
+  .n b{color:#2B2622}
+  .legend{margin-top:20px;display:flex;gap:22px;font-size:12px;color:#57534E}
+  .dot{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+  .foot{margin-top:16px;background:#FDF6EF;border:1.5px solid #F3D9C6;border-radius:12px;padding:13px 16px;
+        font-size:12.5px;color:#7A4A22;line-height:1.65}
+</style></head>
+<body>
+  <h1>拼缝三态 · 重叠区怎么处理</h1>
+  <div class="sub">产出同一条 latent，交给同一次解码；区别只在重叠区那十几帧取谁的值</div>
+
+  <div class="panels">
+    <div class="p hi">
+      <div class="t">① 硬切</div>
+      <div class="when">hunt 测到真转镜正压在边界</div>
+      <div class="strip">
+        <div class="seg a" style="width:50%">窗口 A</div>
+        <div class="seg b" style="width:50%">窗口 B</div>
+      </div>
+      <div class="n">重叠 0：B 从边界处<b>全新生成</b>。<br>
+      内容本来就该在这一帧断 → 看不出接缝 ✓<br>
+      <span style="color:#C2410C">要求：提示词里这一帧必须写了换镜头</span></div>
+    </div>
+
+    <div class="p">
+      <div class="t">② 冻结锚定（默认）</div>
+      <div class="when">hunt 拒绝 / calm 挪过界</div>
+      <div class="strip">
+        <div class="seg a" style="width:50%">窗口 A</div>
+        <div class="seg a" style="width:17%;background:#E88A63">A 的前缀</div>
+        <div class="seg b" style="width:33%">B 新生成</div>
+      </div>
+      <div class="n">重叠 17 帧：前缀<b>逐字</b>取 A 的输出 → 零重影 ✓<br>
+      代价：那 17 帧的"A | B"交界仍是一次硬接——两窗背景画得不一样时表现为<b>跳变</b></div>
+    </div>
+
+    <div class="p">
+      <div class="t">③ 交叉淡化 <span style="font-size:11px;color:#0F766E">seam_blend=true</span></div>
+      <div class="when">静止 / 慢速镜头</div>
+      <div class="strip">
+        <div class="seg a" style="width:50%">窗口 A</div>
+        <div class="seg mix" style="width:50%">A→B 线性溶解</div>
+      </div>
+      <div class="n">重叠区内两窗 latent 按 0→1 线性混合再解码 → 跳变被摊成柔和过渡 ✓<br>
+      <span style="color:#C2410C">运动镜头风险：两窗差异大 → 重影 / 糊团</span></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><span class="dot" style="background:#C2410C"></span>窗口 A 生成</span>
+    <span><span class="dot" style="background:#E88A63"></span>A 的前缀（逐字冻结）</span>
+    <span><span class="dot" style="background:#D97757"></span>窗口 B 生成</span>
+  </div>
+
+  <div class="foot">
+    <b>怎么选：</b>动作/运镜剧烈的片 → 冻结（②）；对话/静态镜头 → 交叉淡化（③）；提示词切点极准、想要干脆的剪辑 → 硬切（①，overlap_frames=0）。
+    判据不是"哪个更高级"，而是<b>两个窗口在重叠区画得像不像</b>——像 → 淡化；不像 → 冻结或硬切。
+  </div>
+</body></html>
