@@ -596,9 +596,6 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
             ],
             outputs=[
                 PLAN_TYPE.Output("plan"),
-            io.Boolean.Output("use_cache"),
-            io.String.Output("cache_key"),
-            io.Boolean.Output("require_sage_patch"),
                 io.String.Output("prompt"),
                 io.String.Output("report"),
                 io.Int.Output("first_width", tooltip="First-pass width (from first_megapixels)."),
@@ -844,7 +841,6 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
             second_w,
             second_h,
             info["total_frames"],
-            float(second_pass_sigma0),
             ui={"text": (report,)},
         )
 
