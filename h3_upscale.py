@@ -1216,6 +1216,7 @@ def execute(
     dump_latents: bool = False,
     dump_dir: str = "",
     upscale_pad_tokens: int = 0,
+    seam_blend: bool = False,
 ):
     core = _core()
     learned = _learned()
@@ -1687,7 +1688,7 @@ def execute(
         # moving.  But freezing means the boundary is still a hard join, which
         # reads as a cut - so it is now a switch, and blending is available for
         # material where ghosting is not a risk (still or slow shots).
-        if seg_overlap and not bool((plan.get("hardcut") or {}).get("seam_blend", False)):
+        if seg_overlap and not (bool(seam_blend) or bool((plan.get("hardcut") or {}).get("seam_blend", False))):
             # guarded overlap: the first `locked_overlap` tokens stay exactly as
             # the previous window published them, the remaining `transition`
             # tokens take this window's fresh sample, then the rest is appended.
@@ -1989,6 +1990,18 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                     default="D:\\comfyui\\_hardcut_work\\latent_dump\\",
                     optional=True,
                     tooltip="dump_latents 的输出目录（建议带运行标签，如 ...\\latent_dump\\A2_20260925\\）。",
+                ),
+                io.Boolean.Input(
+                    "seam_blend",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "锚定缝用 latent 域线性交叉淡化（普通 overlap）替代冻结式："
+                        "重叠 17 帧内两窗 latent 线性溶解后再解码。静止/慢速镜头适用"
+                        "（无重影风险，背景跳变摊成柔和过渡）；运动镜头会重影。"
+                        "★ 放在本节点（下游）而在规划节点上——改这里**不会击穿一采缓存**"
+                        "（规划节点在一采上游链里，改它的开关会触发重采样）。"
+                    ),
                 ),
                 io.Int.Input(
                     "upscale_pad_tokens",
