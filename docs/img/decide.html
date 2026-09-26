@@ -50,7 +50,7 @@
     <div class="arw">➜</div>
 
     <div>
-      <div class="head">CALM —— hunt 不可靠时挪到"最平缓的地方"</div>
+      <div class="head">CALM —— hunt 不可靠时怎么放这条缝</div>
       <div class="card">
         <div class="t">① 在 ±<code>calm_search_window</code> 内找最安静的 17k 独占帧</div>
         <div class="n">用同一份剖面；<code>profile_camera_compensate</code> 可先把纯运镜抵消</div>
@@ -65,8 +65,14 @@
         </div>
       </div>
       <div class="card g">
-        <div class="t">③ 挪动 → 该缝给锚定 overlap</div>
-        <div class="n">另有负载护栏：挪动若把窗口撑过负载线 → 撤销挪动</div>
+        <div class="t">③ 落缝策略（<code>calm_policy</code>）——按片子类型选</div>
+        <div class="n">
+          <b>calm_overlap</b>（默认，静态/对话片）<br>
+          挪到最平缓的独占帧 + 给锚定 overlap<br><br>
+          <b>jerk_hardcut</b>（动作/运镜剧烈片）<br>
+          反过来挪到 <b>jerk 最猛处</b>：burst = jerk[t−5]+jerk[t]+jerk[t+5]（3-token 窗，防单点尖峰）<br>
+          → <b>硬切、不锚定</b>。运动把切藏起来；且高 jerk 处模型本就在糊，两窗锐度台阶最小
+        </div>
       </div>
     </div>
   </div>

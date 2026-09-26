@@ -115,12 +115,14 @@
 `pers ≥ hunt_min_persistence(0.8)` → `global ≥ FLAT_RATIO(1.6)` → `global ≥ HUNT_MIN_CUT_RATIO(2.0)` →
 吸附到最近 17k 帧 → 残差 ≤ `seam_tolerance_frames` 才判"压在转镜上" → 硬切。
 
-### ⑤ calm：hunt 不可靠时"挪到最平缓的地方"
+### ⑤ calm：hunt 不可靠时怎么放这条缝
+
+⚠ 注意：这里**有两条方向相反的策略**（`calm_policy`），不是只有"找最平缓"。
 
 **取分**：与 hunt 同源的 `score[i] = max(global[i], jerk[i])`（两个视角都安静才算真安静）。
-**扫描**：在 `计划切点 ± calm_search_window`（默认 34，你的配置 51）内逐 17k 独占帧评估，取分数最低者为候选。
+**候选**：`计划切点 ± calm_search_window`（默认 34，你的配置 51）内的全部 17k 独占帧。
 
-四道门（任一不过就退回计划点）：
+**策略 A · `calm_overlap`（默认，静态/对话片）**——取分数**最低**者为候选，四道门（任一不过退回计划点）：
 
 | 门 | 默认 | 语义 |
 |---|---|---|
@@ -129,7 +131,20 @@
 | `calm_min_quality` | 0.8 | 候选分数仍 > 0.8 × 全片中位 → 不值得搜 → 退回计划点**硬切** |
 | `calm_abstain_below` | 0（关） | 全片 jerk 对比度 max/mean 低于本值 → 整片不搜、全保计划 |
 
-另有**负载护栏**：挪动若使某段 `帧数 × canvas_mp ≥ 负载线` → 撤销挪动、退回计划点。
+挪动成功 → 该缝给 `calm_overlap_frames`（17f）的锚定 overlap。
+
+**策略 B · `jerk_hardcut`（动作 / 运镜剧烈片）**——**反过来**取 jerk **最猛**者为候选：
+
+```text
+   burst(f) = jerk[t−5] + jerk[t] + jerk[t+5]        ← 3-token 窗（同相），防单点尖峰胜出
+   peak = max(候选, key=burst)  →  硬切，overlap = 0（**不锚定**）
+   burst 全为 0（全片无 jerk）→ 退回计划点，硬切
+```
+
+设计理由（代码注释原话）：**运动把切藏起来**；而且高 jerk 处模型本来就在"放弃、糊掉"——
+两个窗口之间的**锐度台阶在"两块都糊的帧"之间最小**。这里连续性不是目标，**藏得住**才是。
+
+**负载护栏**（两条策略共用）：挪动若使某段 `帧数 × canvas_mp ≥ 负载线` → 撤销挪动、退回计划点。
 
 ### ⑥ 缝窗重去噪（`seam_redenoise`，默认关）
 
@@ -270,7 +285,7 @@
 | `calm_min_quality` | 逐缝质量门 | 0.8 | 保持 | 0.80 |
 | `calm_too_quiet_below` | 过静保护 | 0.05 | 保持 | 0.05 |
 | `calm_abstain_below` | 整片平淡时放弃搜索 | 0 | 动作片可设 2.0 | 0.00 |
-| `calm_policy` | 拒绝后策略 | calm_overlap | 保持 | calm_overlap |
+| `calm_policy` | 落缝策略（两条方向相反） | calm_overlap | **动作/运镜剧烈 → jerk_hardcut** | calm_overlap / jerk_hardcut |
 | `profile_camera_compensate` | 剖面做镜头补偿 | False | **提示词有运镜时开** | **true** |
 | `profile_reduce` | 剖面聚合方式 | mean | 保持 | mean |
 
@@ -298,8 +313,8 @@
 
 | 场景 | 建议 |
 |---|---|
-| **动作 / 运镜剧烈的片** | `overlap_frames=17` + `auto_seam_hunt=true` + `auto_calm_search=true` + `profile_camera_compensate=true` + `seam_blend=false` |
-| **对话 / 静态镜头片** | 同上，但 `seam_blend=true`（交叉淡化在静止内容上零重影，能抹掉背景跳变） |
+| **动作 / 运镜剧烈的片** | `overlap_frames=17` + `auto_seam_hunt=true` + `auto_calm_search=true` + `profile_camera_compensate=true` + **`calm_policy=jerk_hardcut`（缝藏进最猛的运动里）** + `seam_blend=false` |
+| **对话 / 静态镜头片** | 同上，但 `calm_policy=calm_overlap`（缝挪到最平缓处）+ `seam_blend=true`（交叉淡化在静止内容上零重影，能抹掉背景跳变） |
 | **只想快速出片（不追缝）** | `overlap_frames=0`（全硬切）+ hunt/calm 关 —— 要求提示词里的切点非常准 |
 | **缝有台阶、想定点修** | `seam_redenoise=true` + `seam_redenoise_frames="187"` 单缝试，之后用 `stroke_check` 检查裂纹 |
 | **换剧情/换片** | 改 `cache_key`（避免读到上一条片的缓存） |
