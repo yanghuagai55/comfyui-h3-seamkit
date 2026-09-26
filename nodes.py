@@ -464,14 +464,6 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
                     step=0.5,
                     tooltip="Clip length in seconds. Snapped to the 17n+5 frame grid.",
                 ),
-                io.Int.Input("video_steps", default=6, min=1, max=1000,
-                             tooltip="一采视频步数（原在采样器节点上，挪来统一管）。"),
-                io.Int.Input("audio_steps", default=8, min=1, max=1000,
-                             tooltip="一采音频微步数（≥ video_steps）。"),
-                io.Float.Input("shift_video", default=12.0, min=0.01, max=100.0, step=0.01,
-                               tooltip="一采视频 shift（原在采样器节点上）。"),
-                io.Float.Input("shift_audio", default=3.0, min=0.01, max=100.0, step=0.01,
-                               tooltip="一采音频 shift。"),
                 io.Boolean.Input(
                     "use_cache", default=True,
                     tooltip="一采缓存总开关（原在采样器节点上，挪到本节点统一管）。关=纯采样器。"),
@@ -605,10 +597,6 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
             io.Boolean.Output("use_cache"),
             io.String.Output("cache_key"),
             io.Boolean.Output("require_sage_patch"),
-            io.Int.Output("video_steps"),
-            io.Int.Output("audio_steps"),
-            io.Float.Output("shift_video"),
-            io.Float.Output("shift_audio"),
                 io.String.Output("prompt"),
                 io.String.Output("report"),
                 io.Int.Output("first_width", tooltip="First-pass width (from first_megapixels)."),
@@ -657,10 +645,6 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         use_cache: bool = True,
         cache_key: str = "s15_cam",
         require_sage_patch: bool = True,
-        video_steps: int = 6,
-        audio_steps: int = 8,
-        shift_video: float = 12.0,
-        shift_audio: float = 3.0,
     ):
         w_ratio, h_ratio = aspect_ratios().get(
             aspect_ratio, aspect_ratios()[default_aspect()]
@@ -1128,16 +1112,6 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             category="MiniMax H3 Hard Cut",
             is_experimental=True,
             inputs=[
-                io.Int.Input("steps", default=3, min=1, max=1000,
-                             tooltip="二采步数（原在采样器节点上，挪来统一管）。"),
-                io.Float.Input("shift_video", default=12.0, min=0.01, max=100.0, step=0.01,
-                               tooltip="二采视频 shift。"),
-                io.Float.Input("shift_audio", default=3.0, min=0.01, max=100.0, step=0.01,
-                               tooltip="二采音频 shift。"),
-                io.String.Input("sampler_name", default="dual_clock_euler",
-                                tooltip="二采采样器名（原在采样器节点上）。"),
-                io.String.Input("scheduler", default="native_flow",
-                                tooltip="二采调度器名。"),
                 io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.001,
                                tooltip="锚定强度（接口兼容保留）。"),
                 io.Combo.Input("second_pass_audio_policy", options=list(AUDIO_POLICIES),
@@ -1186,18 +1160,11 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             ],
             outputs=[
                 PASS2_TYPE.Output("pass2_plan"),
-                io.Int.Output("steps"),
-                io.Float.Output("shift_video"),
-                io.Float.Output("shift_audio"),
-                io.String.Output("sampler_name"),
-                io.String.Output("scheduler"),
             ],
         )
 
     @classmethod
-    def execute(cls, steps: int = 3, shift_video: float = 12.0, shift_audio: float = 3.0,
-                sampler_name: str = "dual_clock_euler", scheduler: str = "native_flow",
-                anchor_strength: float = 0.999,
+    def execute(cls, anchor_strength: float = 0.999,
                 second_pass_audio_policy: str = None, seam_tolerance_frames: int = 4,
                 calm_search_window: int = 34, calm_policy: str = "calm_overlap",
                 profile_camera_compensate: bool = False, profile_reduce: str = "mean",
@@ -1212,11 +1179,6 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                 dump_dir: str = "", show_memory_log: bool = True):
         plan = {
             "schema": PASS2_TYPE_STRING,
-            "steps": int(steps),
-            "shift_video": float(shift_video),
-            "shift_audio": float(shift_audio),
-            "sampler_name": str(sampler_name),
-            "scheduler": str(scheduler),
             "anchor_strength": float(anchor_strength),
             "second_pass_audio_policy": str(second_pass_audio_policy or AUDIO_POLICIES[0]),
             "seam_tolerance": int(seam_tolerance_frames),
@@ -1249,5 +1211,4 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                  plan["upscale_pad_tokens"], plan["seam_blend"],
                  "on" if plan["seam_redenoise"] else "off", plan["seam_redenoise_gate"]),
               flush=True)
-        return io.NodeOutput(plan, int(steps), float(shift_video), float(shift_audio),
-                             str(sampler_name), str(scheduler))
+        return io.NodeOutput(plan)
