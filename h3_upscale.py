@@ -1265,6 +1265,17 @@ def execute(
         cfg = float(_p2("cfg", cfg))
         auto_seam_hunt = bool(_p2("auto_seam_hunt", auto_seam_hunt))
         show_memory_log = bool(_p2("show_memory_log", show_memory_log))
+
+        # 下游覆盖上游 plan 的 6 个二采专用字段（浅拷贝，不污染上游输出）
+        plan = dict(plan)
+        for _k in ("model_name", "precision", "release_policy",
+                   "auto_calm_search", "calm_overlap_frames"):
+            _v = _p2(_k, plan.get(_k))
+            if _v is not None and _v != "":
+                plan[_k] = _v
+        _ov = _p2("overlap_frames", None)
+        if _ov is not None:
+            plan["temporal_overlap_frames"] = max(0, int(_ov))
         seam_redenoise = bool(_p2("seam_redenoise", seam_redenoise))
         seam_redenoise_frames = str(_p2("seam_redenoise_frames", seam_redenoise_frames))
         seam_window_tokens = int(_p2("seam_window_tokens", seam_window_tokens))
@@ -1474,11 +1485,11 @@ def execute(
     calm_overlaps = None
     if planned and isinstance(plan.get("hardcut"), dict):
         _hc = plan["hardcut"]
-        if _hc.get("auto_calm_search"):
+        if _p2("auto_calm_search", _hc.get("auto_calm_search")):
             calm_boundaries, calm_overlaps, _calm_notes = find_calm_boundaries(
                 profile, planned, aligned, frame_count,
                 window=int(_hc.get("calm_search_window", 34)),
-                overlap_frames=int(_hc.get("calm_overlap_frames", 17)),
+                overlap_frames=int(_p2("calm_overlap_frames", _hc.get("calm_overlap_frames", 17))),
                 seam_tolerance=int(_hc.get("seam_tolerance", 17)),
                 policy=str(_hc.get("calm_policy", "calm_overlap")),
                 abstain_below=float(_hc.get("calm_abstain_below", 0.0)),
@@ -1540,7 +1551,7 @@ def execute(
     # segments keeps the footprint flat; the models stay loaded (this is
     # soft_empty_cache, never unload_all_models).
     _empty_between = bool((plan.get("hardcut") or {}).get("empty_cache_between_segments", True))
-    ov_input = max(0, int(plan.get("temporal_overlap_frames", 0)))
+    ov_input = max(0, int(_p2("overlap_frames", plan.get("temporal_overlap_frames", 0))))
     _chunk = int(plan.get("temporal_chunk_frames") or 0)
     ov_tokens = ov_input
     if _chunk > 0 and ov_input >= _chunk:

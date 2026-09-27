@@ -531,62 +531,9 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
                     tooltip="Round both canvases to this multiple (H3 wants 32).",
                     advanced=True,
                 ),
-                io.Combo.Input("model_name", options=upscaler_options()),
-                io.Combo.Input(
-                    "precision",
-                    options=list(PRECISIONS),
-                    default="bf16",
-                    advanced=True,
-                ),
-                io.Combo.Input(
-                    "release_policy",
-                    options=list(RELEASE_POLICIES),
-                    default="clear_after",
-                    advanced=True,
-                ),
 
 
-                io.Int.Input(
-                    "overlap_frames",
-                    default=0,
-                    min=0,
-                    max=2048,
-                    step=17,
-                    tooltip=(
-                        "★ 段间重叠（帧，17 的倍数）。0 = 硬切（现在的行为）。\n"
-                        "> 0 时每段的**起点向前回看本值帧**，采样器把该段第一个 token "
-                        "锚在上一段已生成的结果上（强度 = anchor_strength），接缝因此"
-                        "不再是两条独立结果的硬拼。\n"
-                        "**送入采样器的值会被自动压到 < chunk**（一整个窗口就没内容可生成了）。\n"
-                        "负载按 (最长段 + 本值) 算：15s/1.5MP 下 **17 已经到 178.5，34 会爆**。"
-                    ),
-                    advanced=True,
-                ),
-                io.Boolean.Input(
-                    "auto_calm_search",
-                    default=False,
-                    tooltip=(
-                        "★ 自适应平缓搜索（需要 `#40` 的 `auto_seam_hunt` 一起开）。\n"
-                        "hunt 判定某个切点**不可靠**时（没检测到转镜，或检测到的位置离计划点"
-                        "超过 `seam_tolerance_frames`），不再硬切在计划点上，而是在 **± "
-                        "`calm_search_window`** 范围内找 **latent 变化最小的独占帧**，"
-                        "把边界挪过去，并给那条缝开 `calm_overlap_frames` 的重叠锚定。\n"
-                        "目的：接缝既不落在内容剧变处，也不用两条独立结果硬拼。"
-                    ),
-                ),
 
-                io.Int.Input(
-                    "calm_overlap_frames",
-                    default=17,
-                    min=0,
-                    max=1632,
-                    step=17,
-                    tooltip=(
-                        "平缓缝使用的重叠（帧）。17 = 一个 token 组。\n"
-                        "负载按 (最长窗 + 本值) 算——15s/1.5MP 下 17 已到 178.5，34 会爆。"
-                    ),
-                    advanced=True,
-                ),
 
 
 
@@ -619,9 +566,9 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         second_megapixels: float,
         aspect_ratio: str,
         multiple: int,
-        model_name: str,
-        precision: str,
-        release_policy: str,
+        model_name: str = "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+        precision: str = "bf16",
+        release_policy: str = "clear_after",
         anchor_strength: float = 0.999,
         second_pass_audio_policy: str = "joint_av_preserve_input",
         second_pass_sigma0: float = 0.30,
@@ -1118,6 +1065,15 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             inputs=[
                 io.Float.Input("cfg", default=1.0, min=0.0, max=100.0, step=0.1,
                                tooltip="二采 CFG（原在 #40 上，挪来统一管）。"),
+                io.Combo.Input("model_name", options=upscaler_options(),
+                               tooltip="上采样模型（二采才用，从上游搬来）。"),
+                io.Combo.Input("precision", options=list(PRECISIONS), default="bf16",
+                               tooltip="上采样模型精度。"),
+                io.Combo.Input(
+                    "release_policy",
+                    options=list(RELEASE_POLICIES),
+                    default="clear_after",
+                    tooltip="上采样模型释放策略。"),
                 io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.001,
                                tooltip="锚定强度（接口兼容保留）。"),
                 io.Combo.Input("second_pass_audio_policy", options=list(AUDIO_POLICIES),
@@ -1131,10 +1087,18 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                                tooltip=(
                                    "逐缝落缝策略（hunt 不可靠时这条缝怎么办）。\\n"
                                    "auto（默认）：**逐缝**看邻域闹度——周围在炸 → jerk 硬切藏切；"
-                                   "周围平静 → 挪最平缓 + 锚定。同一条片里两种缝各走各的。\\n"
-                                   "calm_overlap：全部缝都按平静处理。\\n"
+                                   "周围平静 → 挪最平缓 + 锚定。同一条片里两种缝各走各的。\n"
+                                   "calm_overlap：全部缝都按平静处理。\n"
                                    "jerk_hardcut：全部缝都按剧烈处理。"
                                )),
+
+                io.Int.Input("overlap_frames", default=17, min=0, max=2048, step=17,
+                             tooltip="缝的重叠帧数（0=全硬切；17=锚定重叠）。从上游搬来。"),
+                io.Boolean.Input("auto_calm_search", default=True,
+                                 tooltip="开 calm 挪界搜索。从上游搬来。"),
+                io.Int.Input("calm_overlap_frames", default=17, min=0, max=2048, step=17,
+                             tooltip="calm 缝的重叠帧数。从上游搬来。"),
+
                 io.Boolean.Input("profile_camera_compensate", default=False,
                                  tooltip="latent profile 镜头补偿。"),
                 io.Combo.Input("profile_reduce", options=["mean", "max", "top-decile"], default="mean",
@@ -1177,7 +1141,12 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, cfg: float = 1.0, anchor_strength: float = 0.999,
+    def execute(cls, cfg: float = 1.0,
+                model_name: str = "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+                precision: str = "bf16", release_policy: str = "clear_after",
+                overlap_frames: int = 17, auto_calm_search: bool = True,
+                calm_overlap_frames: int = 17,
+                anchor_strength: float = 0.999,
                 second_pass_audio_policy: str = None, seam_tolerance_frames: int = 4,
                 calm_search_window: int = 34, calm_policy: str = "auto",
                 profile_camera_compensate: bool = False, profile_reduce: str = "mean",
@@ -1192,12 +1161,18 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                 dump_dir: str = "", show_memory_log: bool = True):
         plan = {
             "schema": PASS2_TYPE_STRING,
+            "model_name": str(model_name),
+            "precision": str(precision),
+            "release_policy": str(release_policy),
             "cfg": float(cfg),
             "anchor_strength": float(anchor_strength),
             "second_pass_audio_policy": str(second_pass_audio_policy or AUDIO_POLICIES[0]),
             "seam_tolerance": int(seam_tolerance_frames),
             "calm_search_window": int(calm_search_window),
             "calm_policy": str(calm_policy),
+            "overlap_frames": max(0, int(overlap_frames)),
+            "auto_calm_search": bool(auto_calm_search),
+            "calm_overlap_frames": max(0, int(calm_overlap_frames)),
             "profile_camera_compensate": bool(profile_camera_compensate),
             "profile_reduce": str(profile_reduce),
             "calm_abstain_below": float(calm_abstain_below),
