@@ -2,7 +2,7 @@
   "id": "7602f7ac-e171-4e21-b5dc-e8ccb3b3c774",
   "revision": 0,
   "last_node_id": 102,
-  "last_link_id": 198,
+  "last_link_id": 199,
   "nodes": [
     {
       "id": 38,
@@ -226,7 +226,9 @@
           "localized_name": "generated_audio",
           "name": "generated_audio",
           "type": "AUDIO",
-          "links": []
+          "links": [
+            199
+          ]
         },
         {
           "localized_name": "video_latent",
@@ -643,7 +645,7 @@
           "name": "audio",
           "shape": 7,
           "type": "AUDIO",
-          "link": null
+          "link": 199
         },
         {
           "label": "批次管理",
@@ -4002,6 +4004,14 @@
       22,
       0,
       "MODEL"
+    ],
+    [
+      199,
+      16,
+      1,
+      77,
+      1,
+      "AUDIO"
     ]
   ],
   "groups": [
