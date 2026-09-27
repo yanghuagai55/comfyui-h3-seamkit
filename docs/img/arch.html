@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{width:1440px;padding:36px 44px;background:#FBF8F3;
+       font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;color:#2B2622}
+  h1{font-size:24px;font-weight:700;margin-bottom:6px}
+  .sub{font-size:13.5px;color:#7A7268;margin-bottom:30px}
+  .row{display:flex;align-items:stretch;gap:12px}
+  .col{display:flex;flex-direction:column;gap:11px;justify-content:center}
+  .card{background:#fff;border:1.5px solid #E7E1D8;border-radius:12px;padding:13px 16px;
+        box-shadow:0 1px 2px rgba(43,38,34,.04)}
+  .card.hi{border-color:#C2410C;box-shadow:0 0 0 3px rgba(194,65,12,.08)}
+  .card.dn{border-color:#0F766E;box-shadow:0 0 0 3px rgba(15,118,110,.07)}
+  .t{font-size:14.5px;font-weight:700;margin-bottom:4px}
+  .n{font-size:11.5px;color:#7A7268;line-height:1.55}
+  .tag{display:inline-block;font-size:10.5px;padding:1px 8px;border-radius:20px;
+       background:#FDF0E7;color:#C2410C;border:1px solid #F3D9C6;margin-left:6px;vertical-align:2px}
+  .tag.g{background:#EEF6F4;color:#0F766E;border-color:#CFE4E0}
+  .arrow{display:flex;align-items:center;color:#C2410C;font-size:22px;font-weight:700;padding:0 2px}
+  .vert{display:flex;flex-direction:column;align-items:center;color:#0F766E;font-weight:700;
+        font-size:11px;gap:2px;padding-top:8px}
+  .vline{width:2px;height:16px;background:#CFE4E0}
+  .foot{margin-top:26px;display:flex;gap:14px}
+  .fcard{flex:1;background:#FDF6EF;border:1.5px solid #F3D9C6;border-radius:12px;padding:13px 16px;
+         font-size:12.5px;color:#7A4A22;line-height:1.6}
+  .fcard.g{background:#F2F8F7;border-color:#CFE4E0;color:#0B5B54}
+  code{background:#F5F1EA;padding:1px 6px;border-radius:5px;font-size:11.5px;color:#8A4B1D}
+</style></head>
+<body>
+  <h1>架构一览 · v1.4</h1>
+  <div class="sub">上游只管一采（决定缓存指纹），下游只管二采（改它永不重采）；两个执行节点零控件</div>
+
+  <div class="row" style="align-items:center;gap:0">
+    <div class="col" style="flex:0 0 150px">
+      <div class="card"><div class="t">参考图 ×N</div><div class="n">角色 / 场景</div></div>
+      <div class="card"><div class="t">提示词</div><div class="n">官方六段结构</div></div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:0 0 230px">
+      <div class="card hi">
+        <div class="t">上游 Plan<span class="tag">12 控件</span></div>
+        <div class="n">片长 · 画布 · <b>每段不超过几秒</b> · 缓存开关 · 提示词<br>
+        <span style="color:#C2410C">改动 → 一采重采</span></div>
+      </div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:0 0 200px">
+      <div class="card">
+        <div class="t">一采采样<span class="tag g">零控件</span></div>
+        <div class="n"><b>可缓存</b>：上游没变 → 直接读回<br>整片 latent（省 ~9 分钟）</div>
+      </div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:1">
+      <div class="card hi" style="border-color:#C2410C">
+        <div class="t">二采执行器<span class="tag g">零控件</span></div>
+        <div class="n">逐窗：切片 → 上采样(时间重叠) → 锚定 → 采样 →
+        <b>拼缝</b>（硬切 / 冻结锚定 / 交叉淡化）→ 可选缝窗重去噪</div>
+      </div>
+      <div class="vert">
+        <span>▲ pass2_plan（模型 / hunt / calm / 拼缝 / 去噪 / 诊断）</span>
+        <div class="vline"></div>
+      </div>
+      <div class="card dn">
+        <div class="t">下游 Pass-2 Plan<span class="tag g">33 控件</span></div>
+        <div class="n"><b>改这里不触发一采重采</b>——它不在一采的上游链里。
+        <code>calm_policy=auto</code> 逐缝自动：动作里的缝硬切、平静切点锚定</div>
+      </div>
+    </div>
+    <div class="arrow">➜</div>
+    <div class="col" style="flex:0 0 130px">
+      <div class="card"><div class="t">解码</div><div class="n">AVDecodeT8</div></div>
+      <div class="card"><div class="t">合成</div><div class="n">写 mp4</div></div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <div class="fcard">
+      <b>指纹边界在哪：</b>一采的缓存指纹 = 它上游子图的哈希。上游 Plan 全在指纹里，
+      所以"画布 / 每段秒数 / 缓存开关"必须放上游；下游 Plan 在指纹之外，33 个控件随便改。
+    </div>
+    <div class="fcard g">
+      <b>缝怎么处理：</b>hunt 找到真转镜 → 硬切；找不到 → calm 挪到最平缓独占帧 + 锚定 overlap；
+      动作里的缝则反过来藏进最猛处。三种缝由 <code>calm_policy=auto</code> 逐缝自动挑。
+    </div>
+  </div>
+</body></html>

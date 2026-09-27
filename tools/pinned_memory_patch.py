@@ -139,7 +139,6 @@ TARGET = COMFY_ROOT / "comfy" / "model_management.py"
 # 新增候选时**往后面加**，别调换顺序 —— 换顺序会让已有的备份被"看不见"。
 BACKUP_DIRS = [
     COMFY_ROOT / "user" / "pinned_memory_patch",          # 默认
-    HOME_DIR / "_hardcut_work" / "patches",               # 兼容早期手工位置的备份
 ]
 HOST_PORT = 8188
 

@@ -250,7 +250,7 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 缝邻域 5 个 token 的 `max(global, jerk)` 均值 ÷ 全片中位；**≥ 1.5 直接跳过**（闹处重画容易生伪纹理）。
 `seam_redenoise_frames` 可指定只做某几条缝（逗号分隔帧号，±17 帧内匹配）。
 
-**事后否决**：`stroke_check.py A.mp4 B.mp4` → 裂纹笔画比 B/A > 1.2 即判注入伪纹理，回退。
+**事后否决**：用 `tools/check_cut_flicker.py` 看缝附近是否冒出细深色"裂纹"笔画——明显增加即判注入伪纹理，回退。
 
 **音频**：联合生成时音频参与（帮视频与声音对齐），但写回**只有视频**
 （`accumulated[:, :, w0:w1] = new_video`）——成片音频仍是参考音频透传，**对白/音效不会被破坏**。
@@ -457,7 +457,7 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | **剧烈连续动作的缝还想更平滑** | 上述动作配置 + `seam_redenoise=true` + `gate=off` + `seam_redenoise_frames="<缝>"`（单缝实验，1.8） |
 | **只想快速出片（不追缝）** | `overlap_frames=0`（全硬切）+ hunt/calm 关 —— 要求提示词切点非常准 |
 | **换剧情 / 换片** | 改 `cache_key`（避免读到上一条片的缓存） |
-| **怀疑某段软化 / 裂纹** | `dump_latents=true` + `dump_dir` 指新目录 → `latent_decode_lab.py` 离线解剖 |
+| **怀疑某段软化 / 裂纹** | `dump_latents=true` + `dump_dir` 指新目录 → 用 `torch.load` 离线解剖（缓存管理见 `tools/latent_cache.py`） |
 
 ## 2.14 指纹规则速记（哪些改动重采）
 
@@ -476,4 +476,3 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | `docs/GUIDE.md` | **本文件**——原理 + 参数 |
 | `templates/prompt-template.md` | 提示词模板（官方六段骨架 + 硬切注意事项） |
 | `MANUAL.md` 已删除 | 旧作业手册（被本文件取代） |
-| `_hardcut_work/` | 调查工作区（测试工具 / dump / 策略单测） |

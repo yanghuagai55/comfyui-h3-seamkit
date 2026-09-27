@@ -21,13 +21,7 @@
 
 ## 架构（v1.4）
 
-```text
-   上游 Plan（12 控件）──► 一采 #93（可缓存，零控件）──► 二采执行器 #40（零控件）──► 解码
-        │                        ▲                            ▲
-        └─ plan/prompt/尺寸      │                            │ pass2_plan
-                                 │                    下游 Pass-2 Plan（33 控件）
-   一采缓存：上游任何改动 → 指纹变 → 重采；下游 33 个控件随便改，永不重采
-```
+![架构一览](docs/img/arch.png)
 
 - **上游 Plan**：画布、每段秒数、缓存开关、提示词——只留**影响一采**的东西
 - **下游 Pass-2 Plan**：模型三件套、hunt/calm、锚定、拼缝、重去噪、诊断——全部二采参数
@@ -39,7 +33,7 @@
 
 1. 克隆到 `ComfyUI/custom_nodes/`：
    ```bash
-   git clone https://github.com/<you>/comfyui-h3-seamkit.git
+   git clone https://github.com/yanghuagai55/comfyui-h3-seamkit.git
    ```
 2. 重启 ComfyUI。节点在分类 **`MiniMax H3 Hard Cut`** 下（10 个）。
 3. 上游依赖同装：`comfyui-minimax-h3-audio-T8`。
@@ -79,11 +73,20 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 - **`upscale_pad_tokens=3` 默认**：治分块尾软化
 - 文档全新：`docs/GUIDE.md`（原理 + 参数）+ 单页提示词模板
 
-## 测试
+## 附带工具（`tools/`）
 
-```bash
-python ../_hardcut_work/seamfix/e4_hardcut_policy_test.py   # 策略树单测
-```
+| 工具 | 用途 |
+|---|---|
+| `pinned_memory_patch.py` | 内存/pinned 上限补丁（**报错先用它**，交互菜单） |
+| `seam_report.py` | 逐缝台阶 / 闪烁测量（单机自检 + A/B 对照） |
+| `check_cut_flicker.py` | 成片缝与闪屏取证 |
+| `repair_seam.py` | 像素域接缝修复 |
+| `analyze_cut.py` | 真实切点分析与接触表 |
+| `latent_cache.py` | 一采 latent 缓存管理（ComfyUI 之外用） |
+| `check_widgets.py` | 控件槽位体检（UI 错位排查） |
+| `attention_backend_patch.py` | 注意力后端补丁（A/B 可复现） |
+
+纯计算器（不起 ComfyUI）：`hardcut_math.py`。
 
 ## 许可
 

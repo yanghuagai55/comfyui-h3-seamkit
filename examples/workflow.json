@@ -3498,7 +3498,7 @@
         3,
         "off",
         false,
-        "D:\\comfyui\\_hardcut_work\\latent_dump\\",
+        "latent_dump",
         true
       ],
       "widgets_values_named": {
@@ -3533,7 +3533,7 @@
         "seam_lock_tokens": 3,
         "seam_redenoise_gate": "off",
         "dump_latents": false,
-        "dump_dir": "D:\\comfyui\\_hardcut_work\\latent_dump\\",
+        "dump_dir": "latent_dump",
         "show_memory_log": true
       }
     }

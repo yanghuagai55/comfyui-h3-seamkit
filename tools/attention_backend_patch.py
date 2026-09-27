@@ -47,7 +47,6 @@ EXPERIMENT_LAUNCHER = HOME_DIR / "启动ComfyUI-确定性.bat"
 
 BACKUP_DIRS = [
     COMFY_ROOT / "user" / "seamkit_patches",
-    HOME_DIR / "_hardcut_work" / "patches",
 ]
 ORIG_NAME = "ops.py.orig"
 

@@ -605,9 +605,8 @@ def _redenoise_seam_windows(
     in comfy/model_base.py).  Said explicitly because the RePaint repository is
     CC BY-NC-SA 4.0 (non-commercial, share-alike), which would NOT be compatible
     with this pack's GPL-3.0-or-later if any of its code were in here.
-    Verified end-to-end on the real comfy path (CPU, no weights) in
-    _hardcut_work/seamfix/e1_temporal_mask_test.py: locked tokens converge to
-    the published latent exactly (err ~2e-7).
+    Verified end-to-end on the real comfy path (CPU, no weights): locked
+    tokens converge to the published latent exactly (err ~2e-7).
     """
     entries = []
     total_tokens = int(accumulated.shape[2])
@@ -1110,7 +1109,7 @@ def _hunt_log_line(entry) -> str:
     """Format one per-cut hunt result for the console.
 
     Separated from the executor so it is unit-testable (see
-    `_hardcut_work/seamfix/e4_hardcut_policy_test.py`, cases L1-L4).  The console
+    the policy unit tests, cases L1-L4).  The console
     is the ONLY window into where the seams landed - a 15s render runs for
     minutes - and a declined cut used to print `ratio=None` with no reason,
     which is indistinguishable between "the persistence gate fired", "the flat

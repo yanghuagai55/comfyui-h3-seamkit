@@ -1131,7 +1131,7 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                 io.Combo.Input("seam_redenoise_gate", options=["off", "auto"], default="off",
                                tooltip="门控：auto=按 busy 度跳过闹缝。"),
                 io.Boolean.Input("dump_latents", default=False, tooltip="诊断：中间 latent 落盘。"),
-                io.String.Input("dump_dir", default="D:\\comfyui\\_hardcut_work\\latent_dump\\",
+                io.String.Input("dump_dir", default="latent_dump",
                                 tooltip="dump 输出目录。"),
                 io.Boolean.Input("show_memory_log", default=True, tooltip="每窗采样后打印显存。"),
             ],

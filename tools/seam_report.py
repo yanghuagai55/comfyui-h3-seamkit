@@ -290,8 +290,8 @@ def main():
     ap.add_argument("--segments", default="",
                     help="边界帧号逗号分隔（如 51,187,272）；给了就多算一列「同段百分位」——"
                          "全片百分位在剧烈/混合片两个方向都失效（§10.6/§11.6）")
-    ap.add_argument("--outdir", default=r"D:\comfyui\_hardcut_work\seam_sheets",
-                    help="看图素材输出目录（默认 _hardcut_work\\seam_sheets）")
+    ap.add_argument("--outdir", default="seam_sheets",
+                    help="看图素材输出目录（默认 ./seam_sheets）")
     args = ap.parse_args()
 
     paths = args.video
