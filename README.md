@@ -73,6 +73,32 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 - **`upscale_pad_tokens=3` 默认**：治分块尾软化
 - 文档全新：`docs/GUIDE.md`（原理 + 参数）+ 单页提示词模板
 
+## 示例成片
+
+两条 15 秒 / 四窗的实测片子，展示缝的两种结局。都在 [`examples/`](examples/)。
+
+### `00095` — 三条缝，只有一条看得见
+
+![00095 帧 265–278 · 缝 272 附近](docs/img/example_095_seam272.jpg)
+
+**[`examples/exp_4v10a_00095.mp4`](examples/exp_4v10a_00095.mp4)**（15.08s / 24fps / 1664×928，含原生音频）
+
+全片三条缝（`85 / 187 / 272`），**最明显的只有一处**：如上图，帧 265 背景还是彩色
+（暖色招牌、行人），**帧 268 起背景突然褪成灰白**，到 275 才恢复——这是 overlap
+交叉淡化把前后两窗平均后的痕迹，**人物主体（两位女主）的轮廓、位置、颜色全程不突变**，
+眼睛捕捉到的只是背景一闪。另外两条缝（85 / 187）落在完全静止段，肉眼几乎不可见。
+
+### `00090` — 85 帧处的直接分割
+
+**[`examples/exp_4v10a_00090.mp4`](examples/exp_4v10a_00090.mp4)**（15.08s / 24fps）
+
+帧 85 处是**直接分割**（上一窗未收尾就硬接下一窗），人物内容整体突变——构图/景别直接换掉。
+这种**不需要重跑**：用剪辑软件**直接剪掉那几帧**即可，去掉不影响剧情与节奏。
+
+> ⚠️ **`00090` 没有声音是意外，不是本插件的常态。** 它生成于 2026-09-26，
+> 当时工作流的音频 mux 线在更早一次节点清理中被误删（已于 09-27 修复）。
+> 音频一直在正常生成，只是没接进最终合成器——`00095` 就是修复后的产物，声音正常。
+
 ## 附带工具（`tools/`）
 
 | 工具 | 用途 |
@@ -106,6 +132,7 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 
 | 来源 | 用在哪 | 说明 |
 |---|---|---|
+| **ComfyUI_MiniMaxH3_Director**（作者 **[AIMixer](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)**，Apache-2.0） | **一采 latent 缓存**——指纹语义（`first_pass_cache_fingerprint`：「身份 = 只影响一采的东西」，二采参数不击穿缓存）+ 缓存的「查看 / 清理」职能划分 | **本插件一采缓存这一层的设计源头**。按其语义在 `nodes_latent_cache.py` / `tools/latent_cache.py` 中重写，未搬运其代码（Apache-2.0 与本包 GPL-3.0-or-later 兼容，但仍选择独立实现）。在此致谢。 |
 | **MAINodes · H3 Jerk Oracle**（matlowai） | jerk（三阶差分）剖面指标、`calm_abstain_below`「平淡时放弃搜索」 | GPL-3.0-or-later（与本包同许可）；按思路重新实现 |
 | **PERSIST**（arXiv:2608.29287） | hunt 的「持续性」判据——真转镜留在另一个稳态，闪烁会回落 | 论文思路，手写窗口均值实现 |
 | **RePaint**（Lugmayr et al., CVPR 2022, arXiv:2201.09865） | 缝窗重去噪：每一步都把已知区重注入 | **仅思路**——RePaint 仓库是 CC BY-NC-SA 4.0，与本包 GPL 不兼容，故**一行代码未用**；实际执行该机制的是 ComfyUI 核心自带的 `KSamplerX0Inpaint` |
