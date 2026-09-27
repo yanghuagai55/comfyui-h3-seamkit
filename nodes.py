@@ -1126,8 +1126,15 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                              tooltip="hunt 残差容差（帧）。"),
                 io.Int.Input("calm_search_window", default=34, min=0, max=170, step=17,
                              tooltip="平缓搜索半径（帧）。"),
-                io.Combo.Input("calm_policy", options=["calm_overlap", "jerk_hardcut"],
-                               default="calm_overlap", tooltip="hunt 不可靠时怎么放这条缝。"),
+                io.Combo.Input("calm_policy", options=["auto", "calm_overlap", "jerk_hardcut"],
+                               default="auto",
+                               tooltip=(
+                                   "逐缝落缝策略（hunt 不可靠时这条缝怎么办）。\\n"
+                                   "auto（默认）：**逐缝**看邻域闹度——周围在炸 → jerk 硬切藏切；"
+                                   "周围平静 → 挪最平缓 + 锚定。同一条片里两种缝各走各的。\\n"
+                                   "calm_overlap：全部缝都按平静处理。\\n"
+                                   "jerk_hardcut：全部缝都按剧烈处理。"
+                               )),
                 io.Boolean.Input("profile_camera_compensate", default=False,
                                  tooltip="latent profile 镜头补偿。"),
                 io.Combo.Input("profile_reduce", options=["mean", "max", "top-decile"], default="mean",
@@ -1172,7 +1179,7 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
     @classmethod
     def execute(cls, cfg: float = 1.0, anchor_strength: float = 0.999,
                 second_pass_audio_policy: str = None, seam_tolerance_frames: int = 4,
-                calm_search_window: int = 34, calm_policy: str = "calm_overlap",
+                calm_search_window: int = 34, calm_policy: str = "auto",
                 profile_camera_compensate: bool = False, profile_reduce: str = "mean",
                 calm_abstain_below: float = 0.0, calm_min_quality: float = 0.8,
                 hunt_persistence: bool = True, hunt_min_persistence: float = 0.8,

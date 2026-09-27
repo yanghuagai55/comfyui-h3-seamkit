@@ -159,11 +159,24 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 
 ## 1.7 calm：hunt 不可靠时怎么放这条缝
 
-⚠ 这里有**两条方向相反的策略**（`calm_policy`），不是只有"找最平缓"。
+⚠ 这里有**三条策略**（`calm_policy`），默认 `auto`——**逐缝**自动在 A/B 之间选。
 
 **候选**：`计划切点 ± calm_search_window`（默认 34，你的配置 51）内的全部 17k 独占帧。
 
-### 策略 A · `calm_overlap`（默认，静态/对话片）——取分数**最低**者
+### 策略 0 · `auto`（**默认**）——逐缝自动选 A 或 B
+
+不是给整片贴"文戏/武戏"标签：**同一条片里两种缝都可以有**——武戏中段的缝周围在炸，
+动作结束后的切点（比如 271 之后那种）周围却很平静。每条缝独立看自己邻域的闹度：
+
+```text
+   busy = 缝邻域 ±2 token 的 max(global, jerk) 均值 ÷ 全片中位
+   busy ≥ 1.5（CALM_AUTO_BUSY_RATIO）→ 这条缝周围在炸 → 走策略 B（jerk 硬切）
+   busy <  1.5                       → 这条缝周围平静 → 走策略 A（calm overlap）
+```
+
+单测（e4 K1/K2）：静缝 busy 1.22 → 挪 102 + overlap17；闹缝 busy 5.6 → 峰 85 + 硬切。
+
+### 策略 A · `calm_overlap`（静态/对话片）——取分数**最低**者
 
 四道门（任一不过退回计划点）：
 
@@ -382,7 +395,7 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | 控件 | 作用 | 默认 | 什么时候改 | 举例 |
 |---|---|---|---|---|
 | `calm_search_window` | 搜索半径（帧） | 34 | 你的配置 | **51** |
-| `calm_policy` | **落缝策略**（两条方向相反） | calm_overlap | 动作片 → jerk_hardcut | calm_overlap / jerk_hardcut |
+| `calm_policy` | **落缝策略**（auto=逐缝自动选 A/B） | **auto** | 整条动作片可锁 jerk_hardcut；整条对话片可锁 calm_overlap | auto / calm_overlap / jerk_hardcut |
 | `calm_min_gain` | 挪动收益门（仅 A 策略） | 0.15 | 挪太频繁 → 提高 | 0.15 |
 | `calm_min_quality` | 逐缝质量门（仅 A 策略） | 0.8 | 保持 | 0.80 |
 | `calm_too_quiet_below` | 过静保护（仅 A 策略） | 0.05 | 保持 | 0.05 |

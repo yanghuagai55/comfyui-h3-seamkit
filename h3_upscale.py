@@ -134,6 +134,17 @@ def find_calm_boundaries(
             continue
         score[idx] = max(glob, jerk)
         jerk_by_idx[idx] = jerk
+    # auto 策略的分母：全片 score 中位（与 B1 重去噪门同口径）
+    _score_vals = sorted(v for v in score.values() if v > 0)
+    if _score_vals:
+        _sn = len(_score_vals)
+        _score_med = (
+            _score_vals[_sn // 2]
+            if _sn % 2
+            else 0.5 * (_score_vals[_sn // 2 - 1] + _score_vals[_sn // 2])
+        )
+    else:
+        _score_med = 0.0
     entry_by_cut = {}
     for e in aligned or ():
         try:
@@ -232,7 +243,26 @@ def find_calm_boundaries(
             # (FRAME_PER_TOKEN=(1,4,4,4,4) puts a 1-frame token every 17 frames)
             return int(frame) // int(grid) * 5
 
-        if policy == "jerk_hardcut":
+        # ---- 逐缝策略选择（calm_policy="auto"，2026-09-27）----------------
+        # 不是给整片贴文戏/武戏标签：同一条片里两种缝都可以有。每条缝独立看
+        # 自己邻域的闹度（±2 token 的 max(global,jerk) 均值 ÷ 全片中位）：
+        #   ≥ CALM_AUTO_BUSY_RATIO → 周围在炸 → jerk_hardcut（藏进最猛处，硬切）
+        #   <  ...                 → 周围平静   → calm_overlap（挪最平缓 + 锚定）
+        use_jerk = policy == "jerk_hardcut"
+        auto_tag = ""
+        if policy == "auto":
+            _tok = tok_of(cut)
+            _nb = [score[i] for i in range(_tok - 2, _tok + 3) if i in score]
+            _busy = (sum(_nb) / len(_nb) / _score_med) if (_nb and _score_med > 1e-9) else 0.0
+            use_jerk = _busy >= float(CALM_AUTO_BUSY_RATIO)
+            auto_tag = (
+                f"auto busy {_busy:.2f} {'>=' if use_jerk else '<'} "
+                f"{float(CALM_AUTO_BUSY_RATIO):.2f} -> "
+                + ("JERK hardcut（周围在炸，藏切）" if use_jerk else "CALM overlap（周围平静，锚定）")
+            )
+            notes.append(f"cut {cut}: {auto_tag}")
+
+        if use_jerk:
             # Opposite bet to the calm search: put the seam where the picture is
             # ALREADY moving hardest.  Two reasons.  Motion masks a cut, and
             # high jerk is exactly where MAINodes measured the model gives up and
@@ -1151,6 +1181,11 @@ def release_text_encoders() -> list:
 # max(global, jerk)），除以全片中位 -> busy 度。这是 §4.1 像素域 B1
 # （锚间高频一致性）的 latent 域替身，零额外计算；标定后若相关性差再升级。
 REDENOISE_BUSY_SKIP_RATIO = 1.5
+# calm_policy="auto" 的**逐缝**判据：该缝邻域（±2 token）的 max(global, jerk) 均值
+# ÷ 全片中位 ≥ 此值 → 这条缝周围是剧烈动作 → 走 jerk_hardcut（缝藏进最猛处，硬切）；
+# < 此值 → 这条缝周围平静 → 走 calm_overlap（挪到最平缓独占帧 + 锚定 overlap）。
+# 一条片子里两种缝都可以有：武戏中段是前者的典型，动作结束后的平静切点是后者的典型。
+CALM_AUTO_BUSY_RATIO = 1.5
 
 
 def gate_seam_redenoise(profile, seam_marks,
