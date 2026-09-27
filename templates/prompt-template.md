@@ -62,21 +62,25 @@ non_diegetic_music:
 
 ## 三、★ 硬切路线专属注意事项（4 条）
 
-### 1. 切点时间戳必须逐字对齐 —— 从节点报告里抄
+### 1. 切点时间戳：任意浮点都行，不要求精确
 
-运行一次（或看节点执行后）**上游规划节点 `MiniMax H3 Plan (upstream / first-pass)` 的报告**：
+识别系统只认 **`[Shot N] At + 时间点`** 这个前缀形状——`At 00:03.750`、`At 00:03.75`、
+`At 00:03.8` 都行，**不强求 0.001 秒精度**。对不齐执行器的边界也只是**警告**（报告会列出
+执行器自己的边界时间作参考），不会拦停。
+
+时间点从哪来：**上游规划节点 `MiniMax H3 Plan (upstream / first-pass)` 的报告**：
 
 ```text
 cut points    : 3.750s (frame 90), 7.500s (frame 180), 11.250s (frame 270)
-windows:
-  #0  frames [   0 ->   85) ...
 ```
 
-**把这些时间戳原样写进**提示词的 `summary` 与各 `[Shot N] At ...,`。差一帧就会被
-`MiniMaxH3HardCutValidate` 拦下（报告会给出正确值）。
+照这个量级写就行（它由 `target_segment_seconds` 算出——比如 5.0 的意思就是**每个片段不超过 5 秒**）。
 
-段长上限写进 `summary` 最后一句：`with every segment no longer than <target_segment_seconds> seconds`
-（例：`target_segment_seconds = 5.0` → 每段不超过 5 秒）。
+段长上限写进 `summary` 最后一句：`with every segment no longer than <target_segment_seconds> seconds`。
+
+> ⚠ **`[Shot N] At` 是识别前缀，只认行首那个**——同一行/正文里其余位置的 `[Shot N]`
+> 会被误当成镜头声明。引用前面的镜头请**改用文字**（如 `the opening wide shot`），
+> 不要再写 `[Shot 1]`。（校验器发现疑似误用会警告。）
 
 ### 2. 绝对不要出现"一镜到底"措辞
 
@@ -101,16 +105,9 @@ executed as a <N>-shot sequence with hard cuts at <...>
 
 凡"跨窗口必须一致"的视觉语义（站位、朝向、视线、与镜头的相对关系）都写死 + 声明全片统一。
 
-### 4. 声音跨切点连续
-
-`overall_soundscape` 末尾加一句：
-
-```text
-The ambience and effects carry straight across the cuts at <...> without a break —
-the picture changes angle, the sound does not restart.
-```
-
-（本路线音频整片透传；不写这句，模型可能自己"换环境音"。）
+> **blocking 是什么**：影视制作术语，指**演员的站位与走位**——谁站在画面哪个位置、
+> 身体朝向哪、视线看向哪、与镜头的相对关系。两个采样窗口独立渲染时，各自的"调度"
+> 是自己解出来的：blocking 写死 = 强迫两个窗口用同一套调度，接缝才对得上。
 
 ---
 
@@ -119,10 +116,10 @@ the picture changes angle, the sound does not restart.
 - [ ] 六段齐全、顺序正确、全英文（`<d>` 除外）
 - [ ] `summary`：`[reference generation]` + 硬切表述 + 每个时间戳 + 段长上限
 - [ ] `[Shot 1]` 无时间戳；`[Shot 2]` 起都有 `At MM:SS.mmm, `
-- [ ] 时间戳**逐字**等于节点报告的 `cut points`
+- [ ] 时间戳任意浮点即可（`At 00:03.75` 与 `At 00:03.750` 等价）；想完全对齐就照报告 `cut points` 写
 - [ ] `retention_analysis` 列全所有 `[Shot N]`；标签用官方两族
 - [ ] 没有 `no cuts` / `continuous take` / `unbroken`
 - [ ] **blocking 写死**（站位/朝向/视线 + "全片统一"声明）
-- [ ] `overall_soundscape` 有"跨切点不中断"一句
 - [ ] 相邻镜头**换了机位或景别**（否则切点看起来像"崩了"而不是剪辑）
+- [ ] 正文里**没有**多余的 `[Shot N]`（引用前面的镜头用文字，如 `the opening wide shot`）
 - [ ] `MiniMaxH3HardCutValidate` 报告第一行 `status : OK`

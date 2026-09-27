@@ -1102,10 +1102,18 @@ NO_CUT_PATTERNS = (
 )
 
 _SECTION_RE = re.compile(r"^([a-z_]+)\s*:", re.MULTILINE)
+# 镜头声明只认**行首**的 `[Shot N]`——正文里句子中间的 `[Shot N]` 是引用，不是声明
+# （2026-09-27：旧行为把句中的也算进去，制造过幽灵第 5 镜）。
 _SHOT_RE = re.compile(
-    r"\[\s*Shot\s+(\d+)\s*\]\s*(.*?)(?=\[\s*Shot\s+\d+\s*\]|\Z)", re.DOTALL
+    r"(?m)^[ \t]*\[\s*Shot\s+(\d+)\s*\][ \t]*(.*?)(?=^[ \t]*\[\s*Shot\s+\d+\s*\]|\Z)",
+    re.DOTALL,
 )
-_LEAD_STAMP_RE = re.compile(r"^At\s+(\d{1,3}):(\d{2})\.(\d{3})\s*,", re.IGNORECASE)
+# 时间戳识别放宽（2026-09-27）：`At MM:SS.xxx` 小数位任意（.75 = .750）；毫秒可不写；
+# 逗号可省。识别只看「[Shot N] At + 时间点」这个前缀形状，不要求 0.001 精度。
+_LEAD_STAMP_RE = re.compile(
+    r"^At\s+(\d{1,3}):(\d{1,2})(?:\.(\d{1,3}))?\s*,?", re.IGNORECASE
+)
+_LEAD_STAMP_BARE_RE = re.compile(r"^At\s+(\d+(?:\.\d+)?)\s*s?\s*,?", re.IGNORECASE)
 _DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*second", re.IGNORECASE)
 
 MAX_LISTED = 8          # never dump an unbounded error list into the node UI
@@ -1133,15 +1141,17 @@ def parse_shots(prompt: str) -> list[dict]:
     for match in _SHOT_RE.finditer(section):
         body = match.group(2).strip()
         lead = _LEAD_STAMP_RE.match(body)
+        if lead:
+            frac = (lead.group(3) or "0").ljust(3, "0")
+            cut = int(lead.group(1)) * 60 + int(lead.group(2)) + int(frac) / 1000.0
+        else:
+            bare = _LEAD_STAMP_BARE_RE.match(body)
+            cut = float(bare.group(1)) if bare else None
         rows.append(
             {
                 "index": int(match.group(1)),
                 "body": body,
-                "cut_seconds": (
-                    int(lead.group(1)) * 60 + int(lead.group(2)) + int(lead.group(3)) / 1000.0
-                )
-                if lead
-                else None,
+                "cut_seconds": cut,
             }
         )
     return rows
@@ -1253,6 +1263,28 @@ def validate_prompt(
     elif indices != list(range(1, len(indices) + 1)):
         errors.append(
             f"[Shot N] numbering must run consecutively from 1; found {indices}"
+        )
+
+    # ---- [Shot N] 识别前缀误用警告（2026-09-27）---------------------------
+    # 镜头声明只认**行首**的 `[Shot N]`；同一行内其余位置的 `[Shot N]`（如
+    # "closer than in [Shot 1]."）不是声明，但旧行为会把它算进去（实测制造过
+    # 幽灵第 5 镜——它就在 Shot 2 声明行的中部）。
+    _decl = _tail_after(prompt or "", "detailed_description:", "overall_soundscape:")
+    _stray = []
+    for i, line in enumerate(_decl.split("\n")):
+        _hits = list(re.finditer(r"\[\s*Shot\s+\d+\s*\]", line))
+        if not _hits:
+            continue
+        _lead_col = len(line) - len(line.lstrip())
+        for _m in _hits[1 if line.lstrip().startswith("[Shot") else 0:]:
+            _stray.append((i + 1, line.strip()[:60]))
+            break
+    if _stray:
+        _shown = "; ".join(f"L{n}: {t}" for n, t in _stray[:3])
+        warnings.append(
+            "[Shot N] 是镜头声明的识别前缀（只认行首的那个）——同一行/正文里其余位置的"
+            f"[Shot N] 会被误当镜头声明，引用镜头请改用文字（如 'the opening wide shot'）。"
+            f"疑似误用 {len(_stray)} 处: {_shown}"
         )
 
     # ---- 3. wording that forbids cutting --------------------------------
@@ -1428,9 +1460,10 @@ def validate_prompt(
                         "anchored instead of relying on a model cut here."
                     )
                 else:
-                    errors.append(
-                        _msg + "  — a window boundary is a hard break (no context crosses "
-                        "it), so the model has to be told to change shot at that exact frame."
+                    warnings.append(
+                        _msg + "  — 时间戳是指示值，不必精确：执行器按自己的网格边界切，"
+                        "模型可能在此帧前后才换镜（overlap 模式下由锚定 overlap 吸收）。"
+                        " 要完全对齐可把提示词时间戳改成报告里的 cut points。"
                     )
             extra = [
                 p for p in prompt_frames if not any(abs(p - t) <= 1 for t in truth)
