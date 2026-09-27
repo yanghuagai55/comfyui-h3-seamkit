@@ -13,3 +13,7 @@ Thumbs.db
 Thumbs.db
 .DS_Store
 *.log
+
+# Python缓存
+__pycache__/
+*.pyc
