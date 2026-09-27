@@ -116,7 +116,7 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 
 ## 致谢与来源
 
-### 上游依赖（运行时直接调用它的代码）
+### 上游依赖
 
 - **[comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)**（作者 **T8mars**，GPL-3.0-or-later）——
   二采执行器在运行时直接调用它的**放大器 / DualClock 采样 / 条件重锚 / 分段装配
@@ -128,16 +128,20 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 - **MiniMax H3** 的模型与官方提示词规范（六段式 R2V 模板）——`templates/prompt-template.md`
   按官方结构编写，只追加了硬切路线的注意事项。
 
-### 思路来源（**仅借鉴思想，未搬运任何代码**）
+### 灵感来源
 
-| 来源 | 用在哪 | 说明 |
-|---|---|---|
-| **ComfyUI_MiniMaxH3_Director**（作者 **[AIMixer](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)**，Apache-2.0） | **一采 latent 缓存**——指纹语义（`first_pass_cache_fingerprint`：「身份 = 只影响一采的东西」，二采参数不击穿缓存）+ 缓存的「查看 / 清理」职能划分 | **本插件一采缓存这一层的设计源头**。按其语义在 `nodes_latent_cache.py` / `tools/latent_cache.py` 中重写，未搬运其代码（Apache-2.0 与本包 GPL-3.0-or-later 兼容，但仍选择独立实现）。在此致谢。 |
-| **MAINodes · H3 Jerk Oracle**（matlowai） | jerk（三阶差分）剖面指标、`calm_abstain_below`「平淡时放弃搜索」 | GPL-3.0-or-later（与本包同许可）；按思路重新实现 |
-| **PERSIST**（arXiv:2608.29287） | hunt 的「持续性」判据——真转镜留在另一个稳态，闪烁会回落 | 论文思路，手写窗口均值实现 |
-| **RePaint**（Lugmayr et al., CVPR 2022, arXiv:2201.09865） | 缝窗重去噪：每一步都把已知区重注入 | **仅思路**——RePaint 仓库是 CC BY-NC-SA 4.0，与本包 GPL 不兼容，故**一行代码未用**；实际执行该机制的是 ComfyUI 核心自带的 `KSamplerX0Inpaint` |
-| **StreamingT2V** | 多 token 锚定（`anchor_tokens`）——单帧条件才是分段不一致的根源 | 论文思路 |
-| **ComfyUI 核心** | `KSamplerX0Inpaint` / `scale_latent_inpaint`（锁端每步重注入的实际实现者） | GPL-3.0 |
+一采 latent 缓存这一层，源头是 **[ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)**
+（作者 **AIMixer**）。它把缓存的「身份」定义成*只影响一采的那些东西*——二采参数怎么改都不击穿缓存；
+缓存该有「查看 / 清理」两个动作，也是跟它学的。本插件的 `nodes_latent_cache.py` /
+`tools/latent_cache.py` 照这套语义写。谢谢。
+
+jerk（三阶差分）剖面指标和「平淡时放弃搜索」，来自 **MAINodes · H3 Jerk Oracle**（matlowai）。
+hunt 的「持续性」判据来自 **PERSIST**（arXiv:2608.29287）——真转镜会落在另一个稳态，闪烁会回落。
+多 token 锚定（`anchor_tokens`）的思路来自 **StreamingT2V**：单帧条件才是分段不一致的根源。
+
+缝窗重去噪「每一步都把已知区重注入」出自 **RePaint**（Lugmayr et al., CVPR 2022）。
+它的仓库是 CC BY-NC-SA 4.0，与本包 GPL 不兼容，所以这里一行代码都没有用它；
+真正执行这个机制的是 ComfyUI 核心自带的 `KSamplerX0Inpaint`。
 
 ### 协作与审计
 

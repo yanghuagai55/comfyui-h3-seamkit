@@ -89,6 +89,9 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | key 不存在 | **MISS**：正常采样，结束后写缓存 |
 | key 存在 + 指纹不一致 | **不使用**：正常采样；保存时覆盖旧档，并打印"哪里变了"（文本前 70 字 / 种子 / 节点类清单） |
 
+> 这套「身份 = 只影响一采的东西」的缓存语义，思路来自
+> [ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)（AIMixer）。
+
 ## 1.4 二采执行器（#40）逐窗做什么
 
 ![二采执行器逐窗六步：切片 → 上采样 → 锚定 → 采样 → 装配 → 可选去噪](img/pass2.png)
@@ -238,7 +241,7 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 
 **锁端怎么保持**：不是只在开头注入一次，而是**采样每一步都把锁端重注入一次**
 （`KSamplerX0Inpaint`，时间步 0.999）→ 模型始终在"两侧都是干净关键帧"的条件下解中间区域
-（RePaint 思路；ComfyUI 核心已实现，本包未搬运其代码）。
+（RePaint 思路，实际执行者是 ComfyUI 核心的 `KSamplerX0Inpaint`）。
 噪声用全局噪声切片 `[w0:w1]`（与首轮同相，不引入新随机性）。实测锁端收敛到已发布 latent，误差 ~2e-7。
 
 **作用范围**：只作用于**锚定 overlap 缝**（`seam_marks` = `start_token + locked`，硬切永不进入）——
@@ -485,10 +488,11 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 |---|---|---|
 | **上游代码依赖** | [comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)（T8mars，GPL-3.0-or-later） | 放大器 / DualClock 采样 / 条件重锚 / `_append_video_guarded_overlap`；plan 契约 |
 | **官方** | MiniMax H3 官方提示词规范（六段式 R2V） | `templates/prompt-template.md` 的结构 |
-| **思路（未搬代码）** | MAINodes · H3 Jerk Oracle（matlowai，GPL-3.0-or-later） | jerk 三阶差分指标、`calm_abstain_below` |
-| **思路（未搬代码）** | PERSIST（arXiv:2608.29287） | hunt 的持续性判据 |
+| **灵感** | [ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director)（AIMixer） | 一采 latent 缓存的指纹语义（「身份 = 只影响一采的东西」）与「查看 / 清理」职能——`nodes_latent_cache.py` / `tools/latent_cache.py` |
+| **灵感** | MAINodes · H3 Jerk Oracle（matlowai，GPL-3.0-or-later） | jerk 三阶差分指标、`calm_abstain_below` |
+| **灵感** | PERSIST（arXiv:2608.29287） | hunt 的持续性判据 |
 | **思路（未搬代码）** | RePaint（CVPR 2022, arXiv:2201.09865，CC BY-NC-SA 4.0） | 缝窗重去噪的每步重注入（实际执行者 = ComfyUI 核心 `KSamplerX0Inpaint`） |
-| **思路（未搬代码）** | StreamingT2V | 多 token 锚定 `anchor_tokens` |
+| **灵感** | StreamingT2V | 多 token 锚定 `anchor_tokens` |
 | **协作** | Zhipu AI（GLM） | 缝窗重去噪首版实现 + 单测（`e9ee3c0`）、token 检测四轮调研 |
 | **审计** | 外部对抗性审阅 | 检测栈/策略树逐条核查，D1–D3 等缺陷已修 |
 
