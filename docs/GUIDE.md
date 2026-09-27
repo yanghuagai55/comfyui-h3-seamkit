@@ -476,3 +476,20 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | `docs/GUIDE.md` | **本文件**——原理 + 参数 |
 | `templates/prompt-template.md` | 提示词模板（官方六段骨架 + 硬切注意事项） |
 | `MANUAL.md` 已删除 | 旧作业手册（被本文件取代） |
+
+---
+
+## 附录 · 来源与致谢
+
+| 类型 | 来源 | 用在本包的哪里 |
+|---|---|---|
+| **上游代码依赖** | [comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)（T8mars，GPL-3.0-or-later） | 放大器 / DualClock 采样 / 条件重锚 / `_append_video_guarded_overlap`；plan 契约 |
+| **官方** | MiniMax H3 官方提示词规范（六段式 R2V） | `templates/prompt-template.md` 的结构 |
+| **思路（未搬代码）** | MAINodes · H3 Jerk Oracle（matlowai，GPL-3.0-or-later） | jerk 三阶差分指标、`calm_abstain_below` |
+| **思路（未搬代码）** | PERSIST（arXiv:2608.29287） | hunt 的持续性判据 |
+| **思路（未搬代码）** | RePaint（CVPR 2022, arXiv:2201.09865，CC BY-NC-SA 4.0） | 缝窗重去噪的每步重注入（实际执行者 = ComfyUI 核心 `KSamplerX0Inpaint`） |
+| **思路（未搬代码）** | StreamingT2V | 多 token 锚定 `anchor_tokens` |
+| **协作** | Zhipu AI（GLM） | 缝窗重去噪首版实现 + 单测（`e9ee3c0`）、token 检测四轮调研 |
+| **审计** | 外部对抗性审阅 | 检测栈/策略树逐条核查，D1–D3 等缺陷已修 |
+
+许可：**GPL-3.0-or-later**（因链接 GPL 上游，必须同许可）。详见 `README.md` 的「致谢与来源」。

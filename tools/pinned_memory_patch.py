@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """ComfyUI pinned-memory 上限补丁（多档位，交互式小终端）。
 
 改 **两个** 独立的数值，都可以自由切档、随时复原：

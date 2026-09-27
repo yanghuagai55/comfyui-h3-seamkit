@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """一采 latent 缓存的管理工具（ComfyUI 之外用）。
 
 ComfyUI 里的 `MiniMax H3 AV Latent Cache (Save/Load)` 负责存读；

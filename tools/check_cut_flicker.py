@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """Seam/flicker forensics for a rendered clip.
 
 Usage:

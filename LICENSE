@@ -1,3 +1,14 @@
+comfyui-h3-seamkit — MiniMax H3 chunked two-pass hard-cut planning and seam repair
+Copyright (C) 2026 comfyui-h3-seamkit contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.  It links against comfyui-minimax-h3-audio-T8
+(https://github.com/T8mars/comfyui-minimax-h3-audio-T8), also GPL-3.0-or-later.
+
+===============================================================================
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 3, 29 June 2007
 

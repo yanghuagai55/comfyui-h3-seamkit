@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """ComfyUI 注意力后端补丁：强制 SDPA 走 MATH（A/B 可复现用）。
 
 【解决什么问题】

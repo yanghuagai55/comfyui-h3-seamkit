@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 comfyui-h3-seamkit contributors
 """接缝标准测量工具（单机自检 + A/B 对照）。
 
 用法

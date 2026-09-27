@@ -88,6 +88,42 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 
 纯计算器（不起 ComfyUI）：`hardcut_math.py`。
 
+## 致谢与来源
+
+### 上游依赖（运行时直接调用它的代码）
+
+- **[comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)**（作者 **T8mars**，GPL-3.0-or-later）——
+  二采执行器在运行时直接调用它的**放大器 / DualClock 采样 / 条件重锚 / 分段装配
+  （`_append_video_guarded_overlap`）**，plan 契约与它保持逐字段兼容。本插件建立在它的基础上。
+  许可证选 GPL-3.0-or-later 也是因为它：与 GPL 代码链接的衍生作品必须同许可。
+
+### 官方素材
+
+- **MiniMax H3** 的模型与官方提示词规范（六段式 R2V 模板）——`templates/prompt-template.md`
+  按官方结构编写，只追加了硬切路线的注意事项。
+
+### 思路来源（**仅借鉴思想，未搬运任何代码**）
+
+| 来源 | 用在哪 | 说明 |
+|---|---|---|
+| **MAINodes · H3 Jerk Oracle**（matlowai） | jerk（三阶差分）剖面指标、`calm_abstain_below`「平淡时放弃搜索」 | GPL-3.0-or-later（与本包同许可）；按思路重新实现 |
+| **PERSIST**（arXiv:2608.29287） | hunt 的「持续性」判据——真转镜留在另一个稳态，闪烁会回落 | 论文思路，手写窗口均值实现 |
+| **RePaint**（Lugmayr et al., CVPR 2022, arXiv:2201.09865） | 缝窗重去噪：每一步都把已知区重注入 | **仅思路**——RePaint 仓库是 CC BY-NC-SA 4.0，与本包 GPL 不兼容，故**一行代码未用**；实际执行该机制的是 ComfyUI 核心自带的 `KSamplerX0Inpaint` |
+| **StreamingT2V** | 多 token 锚定（`anchor_tokens`）——单帧条件才是分段不一致的根源 | 论文思路 |
+| **ComfyUI 核心** | `KSamplerX0Inpaint` / `scale_latent_inpaint`（锁端每步重注入的实际实现者） | GPL-3.0 |
+
+### 协作与审计
+
+- **Zhipu AI（GLM）**：缝窗重去噪（route ①）的首版实现与配套单测（提交 `e9ee3c0`），
+  以及 token 变化检测方法的四轮文献调研。
+- **外部对抗性审计**：第三方审阅者对本插件的检测栈与策略树做过逐条核查，
+  未通过的缺陷（D1–D3 等）均已修复——相关结论记录在提交历史中。
+
+### 实测环境
+
+全部效果数字来自本机 **RTX 4060 Laptop 8GB / 32GB RAM** 上的实测；
+`docs/GUIDE.md` 中标注的阈值与经验线（负载线 180/191、`calm_min_gain` 0.15 等）均为实测值。
+
 ## 许可
 
 GPL-3.0-or-later（与上游 T8 包一致）。
