@@ -917,6 +917,11 @@ FLAT_RATIO = 1.6     # below this a tolerance window counts as featureless
 #   姿势跳变 ~1.7x；对后者硬切会发布用户可见的无动机跳切。低于此值的变化
 #   照实记录但拒绝硬切，由 calm 搜索 / 锚定 overlap 藏接缝。n=2 标定。
 HUNT_MIN_CUT_RATIO = 2.0
+# ★ 灰区复核（2026-09-28, exp_4v10a_00096 缝 85）：2.0 是 n=2 标定，贴着它的
+#   候选会被「差 0.01」卡掉——实测 85 的 ratio 1.99 但 persistence 0.922（全片
+#   第二高、画面确为近景→全景的景别切换）。ratio 落在 [2.0*HUNT_GREY_ZONE, 2.0)
+#   且持续性仍强时按转镜接受：换维度取证，而不是把同一个阈值往下挪。
+HUNT_GREY_ZONE = 0.9
 # One 17-frame block carries 5 tokens: 1 exclusive (a single frame) + 4 shared
 # (each covering 4 frames).  So a tolerance below ~4 frames cannot even reach
 # the neighbouring candidate row - worth saying out loud in the log.
@@ -1045,15 +1050,28 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
         # 见 HUNT_MIN_CUT_RATIO：真实变化 ≠ 转镜。低于置信门的变化照实记录、
         # 拒绝硬切 —— 计划位置保留，calm 搜索 / 锚定 overlap 藏接缝。
         if peak_ratio < HUNT_MIN_CUT_RATIO:
-            aligned.append({
-                "planned_cut": cut,
-                "moved": False,
-                "note": (f"local change is real but below turn confidence "
-                         f"(ratio {peak_ratio:.2f} < {HUNT_MIN_CUT_RATIO:.2f}) "
-                         f"-> kept the plan, anchored overlap"),
-                "top_candidates": top,
-            })
-            continue
+            # ★ 灰区复核：ratio 略低于置信门，但持续性（另一维度）仍然强时，
+            #   按转镜接受。persistence 门在前面（它已通过才会走到这里），此处
+            #   再确认一次同一个值；不足则维持原来的拒绝对待。
+            _grey_floor = HUNT_MIN_CUT_RATIO * HUNT_GREY_ZONE
+            _grey_pers = float(min_persistence) if min_persistence > 0.0 else 0.8
+            if peak_ratio >= _grey_floor and peak_pers >= _grey_pers:
+                _diagnostics.append(
+                    f"[HardCut]   cut {cut}: ratio {peak_ratio:.2f} in grey zone "
+                    f"[{_grey_floor:.2f}, {HUNT_MIN_CUT_RATIO:.2f}) but persistence "
+                    f"{peak_pers:.2f} >= {_grey_pers:.2f} -> accepted as a turn"
+                )
+                note = None
+            else:
+                aligned.append({
+                    "planned_cut": cut,
+                    "moved": False,
+                    "note": (f"local change is real but below turn confidence "
+                             f"(ratio {peak_ratio:.2f} < {HUNT_MIN_CUT_RATIO:.2f}) "
+                             f"-> kept the plan, anchored overlap"),
+                    "top_candidates": top,
+                })
+                continue
 
         # ★ snap the measured turn onto the exclusive-frame grid.  NEAREST wins:
         # nudging the seam a frame or two towards the turn is harmless, walking
