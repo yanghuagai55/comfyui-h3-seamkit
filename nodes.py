@@ -720,6 +720,37 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         )
 
         incoming = (prompt or "").strip()
+        # ── 显存 / 负载估算（分三类，2026-09-29 新增）────────────────────
+        # 为什么要拆开写：用户问"能不能给个公式"。能，但**只有一部分能**：
+        #   ① 几何量（画布 / token）      → 公式，精确
+        #   ② 解码阶段显存                → ComfyUI 官方公式，**真 GiB**，可核对
+        #   ③ 采样阶段的成败              → 静态量**已证伪**（见下），只能运行期实测
+        # 证据（用往期成片反查）：1568×864/141f（代理 191.0）连出 5 片，
+        # 而 1504×832/141f（代理 176.4）崩 ⇒ 代理值**非单调**，不是"不够准"而是选错量。
+        _ov_f = max(0, int(_effective_overlap))
+        _seglens = list(info.get("lengths") or [])
+        _winmax = (max(_seglens) + _ov_f) if _seglens else int(info["total_frames"])
+        _lat_t = max(1, (_winmax - 5) // 17 * 5 + 2) if _winmax > 5 else 1
+        _tok_win = _lat_t * max(1, second_h // 16) * max(1, second_w // 16)
+        # ★ ComfyUI 官方估算（`comfy/sd.py` 的 H3 VAE 分支）：`min(frames, chunk+2)`
+        #   —— 解码显存**只按一个时间块算**，不随窗长长（这就是它 350s 却不 OOM 的原因）。
+        #   19 = chunk+2，用本机 1664×928 ⇒ 1.11 GiB 反标定得到的。
+        _DEC_CHUNK = 19
+        _dec_f = min(_winmax, _DEC_CHUNK)
+        _dec_gib = (9.5 * _dec_f * second_h * second_w + 270_000_000) * 2 * 1.03 / 2**30
+        report += (
+            "\n\n=== 显存 / 负载估算 ===\n"
+            f"  每窗 token     : {_tok_win:,}  "
+            f"(latent_T {_lat_t} × {second_h // 16} × {second_w // 16})\n"
+            f"  解码阶段       : ≈{_dec_gib:.2f} GiB   ← ComfyUI 官方公式，只按"
+            f"一个时间块计 (min(窗帧, {_DEC_CHUNK})) ⇒ **不随窗长长**\n"
+            f"  采样几何代理   : 最长窗 × MP = {_winmax * canvas_mp:.1f}"
+            "   ← **无单位、且已证伪**（1568×864/141f 连出 5 片 vs 1504×832/141f 崩），仅供粗参考\n"
+            "  采样阶段成败   : **公式预测不了** —— 实测约束在 host 内存侧"
+            "（可用物理内存 / pinned 预算），\n"
+            "                   与画布几何无关。跑前关掉浏览器等占内存的进程；"
+            "每个窗开始时 #40 会打印实时余量。"
+        )
         if incoming:
             # Check the prompt against the split we just picked, then pass it on.
             result = validate_prompt(
