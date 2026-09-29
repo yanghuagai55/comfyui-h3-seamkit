@@ -648,7 +648,14 @@ def auto_plan(
         #   target=5.0s(120 帧) ⇒ cap=119 帧(4.958s)；5.67s ⇒ 136 帧；8.0s ⇒ 187 帧。
         #   （2026-09-29 教训：我一度按 `round(total/target)` 定段数，于是 target=5
         #    算出 3 段×121 帧 = 5.04s，**越了红线 1 帧** —— 红线就是红线。）
-        _cap = max(FRAME_GRID, (int(_tgt * FPS) // FRAME_GRID) * FRAME_GRID)
+        # ★ 红线卡的是**采样窗长**，不是段长（2026-09-29 实测崩溃后的修正）。
+        #   执行器的窗 = 段长 + overlap（`h3_upscale` 每窗从 start_token-overlap 起采），
+        #   所以段长必须扣掉 overlap，否则窗会超红线：
+        #     实测 target=5.67 ⇒ cap_window 136 ⇒ 段 [119,119,124] ⇒ 窗 [119,136,141]
+        #     ⇒ 141f × 1.544MP = 217.7 ≫ OOM 锚 191 ⇒ **window 2 装模型时硬崩（无 traceback）**。
+        #   扣掉 overlap 后：段上限 119 ⇒ 4 段 ⇒ 最长窗 119 ⇒ 183.7 < 191 ✓
+        _cap_window = max(FRAME_GRID, (int(_tgt * FPS) // FRAME_GRID) * FRAME_GRID)
+        _cap = max(FRAME_GRID, _cap_window - max(0, int(overlap)))
         # 段数 = **在红线内能放下的最少段数**（用满红线优先于多切）
         _n = -(-int(total_frames) // _cap)
         _n = max(1, min(int(max_segments), _n))
@@ -678,12 +685,13 @@ def auto_plan(
         if _longest > _cap:
             raise ValueError(
                 f"切不出来：{total_seconds_actual:.2f}s（{total_frames} 帧）在红线 "
-                f"target_segment_seconds={_tgt:.2f}s（网格上取 ≤ 它的最大合法 "
-                f"{_cap} 帧 = {seconds_for_frames(_cap):.3f}s）内放不下 —— "
-                f"按最少 {_n} 段排出来最长一段 {_longest} 帧 "
-                f"（{seconds_for_frames(_longest):.3f}s）超线。"
-                " 要放得下：把 target_segment_seconds 抬到下一档（如 5.0 → 5.67s，"
-                "cap 119 → 136 帧），或缩短片长。"
+                f"target_segment_seconds={_tgt:.2f}s 内放不下 —— 红线按**采样窗长**算"
+                f"：窗 ≤ {_cap_window} 帧（{seconds_for_frames(_cap_window):.3f}s），"
+                f"扣掉 overlap {int(overlap)} 帧后段长 ≤ {_cap} 帧 "
+                f"（{seconds_for_frames(_cap):.3f}s）。按最少 {_n} 段排出来最长一段 "
+                f"{_longest} 帧（{seconds_for_frames(_longest):.3f}s）超线。"
+                " 要放得下：把 target_segment_seconds 抬到下一档（如 5.67 → 8.0s），"
+                "或缩短片长，或把 overlap_frames 调小。"
             )
         # ★ 负载线**不是闸门**（2026-09-29 修正）：它按设计只是**建议**
         #   （报告里的 `load estimate` = SAFE / BORDERLINE / LIKELY-OOM，
