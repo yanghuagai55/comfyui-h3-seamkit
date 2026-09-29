@@ -1510,15 +1510,32 @@ def execute(
     # 什么都没有（E1 只在规划器报错时才带 MP，而它已被降为 warning 不拦；
     # 画布尺寸只出现在节点报告里、不进日志）。用户 2026-09-29 实际踩过：
     # 崩了想核 1.3 还是 1.5 MP，只能靠猜。
+    def _tokens_of(_frames: int, _h: int, _w: int) -> int:
+        """窗口的 DiT token 数 —— **采样阶段的正确量纲**（随帧数线性长，跨分辨率可比）。
+
+        H3 的映射：像素帧 17k+5 ↔ latent 5k+2；空间 16× 下采样。
+        `frames × MP` 只是它的线性代理（∝ token），所以两者同量级；
+        但 token 是**有意义的绝对量**，能跨分辨率比对，`帧×MP` 不能。
+        """
+        _lt = max(1, (_frames - 5) // 17 * 5 + 2) if _frames > 5 else 1
+        return _lt * max(1, _h // 16) * max(1, _w // 16)
+
     _cv_mp = float((plan.get("hardcut") or {}).get("canvas_mp") or 0.0)
+    _cv_w = int(plan.get("target_width") or 0)
+    _cv_h = int(plan.get("target_height") or 0)
     _wins = [int(e) - int(s) for _st, s, _et, e in segments]
     if _cv_mp > 0.0 and _wins:
+        _fmax = max(_wins)
         print(
-            f"[HardCut] 二采画布 {int(plan.get('target_width') or 0)}×"
-            f"{int(plan.get('target_height') or 0)} = {_cv_mp:.3f} MP"
-            f" ｜ 窗口 {len(_wins)} 个，最长 {max(_wins)}f"
-            f" ⇒ 最大负载 {max(_wins) * _cv_mp:.1f}（稳妥线 {float(LOAD_PASS):.0f}"
-            f" / OOM 锚 {float(LOAD_FAIL):.0f}）",
+            f"[HardCut] 二采画布 {_cv_w}×{_cv_h} = {_cv_mp:.3f} MP ｜ 窗口 {len(_wins)} 个，"
+            f"最长 {_fmax}f ⇒ token {_tokens_of(_fmax, _cv_h, _cv_w):,}",
+            flush=True,
+        )
+        print(
+            f"[HardCut]   负载口径：代理值 = 最长窗×MP = {_fmax * _cv_mp:.1f}"
+            f"（**无单位**；锚 {float(LOAD_FAIL):.0f} / 稳妥 {float(LOAD_PASS):.0f} 都按这个口径实测，"
+            f"换分辨率后不严格可比）｜ 解码阶段另算：ComfyUI 官方只按 "
+            f"min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
             flush=True,
         )
     for start_token, start_frame, end_token, end_frame in segments:
