@@ -606,6 +606,8 @@ def auto_plan(
     canvas_mp: float = 1.0,
     max_segments: int = 10,
     overlap: int = 0,
+    target_seconds: float | None = None,
+    reserve_frames: int = 0,
 ) -> dict:
     """Fully automatic cut planning from a chunk STEP (17-frame 档位).
 
@@ -627,6 +629,79 @@ def auto_plan(
     chunk_frames = max(FRAME_GRID, int(chunk_step) * FRAME_GRID)
     total_seconds_actual = seconds_for_frames(total_frames)
     max_segment_seconds = seconds_for_frames(chunk_frames)
+
+    # ---- 参照段数模式（2026-09-29 新增）-------------------------------
+    # `target_seconds` 给定 = 用户把 `target_segment_seconds` 当**参照**：
+    #   段数由它定（n = round(总时长 / target)），规划器只负责在 17k 网格与
+    #   负载线内把边界摆到合法位置；**摆不下就报错**，不再偷偷多切几段。
+    # 动因：旧逻辑把 `chunk_frames` 当硬上限 ⇒ 15s / target=5s / 1.5MP 会切出
+    #   4 个 ~90 帧的窗，而负载线其实容得下 3 个 ~124 帧的窗
+    #   （用户原话："我这分四个窗太空闲了"）。124×1.5 = 186 < LOAD_FAIL 191。
+    # `reserve_frames` = 边界的**搜索带宽**：理想切点 ± 这个帧数之内，规划器挑最近的
+    #   合法 17 帧边界（0 = 只认理想位置，不挪）。它**不从负载线里扣** ——
+    #   扣了会让 target=5s/1.5MP 这种本该 3 段的组合直接报错（实测踩过）。
+    if target_seconds is not None:
+        _tgt = max(float(target_seconds), 1e-9)
+        _cap = int((LOAD_FAIL - 1e-9) / max(float(canvas_mp), 1e-9))
+        _n = max(1, min(int(max_segments),
+                        int(round(total_seconds_actual / _tgt))))
+        _ideal = uniform_cut_frames(total_frames, _n)
+        _r = max(0, int(reserve_frames))
+        _placed: list[int] = []
+        for _i, _c in enumerate(_ideal):
+            _lo = max(FRAME_GRID, int(_c) - _r)
+            _hi = min(total_frames - FRAME_GRID, int(_c) + _r)
+            _cands = [f for f in range(_lo, _hi + 1, FRAME_GRID)
+                      if not _placed or f >= _placed[-1] + FRAME_GRID]
+            if not _cands:
+                raise ValueError(
+                    f"切不出来：第 {_i + 1} 个切点（理想 {int(_c)} 帧 ≈ "
+                    f"{seconds_for_frames(int(_c)):.2f}s）在 ±{_r} 帧的搜索带宽内"
+                    f"（{_lo}..{_hi} 帧）没有合法的 17 帧边界"
+                    f"（要与上一个切点至少隔 1 格）。"
+                    "加大 boundary_search_frames，或改 target_segment_seconds。"
+                )
+            _placed.append(min(_cands, key=lambda f: abs(f - int(_c))))
+        _bounds = [0] + _placed + [total_frames]
+        _segs = [(int(_bounds[i]), int(_bounds[i + 1])) for i in range(len(_bounds) - 1)]
+        _segs = [(s, e) for s, e in _segs if e > s]
+        _lengths = [e - s for s, e in _segs]
+        _longest = max(_lengths)
+        # ★ 负载线**不是闸门**（2026-09-29 修正）：它按设计只是**建议**
+        #   （报告里的 `load estimate` = SAFE / BORDERLINE / LIKELY-OOM，
+        #   由用户看着调 MP）。把它当硬上限 = 拿一个硬约束换掉另一个硬上限，
+        #   等于还是定死段数（用户原话："负载线会定死啊"）。
+        #   所以这里**只报告不拦**；真正该报错的只有「网格/搜索摆不下边界」。
+        #   代价说明：target 给太大时会规划出会 OOM 的窗 —— 报告会醒目提示，
+        #   由用户决定降 MP 还是缩短片长。
+        if _lengths[-1] < FRAME_GRID:
+            raise ValueError(
+                f"切不出来：末段只剩 {_lengths[-1]} 帧 < 一个 17 帧块（{FRAME_GRID}），"
+                "执行器建不出窗口。把 target_segment_seconds 调小一点重算。"
+            )
+        return {
+            "total_frames": total_frames,
+            "total_seconds": total_seconds_actual,
+            "segments": len(_segs),
+            "cut_frames": list(_placed),
+            "segment_frames": list(_placed),
+            "segments_list": _segs,
+            "lengths": _lengths,
+            "longest": _longest,
+            "actual_cuts": [seconds_for_frames(f) for f in _placed],
+            "chunk_step": int(chunk_step),
+            "chunk_frames": chunk_frames,
+            "max_segment_seconds": seconds_for_frames(_cap),
+            "max_frames": _cap,
+            "load": estimate_load(_segs, canvas_mp, overlap),
+            "max_canvas_mp": max_canvas_mp(_segs, overlap),
+            "canvas_mp": float(canvas_mp),
+            "variance": (sum((ln - sum(_lengths) / len(_lengths)) ** 2
+                             for ln in _lengths) / len(_lengths)),
+            "cut_mode": "target-segments",
+            "target_seconds": _tgt,
+            "reserve_frames": _r,
+        }
 
     for n in range(1, max_segments + 1):
         cuts = uniform_cut_frames(total_frames, n)

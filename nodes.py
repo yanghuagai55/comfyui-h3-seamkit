@@ -524,13 +524,27 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "multiple",
-                    default=32,
-                    min=8,
-                    max=128,
-                    step=4,
-                    tooltip="Round both canvases to this multiple (H3 wants 32).",
-                    advanced=True,
+                default=32,
+                min=8,
+                max=128,
+                step=4,
+                tooltip="Round both canvases to this multiple (H3 wants 32).",
+                advanced=True,
+            ),
+            io.Int.Input(
+                "boundary_search_frames",
+                default=17,
+                min=0,
+                max=170,
+                step=17,
+                tooltip=(
+                    "边界搜索带宽（帧，取 17 的倍数）。\n"
+                    "规划器把 target_segment_seconds 当**参照**定段数，再在「理想切点 ± 本带宽」"
+                    "内挑最近的合法 17 帧边界。0 = 只认理想位置，不挪。\n"
+                    "段数在负载线里放不下、或带宽内摆不下边界 ⇒ **直接报错**，"
+                    "不再偷偷多切几段（旧行为）。"
                 ),
+            ),
 
 
 
@@ -566,6 +580,7 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         second_megapixels: float,
         aspect_ratio: str,
         multiple: int,
+        boundary_search_frames: int = 17,
         model_name: str = "minimax_h3_latent_upscaler_3d_fp16.safetensors",
         precision: str = "bf16",
         release_policy: str = "clear_after",
@@ -612,7 +627,9 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         # `load estimate` is the number to watch, not this conversion.
         _chunk_step = max(1, int(round(float(target_segment_seconds) * FPS / FRAME_GRID)))
         info = auto_plan(total_seconds, _chunk_step, canvas_mp,
-                         overlap=_effective_overlap)
+                         overlap=_effective_overlap,
+                         target_seconds=float(target_segment_seconds),
+                         reserve_frames=max(0, int(boundary_search_frames)))
 
         plan_chunk = info["longest"]
         if plan_chunk % FRAME_GRID:
