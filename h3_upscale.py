@@ -1533,11 +1533,47 @@ def execute(
         )
         print(
             f"[HardCut]   负载口径：代理值 = 最长窗×MP = {_fmax * _cv_mp:.1f}"
-            f"（**无单位**；锚 {float(LOAD_FAIL):.0f} / 稳妥 {float(LOAD_PASS):.0f} 都按这个口径实测，"
-            f"换分辨率后不严格可比）｜ 解码阶段另算：ComfyUI 官方只按 "
+            f"（**无单位·只是粗提示**）｜ 解码阶段另算：ComfyUI 官方只按 "
             f"min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
             flush=True,
         )
+        # ── 运行期实测余量：**这才是能预测的**（2026-09-29 实证）───────────
+        # 用成片反查发现：同一画布/同一窗长/同样稠密注意力，00072~00076 全部出片，
+        # 而 09-29 那次崩 —— 静态几何量**分不开过与崩**。真约束在 host 侧：
+        #   pinned 预算 = RAM × 0.45 × 2（本机 28.5 GiB）+ 系统其它进程占用
+        # 所以报**实时**数字：可用物理内存 / pinned 余量 / 显存空闲。
+        _live = []
+        try:
+            import psutil
+            _av = psutil.virtual_memory().available / 2**30
+            _live.append(f"可用物理内存 {_av:.1f} GiB")
+        except Exception:
+            _av = None
+        try:
+            import comfy.model_management as _mm
+            _pmax = float(getattr(_mm, "MAX_PINNED_MEMORY", 0)) / 2**30
+            _pused = float(getattr(_mm, "TOTAL_PINNED_MEMORY", 0)) / 2**30
+            if _pmax > 0:
+                _live.append(f"pinned {_pused:.1f}/{_pmax:.1f} GiB"
+                             f"（余 {_pmax - _pused:.1f}）")
+        except Exception:
+            _pmax = _pused = 0.0
+        try:
+            _fb, _ = torch.cuda.mem_get_info()
+            _live.append(f"显存空闲 {_fb / 2**30:.2f} GiB")
+        except Exception:
+            pass
+        if _live:
+            print(f"[HardCut]   运行期余量：" + " ｜ ".join(_live), flush=True)
+        # 阈值是**启发式**（不是实测锚）：host 侧余量薄时，同几何量也会崩。
+        if _av is not None and _av < 6.0:
+            print(
+                f"[HardCut] ⚠⚠ 可用物理内存只剩 {_av:.1f} GiB —— 二采锁存峰值本就 "
+                f"~25.6 GiB（host 侧），这让**同画布同窗长也可能崩**（实测："
+                f"1568×864/141f 曾连出 5 片，09-29 同参数崩）。\n"
+                f"         跑之前先关掉吃内存的东西（浏览器/其它模型进程）。",
+                flush=True,
+            )
     for start_token, start_frame, end_token, end_frame in segments:
         # how much this window re-reads from the published output: > 0 only when
         # a seam asked for an anchored prefix (the calm search sets it per cut)
