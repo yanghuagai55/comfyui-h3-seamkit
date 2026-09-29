@@ -1533,8 +1533,8 @@ def execute(
         )
         print(
             f"[HardCut]   负载口径：代理值 = 最长窗×MP = {_fmax * _cv_mp:.1f}"
-            f"（**无单位·只是粗提示**）｜ 解码阶段另算：ComfyUI 官方只按 "
-            f"min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
+            f"（实测阈值 (183.8, 191.0]，与 LOAD_FAIL 吻合）｜ 解码阶段另算："
+            f"ComfyUI 官方只按 min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
             flush=True,
         )
         # ── 运行期实测余量：**这才是能预测的**（2026-09-29 实证）───────────
@@ -1565,13 +1565,12 @@ def execute(
             pass
         if _live:
             print(f"[HardCut]   运行期余量：" + " ｜ ".join(_live), flush=True)
-        # 阈值是**启发式**（不是实测锚）：host 侧余量薄时，同几何量也会崩。
+        # 阈值是**启发式**：host 侧余量薄会**降低**阈值（几何代理本身有效，见上）。
         if _av is not None and _av < 6.0:
             print(
                 f"[HardCut] ⚠⚠ 可用物理内存只剩 {_av:.1f} GiB —— 二采锁存峰值本就 "
-                f"~25.6 GiB（host 侧），这让**同画布同窗长也可能崩**（实测："
-                f"1568×864/141f 曾连出 5 片，09-29 同参数崩）。\n"
-                f"         跑之前先关掉吃内存的东西（浏览器/其它模型进程）。",
+                f"~25.6 GiB（host 侧），余量薄会把上面那条阈值的**有效线往下压**。\n"
+                f"         跑之前先关掉吃内存的东西（浏览器/其它模型进程）更稳。",
                 flush=True,
             )
     for start_token, start_frame, end_token, end_frame in segments:
@@ -1752,6 +1751,25 @@ def execute(
                 print(f"[HardCut]   window {len(segment_reports)}: crossfaded overlap "
                       f"{seg_overlap} frames at {start_frame}", flush=True)
             accumulated = core._append_video(accumulated, sampled, start_token)
+        # ── 本窗实测峰值（跑到这里才知道真数，2026-09-29 新増）─────────────
+        # 为什么要量：8GB 卡上「显存峰值」恒等于卡容量（一直是满的，报它没意义），
+        # 真正决定崩不崩的是 **host/pinned 峰值**（权重驻留是主要项）。有了这个数
+        # 才能把"预计最高占用 XX GB"从猜变成标定。
+        try:
+            import comfy.model_management as _mm2
+            _pu = float(getattr(_mm2, "TOTAL_PINNED_MEMORY", 0)) / 2**30
+            _pm = float(getattr(_mm2, "MAX_PINNED_MEMORY", 0)) / 2**30
+            _rsv = torch.cuda.memory_reserved() / 2**30
+            _maxa = torch.cuda.max_memory_allocated() / 2**30
+            print(
+                f"[HardCut]   peak/mem: pinned {_pu:.1f}"
+                + (f"/{_pm:.1f} GiB (余 {_pm - _pu:.1f})" if _pm > 0 else " GiB")
+                + f" ｜ 显存 reserved {_rsv:.2f} / alloc-peak {_maxa:.2f} GiB",
+                flush=True,
+            )
+        except Exception:
+            pass  # 诊断绝不打断采样
+
         prev_end_frame = int(end_frame)
         # The probe is optional; when it is off, simply do not run it.  (An
         # earlier version raised a private exception to skip the block and

@@ -721,12 +721,16 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
 
         incoming = (prompt or "").strip()
         # ── 显存 / 负载估算（分三类，2026-09-29 新增）────────────────────
-        # 为什么要拆开写：用户问"能不能给个公式"。能，但**只有一部分能**：
+        # 用户问"能不能给个公式"。能，拆三类写清各自的可信度：
         #   ① 几何量（画布 / token）      → 公式，精确
         #   ② 解码阶段显存                → ComfyUI 官方公式，**真 GiB**，可核对
-        #   ③ 采样阶段的成败              → 静态量**已证伪**（见下），只能运行期实测
-        # 证据（用往期成片反查）：1568×864/141f（代理 191.0）连出 5 片，
-        # 而 1504×832/141f（代理 176.4）崩 ⇒ 代理值**非单调**，不是"不够准"而是选错量。
+        #   ③ 采样阶段负载                → 代理量 `最长窗 × MP`，**阈值附近有效**
+        # 实测标定（成片反查 + 今晚两次运行，全部用实测画面尺寸与真实帧数）：
+        #   124f×1.355 = 168.0  过 ｜ 141f×1.251 = 176.4 过 ｜ 119f×1.544 = 183.8 过
+        #   141f×1.355 = 191.0  **崩**   ⇒ 阈值落在 (183.8, 191.0]，与 LOAD_FAIL 吻合
+        # ⚠ 两点提醒：① 代理是**线性**的，越是往大 token 走，真实注意力项（平方）越占优，
+        #   所以阈值只在这个量级附近可信；② host 侧余量薄（浏览器等）会**降低**阈值 ——
+        #   把 191 当天花板，不当保证。
         _ov_f = max(0, int(_effective_overlap))
         _seglens = list(info.get("lengths") or [])
         _winmax = (max(_seglens) + _ov_f) if _seglens else int(info["total_frames"])
@@ -738,18 +742,51 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         _DEC_CHUNK = 19
         _dec_f = min(_winmax, _DEC_CHUNK)
         _dec_gib = (9.5 * _dec_f * second_h * second_w + 270_000_000) * 2 * 1.03 / 2**30
+        _proxy = _winmax * canvas_mp
+        # pinned（host 侧）预算与实际占用：逐字读出，别猜
+        try:
+            import psutil as _ps
+            _ram_gib = _ps.virtual_memory().total / 2**30
+        except Exception:
+            _ram_gib = 0.0
+        try:
+            import comfy.model_management as _pmm
+            _pcap = float(getattr(_pmm, "MAX_PINNED_MEMORY", 0)) / 2**30
+            _pused = float(getattr(_pmm, "TOTAL_PINNED_MEMORY", 0)) / 2**30
+        except Exception:
+            _pcap = _pused = 0.0
+        _pin_line = (
+            f"上限 {_pcap:.1f} GiB = RAM {_ram_gib:.1f} GiB × 档位 "
+            f"{(_pcap / _ram_gib / 2):.2f} × 2"
+            if _pcap > 0 and _ram_gib > 0 else
+            "上限读不到（本节点在采样前跑，模型可能尚未驻留）"
+        )
+        _pin_now = (
+            f"已用 {_pused:.1f} GiB，余 {_pcap - _pused:.1f} GiB"
+            if _pcap > 0 else "已用读不到"
+        )
         report += (
             "\n\n=== 显存 / 负载估算 ===\n"
             f"  每窗 token     : {_tok_win:,}  "
             f"(latent_T {_lat_t} × {second_h // 16} × {second_w // 16})\n"
             f"  解码阶段       : ≈{_dec_gib:.2f} GiB   ← ComfyUI 官方公式，只按"
             f"一个时间块计 (min(窗帧, {_DEC_CHUNK})) ⇒ **不随窗长长**\n"
-            f"  采样几何代理   : 最长窗 × MP = {_winmax * canvas_mp:.1f}"
-            "   ← **无单位、且已证伪**（1568×864/141f 连出 5 片 vs 1504×832/141f 崩），仅供粗参考\n"
-            "  采样阶段成败   : **公式预测不了** —— 实测约束在 host 内存侧"
-            "（可用物理内存 / pinned 预算），\n"
-            "                   与画布几何无关。跑前关掉浏览器等占内存的进程；"
-            "每个窗开始时 #40 会打印实时余量。"
+            f"  采样负载代理   : 最长窗 × MP = {_proxy:.1f}"
+            f"   ← 实测阈值落在 (183.8, 191.0]（与 LOAD_FAIL 吻合）\n"
+            f"                   标定依据：124f×1.355=168 过 · 141f×1.251=176 过 ·"
+            f" 119f×1.544=184 过 · **141f×1.355=191 崩**\n"
+            "  两点提醒       : 该代理是**线性**的，token 更大时真实注意力（平方）会占优 ⇒"
+            " 阈值只管这一档；\n"
+            "                   host 余量薄（浏览器等）会**降低**阈值 ⇒ 把 191 当天花板，"
+            "别当保证。跑前关掉占内存的进程更稳。\n"
+            "  预计最高占用   : **host(pinned) 峰值 ≈ 25.6 GiB**（历史实测，本机配置）\n"
+            "                   —— 8GB 卡上显存峰值恒等于卡容量（8GB 一直满，报它没意义），\n"
+            "                   真正决定崩不崩的是 host 侧。\n"
+            + f"  pinned 上限    : {_pin_line}\n"
+            + f"  pinned 当前    : {_pin_now}\n"
+            + "                   上限 = RAM × 档位比例 × 2（`tools/pinned_memory_patch.py` 管档位；\n"
+            "                   稳档 0.45 ⇒ 本机 31.6 × 0.45 × 2 = 28.5 GiB）。改档要重启 ComfyUI。\n"
+            "                   本窗**实测**峰值由 #40 在每个窗结束时打印（pinned 已用/上限 + 显存 reserved）。"
         )
         if incoming:
             # Check the prompt against the split we just picked, then pass it on.
