@@ -1602,11 +1602,15 @@ def validate_prompt(
         load = estimate_load(info["segments"], canvas_mp)
         info["load"] = load
         if load["verdict"] == "LIKELY-OOM":
-            errors.append(
+            # ★ 负载线是**参照**，不是红线（2026-09-29 用户定的规则）：
+            #   红线 = `target_segment_seconds`（每段最长秒数），规划器已在那边硬卡。
+            #   所以这里**只提醒风险、不拦** —— 否则用户把红线调宽（他按设备定的）
+            #   会被负载线顶回来，等于又被另一个隐含上限定死（实测坑过一次）。
+            warnings.append(
                 f"load {load['load']:.1f} ({load['longest_window']}f x "
                 f"{float(canvas_mp):.3f}MP) is past the measured OOM anchor "
-                f"{LOAD_FAIL:.1f}; canvas <= {max_canvas_mp(info['segments']):.3f} MP or "
-                "one more cut would fit"
+                f"{LOAD_FAIL:.1f} — 可能 OOM：稳一点就把 canvas 降到 <= "
+                f"{max_canvas_mp(info['segments']):.3f} MP，或把红线调紧一档多切一段"
             )
         elif load["verdict"] == "BORDERLINE":
             warnings.append(
