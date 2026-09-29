@@ -1015,22 +1015,24 @@ def _hunt_log_line(entry) -> str:
     carries the snap line for an ACCEPTED cut, which is what explains
     `measured=73 -> boundary=68` (2026-09-23).
     """
-    moved = entry.get("moved")
     planned_cut = entry.get("planned_cut")
     boundary = entry.get("boundary_frame")
     if boundary is None:
-        text = (f"cut planned={planned_cut} -> boundary=None "
-                f"(NOT accepted, moved={moved}")
-    else:
-        offset = int(boundary) - int(planned_cut)
-        text = (f"cut planned={planned_cut} -> boundary={boundary} "
-                f"(offset={offset:+d}f, moved={moved}")
-    if entry.get("measured_turn_frame") is not None:
-        text += f", measured={entry['measured_turn_frame']}"
-    text += f", ratio={entry.get('ratio')}"
-    if entry.get("note"):
-        text += f", why: {entry['note']}"
-    return f"[HardCut]   {text})"
+        _why = (entry.get("note") or "").split("->")[0].strip()
+        return f"[HardCut]   cut {planned_cut}: REJECTED" + (f" — {_why}" if _why else "")
+    # ★ 只报 **residual（边界 vs 实测转镜）**，不报 `边界 vs 计划`。
+    #   planΔ（边界−计划）恒等于"吸附到 17k 之后的位移"，永远看着像 +0f，
+    #   与"缝到底有没有落在模型自己的转镜上"是两回事 —— 2026-09-29 它把用户
+    #   误导过一次（看着贴得完美，实际转镜差 8 帧）。这里保留 planΔ 只作参考，
+    #   判读一律看 residual：上限 = FRAME_GRID//2 = 8（转镜恰在两格正中间），
+    #   阈值 = seam_tolerance（残差 ≤ 阈值才走硬切，否则锚定 overlap）。
+    _parts = [f"cut {planned_cut}: bound {boundary}",
+              f"planΔ {int(boundary) - int(planned_cut):+d}"]
+    _turn = entry.get("measured_turn_frame")
+    if _turn is not None:
+        _parts.append(f"turn {_turn} residual {abs(int(boundary) - int(_turn))}f")
+    _parts.append(f"ratio {entry.get('ratio')}")
+    return "[HardCut]   " + " | ".join(_parts)
 
 
 def release_text_encoders() -> list:
@@ -1326,6 +1328,7 @@ def execute(
     # detections they came from.
     _log_buf = {"cfg": [], "hunt": [], "calm": [], "overlap": [], "sum": []}
     calm_overlaps = None
+    _calm_notes = None          # 在 hunt 段按缝合并输出（见日志组装处）
     if planned and isinstance(plan.get("hardcut"), dict):
         _hc = plan["hardcut"]
         if _p2("auto_calm_search", _hc.get("auto_calm_search")):
@@ -1368,8 +1371,10 @@ def execute(
                 if _i < len(calm_overlaps):
                     calm_overlaps[_i] = 0    # a reverted seam is a plain cut
             segment_frames = calm_boundaries
-            for _n in _calm_notes:
-                _log_buf["calm"].append(f"[HardCut]   calm: {_n}")
+    for _n in _calm_notes:
+        # 注：不再往 calm 段打 —— 已在 hunt 段按缝合并成一行（见上方组装处）。
+        #     保留这个空转循环只为不动 find_calm_boundaries 的返回结构。
+        pass
 
     # ---- free the text encoder before sampling ----
     # The conditioning above is fully built, and nothing downstream of this point
@@ -1470,8 +1475,24 @@ def execute(
                 f"[HardCut]   tolerance={seam_hunt.get('tolerance_frames')}f "
                 f"hunt={'on' if auto_seam_hunt else 'off'}"
             )
+            # ★ 每条缝只出一行：hunt 的头段 + calm 的决策段合并（2026-09-29 日志瘦身）。
+            #   以前一条缝吐 2~3 行（hunt 一行 + calm 一行 + 偶尔再一行），一跑十几行，
+            #   真正要看的那两个数（residual / 最终判定）反而被淹掉。
+            _calm_by_cut = {}
+            for _n in (_calm_notes or []):
+                _s = str(_n)
+                if _s.startswith("cut ") and ":" in _s:
+                    _c, _tail = _s[4:].split(":", 1)
+                    try:
+                        _calm_by_cut[int(_c.strip())] = _tail.strip()
+                    except ValueError:
+                        pass
             for entry in seam_hunt.get("aligned") or []:
-                _log_buf["hunt"].append(_hunt_log_line(entry))
+                _line = _hunt_log_line(entry)
+                _tail = _calm_by_cut.pop(int(entry.get("planned_cut")), None)
+                _log_buf["hunt"].append(_line + ("  ⟵ " + _tail if _tail else ""))
+            for _c, _tail in sorted(_calm_by_cut.items()):
+                _log_buf["hunt"].append(f"[HardCut]   cut {_c}: {_tail}")
             if seam_hunt.get("note"):
                 _log_buf["hunt"].append(f"[HardCut]   note: {seam_hunt['note']}")
         for _section in ("cfg", "hunt", "calm", "overlap", "sum"):
