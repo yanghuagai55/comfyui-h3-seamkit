@@ -27,7 +27,7 @@ import comfy.nested_tensor
 from comfy_api.latest import io
 
 from .bridge import PASS2_TYPE_STRING, PLAN_TYPE_STRING, find_upstream_module
-from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL
+from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL, LOAD_PASS
 
 CATEGORY = "MiniMax H3 Hard Cut"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
@@ -1509,6 +1509,34 @@ def execute(
         # how much this window re-reads from the published output: > 0 only when
         # a seam asked for an anchored prefix (the calm search sets it per cut)
         seg_overlap = max(0, (prev_end_frame or 0) - int(start_frame)) if prev_end_frame is not None else 0
+        # ── 二采负载预警（2026-09-29 新增）──────────────────────────────
+        # 规划器那份估计用的是**段长 × MP**，但真正吃显存的是**窗长**：
+        # 每窗从 `start_token − overlap` 起采 ⇒ 窗 = 段 + overlap。
+        # 实测差一个 overlap（17 帧）就足以硬崩：target 5.67 时段 [119,119,124]
+        # 排出来是窗 [119,136,141]，最长窗 141×1.544MP = 217.7 ≫ 锚 191，
+        # 进程在给 window 2 装模型时**直接消失（无 traceback）**（21:39 实测）。
+        # 这里用执行器**真实的窗长**再报一次。**只警告不拦** —— 191 是 8GB 卡上的
+        # 实测锚，12/16GB 的人本来就该能往上走（用户 2026-09-29 定调：不拦）。
+        _win_mp = float((plan.get("hardcut") or {}).get("canvas_mp") or 0.0)
+        if _win_mp > 0.0:
+            _win_frames = int(end_frame) - int(start_frame)
+            _win_load = _win_frames * _win_mp
+            if _win_load >= float(LOAD_FAIL):
+                print(
+                    f"[HardCut] ⚠⚠ window {len(segment_reports)} 负载 {_win_load:.0f} "
+                    f"= {_win_frames}f × {_win_mp:.3f}MP ≥ 实测 OOM 锚 {float(LOAD_FAIL):.0f}"
+                    f" —— 8GB 卡大概率在装模型时**硬崩（无 traceback、日志直接断）**。\n"
+                    f"         压窗的办法：降 second_megapixels / 调小 "
+                    f"target_segment_seconds（每段更短）/ 调小 overlap_frames。",
+                    flush=True,
+                )
+            elif _win_load >= float(LOAD_PASS):
+                print(
+                    f"[HardCut]   window {len(segment_reports)} 负载 {_win_load:.0f} "
+                    f"= {_win_frames}f × {_win_mp:.3f}MP 已过稳妥线 {float(LOAD_PASS):.0f}"
+                    f"（BORDERLINE，8GB 上留意）",
+                    flush=True,
+                )
         # ── 上采样时间 padding（熔化修复 ③，2026-09-26）─────────────────
         # 3D learned upscaler 逐窗独立处理，分块尾的时间感受野只有单侧
         # → 尾部 ~8 帧（= 下一窗的锚定源）轻度软化（0.85-0.9x，UP_W1 判别实证），
