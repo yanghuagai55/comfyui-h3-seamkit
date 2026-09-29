@@ -1505,6 +1505,22 @@ def execute(
     segment_reports = []
     prev_end_frame = None
     seam_marks = []
+    # ── 二采画布 / 最大负载：一行摘要（2026-09-29 新增）─────────────────
+    # 为什么要打这一行：崩了以后想核对"这次到底提交了多大画布"时，日志里
+    # 什么都没有（E1 只在规划器报错时才带 MP，而它已被降为 warning 不拦；
+    # 画布尺寸只出现在节点报告里、不进日志）。用户 2026-09-29 实际踩过：
+    # 崩了想核 1.3 还是 1.5 MP，只能靠猜。
+    _cv_mp = float((plan.get("hardcut") or {}).get("canvas_mp") or 0.0)
+    _wins = [int(e) - int(s) for _st, s, _et, e in segments]
+    if _cv_mp > 0.0 and _wins:
+        print(
+            f"[HardCut] 二采画布 {int(plan.get('target_width') or 0)}×"
+            f"{int(plan.get('target_height') or 0)} = {_cv_mp:.3f} MP"
+            f" ｜ 窗口 {len(_wins)} 个，最长 {max(_wins)}f"
+            f" ⇒ 最大负载 {max(_wins) * _cv_mp:.1f}（稳妥线 {float(LOAD_PASS):.0f}"
+            f" / OOM 锚 {float(LOAD_FAIL):.0f}）",
+            flush=True,
+        )
     for start_token, start_frame, end_token, end_frame in segments:
         # how much this window re-reads from the published output: > 0 only when
         # a seam asked for an anchored prefix (the calm search sets it per cut)
