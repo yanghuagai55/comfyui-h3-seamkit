@@ -642,9 +642,16 @@ def auto_plan(
     #   扣了会让 target=5s/1.5MP 这种本该 3 段的组合直接报错（实测踩过）。
     if target_seconds is not None:
         _tgt = max(float(target_seconds), 1e-9)
-        _cap = int((LOAD_FAIL - 1e-9) / max(float(canvas_mp), 1e-9))
-        _n = max(1, min(int(max_segments),
-                        int(round(total_seconds_actual / _tgt))))
+        # ★ `target_seconds` 是**红线**（用户按设备定的每段最长秒数），**不是可以超的"参照"**。
+        #   所以先把它落成网格上**不超过它**的最大合法长度：
+        #       cap = floor(target * FPS / 17) * 17
+        #   target=5.0s(120 帧) ⇒ cap=119 帧(4.958s)；5.67s ⇒ 136 帧；8.0s ⇒ 187 帧。
+        #   （2026-09-29 教训：我一度按 `round(total/target)` 定段数，于是 target=5
+        #    算出 3 段×121 帧 = 5.04s，**越了红线 1 帧** —— 红线就是红线。）
+        _cap = max(FRAME_GRID, (int(_tgt * FPS) // FRAME_GRID) * FRAME_GRID)
+        # 段数 = **在红线内能放下的最少段数**（用满红线优先于多切）
+        _n = -(-int(total_frames) // _cap)
+        _n = max(1, min(int(max_segments), _n))
         _ideal = uniform_cut_frames(total_frames, _n)
         _r = max(0, int(reserve_frames))
         _placed: list[int] = []
@@ -659,7 +666,7 @@ def auto_plan(
                     f"{seconds_for_frames(int(_c)):.2f}s）在 ±{_r} 帧的搜索带宽内"
                     f"（{_lo}..{_hi} 帧）没有合法的 17 帧边界"
                     f"（要与上一个切点至少隔 1 格）。"
-                    "加大 boundary_search_frames，或改 target_segment_seconds。"
+                    "加大 boundary_search_frames，或调 target_segment_seconds。"
                 )
             _placed.append(min(_cands, key=lambda f: abs(f - int(_c))))
         _bounds = [0] + _placed + [total_frames]
@@ -667,6 +674,17 @@ def auto_plan(
         _segs = [(s, e) for s, e in _segs if e > s]
         _lengths = [e - s for s, e in _segs]
         _longest = max(_lengths)
+        # 红线是硬约束：超了就报错，别偷偷放行
+        if _longest > _cap:
+            raise ValueError(
+                f"切不出来：{total_seconds_actual:.2f}s（{total_frames} 帧）在红线 "
+                f"target_segment_seconds={_tgt:.2f}s（网格上取 ≤ 它的最大合法 "
+                f"{_cap} 帧 = {seconds_for_frames(_cap):.3f}s）内放不下 —— "
+                f"按最少 {_n} 段排出来最长一段 {_longest} 帧 "
+                f"（{seconds_for_frames(_longest):.3f}s）超线。"
+                " 要放得下：把 target_segment_seconds 抬到下一档（如 5.0 → 5.67s，"
+                "cap 119 → 136 帧），或缩短片长。"
+            )
         # ★ 负载线**不是闸门**（2026-09-29 修正）：它按设计只是**建议**
         #   （报告里的 `load estimate` = SAFE / BORDERLINE / LIKELY-OOM，
         #   由用户看着调 MP）。把它当硬上限 = 拿一个硬约束换掉另一个硬上限，
