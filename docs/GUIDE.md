@@ -221,47 +221,9 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 
 **负载护栏**（两条策略共用）：挪动若使某段 `帧数 × canvas_mp ≥ 负载线` → 撤销挪动、退回计划点。
 
-## 1.8 缝窗重去噪（`seam_redenoise`，默认关）
-
-![缝窗重去噪：取哪一段、锁哪两端](img/redenoise.png)
-
-<sub>缝窗重去噪：取哪一段、锁哪两端</sub>
-
-**取窗**（对 `seam_marks` 里的每条缝各执行一次）：
-
-```text
-   half = seam_window_tokens // 2               ← 默认 10 // 2 = 5
-   w0   = max(0, seam_token − half)             ← 窗口起点（token）
-   w1   = min(总 token 数, w0 + seam_window_tokens)   ← 默认 10 个 token ≈ 34 帧
-```
-
-**遮罩**：`video_mask[0 : lock_tokens] = 0`、`video_mask[span−lock_tokens : span] = 0`
-（默认各 3 个 token）——两端**锁回已发布 latent**；中间 `window − 2×lock`（默认 4 个 token ≈ 14 帧）自由生成。
-**窗口内音频全自由**（mask 全 1）——但见下方"音频"：生成音频**不会**被发布。
-
-**锁端怎么保持**：不是只在开头注入一次，而是**采样每一步都把锁端重注入一次**
-（`KSamplerX0Inpaint`，时间步 0.999）→ 模型始终在"两侧都是干净关键帧"的条件下解中间区域
-（RePaint 思路，实际执行者是 ComfyUI 核心的 `KSamplerX0Inpaint`）。
-噪声用全局噪声切片 `[w0:w1]`（与首轮同相，不引入新随机性）。实测锁端收敛到已发布 latent，误差 ~2e-7。
-
-**作用范围**：只作用于**锚定 overlap 缝**（`seam_marks` = `start_token + locked`，硬切永不进入）——
-所以它与 `jerk_hardcut` 互斥（那边是硬切、不进名单），与 `calm_overlap` 是天然搭档：
-锚定 overlap 先铺结构，redenoise 重画"A 冻结前缀 | B 新鲜渲染"的交界（窗口正好骑在交界上，
-外侧锁 A 前缀尾 3 token、内侧锁 B 开头 3 token，中间重画接缝本身）。
-
-**前置门**（`seam_redenoise_gate=auto`）：每条缝算"闹度" =
-缝邻域 5 个 token 的 `max(global, jerk)` 均值 ÷ 全片中位；**≥ 1.5 直接跳过**（闹处重画容易生伪纹理）。
-`seam_redenoise_frames` 可指定只做某几条缝（逗号分隔帧号，±17 帧内匹配）。
-
-**事后否决**：用 `tools/check_cut_flicker.py` 看缝附近是否冒出细深色"裂纹"笔画——明显增加即判注入伪纹理，回退。
-
-**音频**：联合生成时音频参与（帮视频与声音对齐），但写回**只有视频**
-（`accumulated[:, :, w0:w1] = new_video`）——成片音频仍是参考音频透传，**对白/音效不会被破坏**。
-
 ## 1.9 音频与解码
 
 - **音频透传**：参考音频整片透传，不随视频切（条件节点的音频槽全片同源）
-- redenoise 窗口内生成的音频被丢弃（见 1.8）
 - 解码：`AVDecodeT8` 一次解码整条拼接后的 latent → VHS_VideoCombine 写 mp4
 
 ---
@@ -282,7 +244,6 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | **calm 组** | 挪界搜索 / 落缝策略 | 下游 Pass-2 Plan | 不会 |
 | **锚定组** | keyframe 锚定强度与宽度 | 下游 Pass-2 Plan | 不会 |
 | **拼缝组** | 三态怎么选 / 上采样时间重叠 | 下游 Pass-2 Plan | 不会 |
-| **重去噪组** | 缝窗重去噪 | 下游 Pass-2 Plan | 不会 |
 | **诊断组** | dump / 显存日志 | 下游 Pass-2 Plan | 不会 |
 
 ## 2.1 接线总览
@@ -431,18 +392,6 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 | `seam_blend` | 冻结式 ↔ latent 交叉淡化 | False | **静止/对话戏开；动作戏关** | 对话 true / 动作 false |
 | `upscale_pad_tokens` | 上采样分块时间重叠 | **3** | 回旧行为填 0 | 3 |
 
-## 2.11 重去噪组（下游 Pass-2 · 5 控件）
-
-> 原理见 1.8。**只作用于锚定 overlap 缝**——与 `jerk_hardcut` 互斥。
-
-| 控件 | 作用 | 默认 | 什么时候改 | 举例 |
-|---|---|---|---|---|
-| `seam_redenoise` | 总开关 | False | 缝有真台阶时开 | false |
-| `seam_redenoise_frames` | 只做指定缝 | 空 | 定点修复（单缝实验） | "85" |
-| `seam_window_tokens` | 缝窗大小 | 10 | 想要更大自由区 → 12-14 | 10 |
-| `seam_lock_tokens` | 两端锁定数 | 3 | 保持（≥ 窗/2 会整窗锁死） | 3 |
-| `seam_redenoise_gate` | 闹度自动门 | off | 全开自动时设 auto | off |
-
 ## 2.12 诊断组（下游 Pass-2 · 3 控件）
 
 | 控件 | 作用 | 默认 | 什么时候改 | 举例 |
@@ -457,7 +406,6 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 |---|---|
 | **动作 / 运镜剧烈的片** | 全在下游：`overlap_frames=17` + `auto_calm_search=true` + `auto_seam_hunt=true` + `profile_camera_compensate=true` + **`calm_policy=jerk_hardcut`（缝藏进最猛的运动里）** + `seam_blend=false` |
 | **对话 / 静态镜头片** | 同上，但 `calm_policy=calm_overlap`（缝挪到最平缓处）+ `seam_blend=true`（交叉淡化在静止内容上零重影）——或直接用默认 `auto` 让每缝自己选 |
-| **剧烈连续动作的缝还想更平滑** | 上述动作配置 + `seam_redenoise=true` + `gate=off` + `seam_redenoise_frames="<缝>"`（单缝实验，1.8） |
 | **只想快速出片（不追缝）** | `overlap_frames=0`（全硬切）+ hunt/calm 关 —— 要求提示词切点非常准 |
 | **换剧情 / 换片** | 改 `cache_key`（避免读到上一条片的缓存） |
 | **怀疑某段软化 / 裂纹** | `dump_latents=true` + `dump_dir` 指新目录 → 用 `torch.load` 离线解剖（缓存管理见 `tools/latent_cache.py`） |
@@ -466,7 +414,7 @@ H3 的时间轴不是均匀帧，而是**按 token 组组织**的：
 
 ```text
    重采 ✗   上游 Plan 的 12 控件（片长/画布/每段秒数/缓存/提示词）＋ 一采采样器（#30）＋ 条件节点
-   不采 ✓   下游 Pass-2 的 33 控件（模型/hunt/calm+overlap/锚定/拼缝/重去噪/诊断/cfg）＋ 二采采样器（#38）
+   不采 ✓   下游 Pass-2 的 28 控件（模型/hunt/calm+overlap/锚定/拼缝/诊断/cfg）＋ 二采采样器（#38）
 ```
 
 ---

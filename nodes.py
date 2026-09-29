@@ -1123,13 +1123,6 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                              tooltip="上采样分块时间重叠（熔化修复，默认 3；0=旧行为）。"),
                 io.Boolean.Input("seam_blend", default=False,
                                  tooltip="锚定缝 latent 线性交叉淡化（静止镜头适用；运动镜头会重影）。"),
-                io.Boolean.Input("seam_redenoise", default=False, tooltip="缝窗重去噪（E-3）。"),
-                io.String.Input("seam_redenoise_frames", default="",
-                                tooltip="只重去噪指定帧附近的缝（逗号分隔；空=自动）。"),
-                io.Int.Input("seam_window_tokens", default=10, min=4, max=30, tooltip="缝窗 token 数。"),
-                io.Int.Input("seam_lock_tokens", default=3, min=1, max=10, tooltip="缝窗两侧锁定 token 数。"),
-                io.Combo.Input("seam_redenoise_gate", options=["off", "auto"], default="off",
-                               tooltip="门控：auto=按 busy 度跳过闹缝。"),
                 io.Boolean.Input("dump_latents", default=False, tooltip="诊断：中间 latent 落盘。"),
                 io.String.Input("dump_dir", default="latent_dump",
                                 tooltip="dump 输出目录。"),
@@ -1155,9 +1148,7 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
                 hunt_search_window: int = 34, calm_too_quiet_below: float = 0.05,
                 calm_min_gain: float = 0.15, auto_seam_hunt: bool = False,
                 anchor_tokens: int = 1, upscale_pad_tokens: int = 3, seam_blend: bool = False,
-                seam_redenoise: bool = False, seam_redenoise_frames: str = "",
-                seam_window_tokens: int = 10, seam_lock_tokens: int = 3,
-                seam_redenoise_gate: str = "off", dump_latents: bool = False,
+                dump_latents: bool = False,
                 dump_dir: str = "", show_memory_log: bool = True):
         plan = {
             "schema": PASS2_TYPE_STRING,
@@ -1186,18 +1177,12 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             "anchor_tokens": int(anchor_tokens),
             "upscale_pad_tokens": int(upscale_pad_tokens),
             "seam_blend": bool(seam_blend),
-            "seam_redenoise": bool(seam_redenoise),
-            "seam_redenoise_frames": str(seam_redenoise_frames or ""),
-            "seam_window_tokens": int(seam_window_tokens),
-            "seam_lock_tokens": int(seam_lock_tokens),
-            "seam_redenoise_gate": str(seam_redenoise_gate),
             "dump_latents": bool(dump_latents),
             "dump_dir": str(dump_dir or ""),
             "show_memory_log": bool(show_memory_log),
         }
-        print("[SeamKit] Pass-2 plan: hunt=%s pad=%d blend=%s redenoise=%s(%s)"
+        print("[SeamKit] Pass-2 plan: hunt=%s pad=%d blend=%s"
               % ("on" if plan["auto_seam_hunt"] else "off",
-                 plan["upscale_pad_tokens"], plan["seam_blend"],
-                 "on" if plan["seam_redenoise"] else "off", plan["seam_redenoise_gate"]),
+                 plan["upscale_pad_tokens"], plan["seam_blend"]),
               flush=True)
         return io.NodeOutput(plan)

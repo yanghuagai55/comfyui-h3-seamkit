@@ -22,7 +22,6 @@ with every segment no longer than <target_segment_seconds> seconds.
 retention_analysis:
 <Subject 1> (appears in [Shot 1], [Shot 2], ...): fully_preserved - <具体保留了什么>.
 <Subject 2> (appears in [Shot 1], [Shot 2], ...): fully_preserved - <环境/光线/构图>.
-<Audio 1>: reference - <参考音色/节奏，不搬原话>.
 
 detailed_description:
 <一两句定调：风格/画质/色调 —— 必须在 [Shot 1] 之前>.
@@ -38,6 +37,37 @@ non_diegetic_music:
 ```
 
 **官方硬规则**（逐条别漏）：
+
+- **⚠⚠ 媒体标签是「引用声明」，只有真的接了对应媒体才准出现。** 这是本项目最常踩的一个坑
+  （2026-09-29 实际炸过一次），后果是**采样直接抛错、整轮白跑**：
+
+  ```text
+  ValueError: MiniMax H3 prompt media tag validation failed:
+  <Audio 1> is not connected; available audio count is 0.
+  Connect the referenced media, correct the ordinal, or disable
+  strict_prompt_tags to treat it as plain prompt text.
+  ```
+
+  对应关系（第 N 个标签 ↔ 第 N 个槽位，**从 1 数**）：
+
+  | 提示词里写的 | 必须在图里接上 |
+  |---|---|
+  | `<Subject N>` / `<Picture N>` | `ref_images.ref_image_{N-1}` |
+  | `<Audio N>` | `ref_audios.ref_audio_{N-1}` |
+  | `<Video N>` | `ref_videos.ref_video_{N-1}` |
+
+  - **没接就别写那一行。** `MiniMaxH3AudioConditioningT8` 的 `strict_prompt_tags` 默认 `True`，
+    显式写的标签 + 该类型可用数为 0 ⇒ **致命错误**（不是警告）。
+  - **本骨架默认不含音频引用**（下面 `retention_analysis` 里没有 `<Audio N>` 行）——
+    想加就自己补一行，且**务必先在图上接好音频参考**：
+
+    ```text
+    <Audio 1>: reference - <参考音色/节奏，不搬原话>.
+    ```
+
+  - 修法三选一：① 删掉那一行（最省）② 接上对应媒体 ③ 把 **两个** conditioning 节点
+    （一采 + 二采各一个）的 `strict_prompt_tags` 关掉 —— 关掉后标签会降级为普通文本。
+  - **`overall_soundscape` 不受影响**：那一段是描述「要生成什么声音」，不是引用，照写。
 
 - `[Shot 1]` **不带时间戳**；`[Shot 2]` 起每段以 `At MM:SS.mmm, ` 开头
 - `summary` 以任务类型前缀开头（参考图锁角色 + 生成新视频 → `[reference generation]`）
@@ -118,6 +148,8 @@ executed as a <N>-shot sequence with hard cuts at <...>
 - [ ] `[Shot 1]` 无时间戳；`[Shot 2]` 起都有 `At MM:SS.mmm, `
 - [ ] 时间戳任意浮点即可（`At 00:03.75` 与 `At 00:03.750` 等价）；想完全对齐就照报告 `cut points` 写
 - [ ] `retention_analysis` 列全所有 `[Shot N]`；标签用官方两族
+- [ ] **每个媒体标签都有对应的已连接媒体**（`<Subject N>`→`ref_image_{N-1}`、`<Audio N>`→`ref_audio_{N-1}`、
+      `<Video N>`→`ref_video_{N-1}`）—— 没接就删掉那一行，否则 `strict_prompt_tags` 会直接抛错
 - [ ] 没有 `no cuts` / `continuous take` / `unbroken`
 - [ ] **blocking 写死**（站位/朝向/视线 + "全片统一"声明）
 - [ ] 相邻镜头**换了机位或景别**（否则切点看起来像"崩了"而不是剪辑）

@@ -3,7 +3,7 @@
 **把 MiniMax H3 分块二采的「接缝」，变成一次有意识的剪辑。**
 
 > `seam` = 接缝，`kit` = 工具箱。硬切（把缝变成剪辑点）只是其中一种策略——缝还看得见时，
-> 还有冻结锚定 / 交叉淡化 / 缝窗重去噪一整套处置办法。
+> 还有冻结锚定 / 交叉淡化一整套处置办法。
 > 依赖上游 [comfyui-minimax-h3-audio-T8](https://github.com/T8mars/comfyui-minimax-h3-audio-T8)（GPL-3.0-or-later），运行时调用它的放大器 / 采样 / 条件重锚。
 > **许可：GPL-3.0-or-later**（与上游一致）。除 ComfyUI 与 torch 外无额外 pip 依赖。
 
@@ -24,7 +24,7 @@
 ![架构一览](docs/img/arch.png)
 
 - **上游 Plan**：画布、每段秒数、缓存开关、提示词——只留**影响一采**的东西
-- **下游 Pass-2 Plan**：模型三件套、hunt/calm、锚定、拼缝、重去噪、诊断——全部二采参数
+- **下游 Pass-2 Plan**：模型三件套、hunt/calm、锚定、拼缝、诊断——全部二采参数
 - **`calm_policy=auto`（默认）**：逐缝看邻域闹度——动作里的缝硬切藏进混乱，
   动作结束后的平静切点自动改走锚定 overlap。同一条片两种缝各走各的。
 - 两个执行节点**零控件**；提示词识别只认**行首 `[Shot N] At + 时间点`**（任意浮点精度）。
@@ -63,7 +63,7 @@ D:\comfyui\comfyenv\python.exe tools\pinned_memory_patch.py
 
 参数细节与原理：[`docs/GUIDE.md`](docs/GUIDE.md)
 （第一章工作原理带线框图；第二章按组讲每个控件：画布 / 切点 / 缓存 / 提示词 / 采样 /
-模型 / hunt / calm / 锚定 / 拼缝 / 重去噪 / 诊断）。
+模型 / hunt / calm / 锚定 / 拼缝 / 诊断）。
 
 ## v1.4 亮点
 
