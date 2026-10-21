@@ -545,17 +545,18 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
                     "不再偷偷多切几段（旧行为）。"
                 ),
             ),
-
-
-
-
-
-
-
-
-
-            ],
-            outputs=[
+            io.Boolean.Input(
+                "green_screen_mode",
+                default=False,
+                tooltip=(
+                    "绿幕模式（专用于绿幕人物视频）：\n"
+                    "1. 禁用硬切，全程使用 overlap 平缓衔接（overlap 参数无需改动，默认 17 帧平缓过渡）；\n"
+                    "2. 视频均等分割，并在 boundary_search_frames 搜索带宽内寻找最合适切点；\n"
+                    "3. 上游不再检测提示词的分镜点（无需 [Shot N] 与 At 时间戳，一镜到底/免分镜提示词直接放行通过）。"
+                ),
+            ),
+        ],
+        outputs=[
                 PLAN_TYPE.Output("plan"),
                 io.String.Output("prompt"),
                 io.String.Output("report"),
@@ -581,6 +582,7 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         aspect_ratio: str,
         multiple: int,
         boundary_search_frames: int = 17,
+        green_screen_mode: bool = False,
         model_name: str = "minimax_h3_latent_upscaler_3d_fp16.safetensors",
         precision: str = "bf16",
         release_policy: str = "clear_after",
@@ -619,10 +621,14 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         # actually use: calm search brings its own anchored overlap, so plan the
         # segments against THAT, or a calm seam pushes the longest window past
         # the load line (15s layout: 157.5 -> 183.7).
-        _effective_overlap = (
-            max(0, int(calm_overlap_frames)) if auto_calm_search
-            else max(0, int(overlap_frames))
-        )
+        # 绿幕模式：全程使用 overlap（默认至少 17 帧平缓过渡），用户无需修改 overlap 参数
+        if green_screen_mode:
+            _effective_overlap = max(17, int(calm_overlap_frames) if auto_calm_search else int(overlap_frames or 17))
+        else:
+            _effective_overlap = (
+                max(0, int(calm_overlap_frames)) if auto_calm_search
+                else max(0, int(overlap_frames))
+            )
         # Seconds -> the nearest legal 17-frame window cap.  The report's
         # `load estimate` is the number to watch, not this conversion.
         _chunk_step = max(1, int(round(float(target_segment_seconds) * FPS / FRAME_GRID)))
@@ -641,7 +647,7 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
             target_height=second_h,
             chunk_frames=plan_chunk,
             anchor_strength=anchor_strength,
-            overlap_frames=max(0, int(overlap_frames)),
+            overlap_frames=_effective_overlap if green_screen_mode else max(0, int(overlap_frames)),
             precision=precision,
             release_policy=release_policy,
             second_pass_audio_policy=second_pass_audio_policy,
@@ -649,7 +655,7 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
                 "total_seconds": info["total_seconds"],
                 "total_frames": info["total_frames"],
                 "chunk_frames": plan_chunk,
-                "overlap_frames": max(0, int(overlap_frames)),
+                "overlap_frames": _effective_overlap if green_screen_mode else max(0, int(overlap_frames)),
                 "cut_frames": list(info["cut_frames"]),
                 "cut_seconds": list(info["actual_cuts"]),
                 "segment_frames": list(info["segment_frames"]),
@@ -664,10 +670,16 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
         # the plan directly — the upscale node reads it back from there.
         plan.setdefault("hardcut", {})["seam_tolerance"] = max(0, int(seam_tolerance_frames))
         _hc = plan.setdefault("hardcut", {})
-        _hc["auto_calm_search"] = bool(auto_calm_search)
+        _hc["green_screen_mode"] = bool(green_screen_mode)
+        if green_screen_mode:
+            _hc["auto_calm_search"] = True
+            _hc["calm_policy"] = "calm_overlap"
+            _hc["calm_overlap_frames"] = int(_effective_overlap)
+        plan["green_screen_mode"] = bool(green_screen_mode)
+        _hc["auto_calm_search"] = bool(_hc.get("auto_calm_search", auto_calm_search))
         _hc["calm_search_window"] = max(0, int(calm_search_window))
-        _hc["calm_overlap_frames"] = max(0, int(calm_overlap_frames))
-        _hc["calm_policy"] = str(calm_policy)
+        _hc["calm_overlap_frames"] = max(0, int(_hc.get("calm_overlap_frames", calm_overlap_frames)))
+        _hc["calm_policy"] = str(_hc.get("calm_policy", calm_policy))
         _hc["profile_camera_compensate"] = bool(profile_camera_compensate)
         _hc["profile_reduce"] = str(profile_reduce)
         _hc["calm_abstain_below"] = max(0.0, float(calm_abstain_below))
@@ -789,27 +801,37 @@ class MiniMaxH3HardCutFirstPassPlan(io.ComfyNode):
             "                   本窗**实测**峰值由 #40 在每个窗结束时打印（pinned 已用/上限 + 显存 reserved）。"
         )
         if incoming:
-            # Check the prompt against the split we just picked, then pass it on.
-            result = validate_prompt(
-                incoming,
-                total_seconds=info["total_seconds"],
-                requested_cuts=list(info["actual_cuts"]),
-                canvas_mp=canvas_mp,
-                chunk_frames=plan_chunk,
-                overlap_frames=max(0, int(overlap_frames)),
-                segment_frames=list(info["cut_frames"]),
-                overlap_anchored=bool(auto_calm_search) or int(overlap_frames) > 0,
-                loose=bool(loose_prompt) or bool(auto_calm_search) or int(overlap_frames) > 0,
-            )
-            out_prompt = incoming
-            errors = result.get("errors") or []
-            report = report + "\n\n" + result["report"]
-            if errors:
-                raise ValueError(
-                    f"Hard-cut auto check failed ({len(errors)} error(s)) — the prompt "
-                    "and the split this node picked disagree, so the model would not "
-                    "cut where the executor cuts.\n\n" + report
+            if green_screen_mode:
+                out_prompt = incoming
+                report = report + (
+                    "\n\n=== 绿幕模式 (Green Screen Mode) ===\n"
+                    "  - 模式状态     : 开启（全程使用 overlap 平缓过渡，禁用硬切）\n"
+                    "  - 提示词校验   : 已跳过分镜点检测，提示词直接放行通过\n"
+                    f"  - 均等分段     : 共 {info['segments']} 段，段间使用 {int(_effective_overlap)} 帧 overlap 锚定过渡\n"
+                    f"  - 搜索带宽     : ±{max(0, int(boundary_search_frames))} 帧范围内寻找合适切点"
                 )
+            else:
+                # Check the prompt against the split we just picked, then pass it on.
+                result = validate_prompt(
+                    incoming,
+                    total_seconds=info["total_seconds"],
+                    requested_cuts=list(info["actual_cuts"]),
+                    canvas_mp=canvas_mp,
+                    chunk_frames=plan_chunk,
+                    overlap_frames=max(0, int(overlap_frames)),
+                    segment_frames=list(info["cut_frames"]),
+                    overlap_anchored=bool(auto_calm_search) or int(overlap_frames) > 0,
+                    loose=bool(loose_prompt) or bool(auto_calm_search) or int(overlap_frames) > 0,
+                )
+                out_prompt = incoming
+                errors = result.get("errors") or []
+                report = report + "\n\n" + result["report"]
+                if errors:
+                    raise ValueError(
+                        f"Hard-cut auto check failed ({len(errors)} error(s)) — the prompt "
+                        "and the split this node picked disagree, so the model would not "
+                        "cut where the executor cuts.\n\n" + report
+                    )
 
             # The model turns a little off the time it is given (measured -10..+1
             # frames, content- and seed-dependent) while the executor can only
@@ -932,12 +954,19 @@ class MiniMaxH3HardCutValidate(io.ComfyNode):
     @classmethod
     def execute(cls, prompt, plan=None):
         if plan is not None:
+            _hc = (plan.get("hardcut") or {}) if isinstance(plan, dict) else {}
+            if _hc.get("green_screen_mode") or (isinstance(plan, dict) and plan.get("green_screen_mode")):
+                report = (
+                    "=== MiniMax H3 Hard-Cut Prompt Check ===\n"
+                    "绿幕模式已开启 (Green Screen Mode)：\n"
+                    "全程使用 overlap 平缓过渡，禁用硬切，不检测提示词分镜点，直接放行通过。"
+                )
+                return io.NodeOutput(prompt, ui={"text": (report,)})
             geo = geometry_from_plan(plan)
             # ★ 与 #56 的口径对齐。修之前这里 `loose` 与 `overlap_anchored` 两个都没传，
             # 而 #56 传了 —— 同一个提示词在 #56 只是 warning，到这里却变成 raise，
             # 整个图在 0.02 秒被拦住（实测：一条"单镜头连续长镜"的提示词）。
             # 本节点入参只有 prompt + plan，所以从 plan 里读（#56 已写入 hardcut 字典）。
-            _hc = (plan.get("hardcut") or {}) if isinstance(plan, dict) else {}
             _anchored = bool(geo.get("overlap") or 0) > 0 or bool(_hc.get("auto_calm_search"))
             _loose = _anchored or bool(_hc.get("loose_prompt"))
             result = validate_prompt(

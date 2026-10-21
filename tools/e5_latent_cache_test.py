@@ -129,7 +129,7 @@ pt.unlink(missing_ok=True)
 import asyncio  # noqa: E402
 
 FPP = "MiniMaxH3HardCutFirstPassPlan"
-NEWEST = "boundary_search_frames"        # 2026-09-29 新增
+NEWEST = "green_screen_mode"            # 绿幕模式（最新新增，置于末位防老工作流错位）
 nodes = {n.define_schema().node_id: n.define_schema()
          for n in asyncio.run(pkg.comfy_entrypoint().get_node_list())}
 names = [i.id if hasattr(i, "id") else getattr(i, "name", None)

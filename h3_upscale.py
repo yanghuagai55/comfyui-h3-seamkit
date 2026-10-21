@@ -99,6 +99,7 @@ def find_calm_boundaries(
     calm_min_quality: float = 0.0,
     too_quiet_below: float = 0.0,
     calm_min_gain: float = 0.0,
+    green_screen_mode: bool = False,
 ):
     """Decide, per planned cut, WHERE to actually put the window boundary.
 
@@ -206,7 +207,8 @@ def find_calm_boundaries(
             # and let that seam get an anchored overlap.
             _dev, _dev_src = None, None
         if (
-            b is not None
+            not green_screen_mode
+            and b is not None
             and _dev is not None
             and _dev <= int(seam_tolerance)
             and all(abs(int(b) - int(o)) >= int(min_sep) for o in refs)
@@ -248,9 +250,10 @@ def find_calm_boundaries(
         # 自己邻域的闹度（±2 token 的 max(global,jerk) 均值 ÷ 全片中位）：
         #   ≥ CALM_AUTO_BUSY_RATIO → 周围在炸 → jerk_hardcut（藏进最猛处，硬切）
         #   <  ...                 → 周围平静   → calm_overlap（挪最平缓 + 锚定）
-        use_jerk = policy == "jerk_hardcut"
+        eff_policy = "calm_overlap" if green_screen_mode else policy
+        use_jerk = eff_policy == "jerk_hardcut"
         auto_tag = ""
-        if policy == "auto":
+        if eff_policy == "auto":
             _tok = tok_of(cut)
             _nb = [score[i] for i in range(_tok - 2, _tok + 3) if i in score]
             _busy = (sum(_nb) / len(_nb) / _score_med) if (_nb and _score_med > 1e-9) else 0.0
@@ -363,11 +366,17 @@ def find_calm_boundaries(
             continue
         boundaries.append(int(best))
         overlaps.append(int(overlap_frames))
-        notes.append(
-            f"cut {cut}: hunt unreliable (boundary {b}, ratio {entry.get('ratio')}) "
-            f"-> calm frame {best} (score {score.get(tok_of(best)):.2f}), "
-            f"overlap {int(overlap_frames)}f"
-        )
+        if green_screen_mode:
+            notes.append(
+                f"cut {cut}: green screen mode -> calm frame {best} (score {score.get(tok_of(best)):.2f}), "
+                f"overlap {int(overlap_frames)}f (no hard cut)"
+            )
+        else:
+            notes.append(
+                f"cut {cut}: hunt unreliable (boundary {b}, ratio {entry.get('ratio')}) "
+                f"-> calm frame {best} (score {score.get(tok_of(best)):.2f}), "
+                f"overlap {int(overlap_frames)}f"
+            )
     return boundaries, overlaps, notes
 
 
@@ -1181,6 +1190,10 @@ def execute(
     planned = [int(c) for c in ((plan.get("hardcut") or {}).get("segment_frames") or [])]
     tolerance = max(0, int((plan.get("hardcut") or {}).get("seam_tolerance", 17)))
     segment_frames = planned or None
+    is_green_screen = bool(
+        (plan.get("hardcut") or {}).get("green_screen_mode", False)
+        or (plan.get("green_screen_mode", False) if isinstance(plan, dict) else False)
+    )
     seam_hunt = None
     profile = None  # 门控在 hunt 关着时也要能问；None -> gate 全放行并打日志
     aligned, boundary_tokens = None, None
@@ -1212,19 +1225,19 @@ def execute(
             ),
             search_window=int((plan.get("hardcut") or {}).get("hunt_search_window", 0)),
         )
-        if not auto_seam_hunt:
-            # hunt 关（用户手动选择）：全部已接受的切点转成 declined 形态
+        if (not auto_seam_hunt) or is_green_screen:
+            # hunt 关或绿幕模式：全部已接受的切点转成 declined 形态
             # （与 persistence/flat 门同构），回退计划位置 + 锚定 overlap。
             boundary_tokens = []
             for entry in aligned:
                 if entry.get("boundary_token") is not None:
                     entry["moved"] = False
+                    _reason = "green screen mode -> declined hard cut" if is_green_screen else "hunt off -> declined the measured turn"
                     entry["note"] = "; ".join(
                         x
                         for x in (
                             entry.get("note"),
-                            f"hunt off -> declined the measured turn "
-                            f"{entry.get('measured_turn_frame')} (anchored overlap)",
+                            f"{_reason} {entry.get('measured_turn_frame')} (anchored overlap)",
                         )
                         if x
                     )
@@ -1269,9 +1282,13 @@ def execute(
                 seam_hunt_note = None
         else:
             seam_hunt_note = (
-                "hunt off -> all planned cuts kept as anchored overlaps"
-                if not auto_seam_hunt
-                else "no latent change found within tolerance of any planned cut"
+                "green screen mode -> all planned cuts kept as anchored overlaps (no hard cut)"
+                if is_green_screen
+                else (
+                    "hunt off -> all planned cuts kept as anchored overlaps"
+                    if not auto_seam_hunt
+                    else "no latent change found within tolerance of any planned cut"
+                )
             )
         seam_hunt = {
             "tolerance_frames": tolerance,
@@ -1331,17 +1348,18 @@ def execute(
     _calm_notes = None          # 在 hunt 段按缝合并输出（见日志组装处）
     if planned and isinstance(plan.get("hardcut"), dict):
         _hc = plan["hardcut"]
-        if _p2("auto_calm_search", _hc.get("auto_calm_search")):
+        if is_green_screen or _p2("auto_calm_search", _hc.get("auto_calm_search")):
             calm_boundaries, calm_overlaps, _calm_notes = find_calm_boundaries(
                 profile, planned, aligned, frame_count,
                 window=int(_hc.get("calm_search_window", 34)),
                 overlap_frames=int(_p2("calm_overlap_frames", _hc.get("calm_overlap_frames", 17))),
                 seam_tolerance=int(_hc.get("seam_tolerance", 17)),
-                policy=str(_hc.get("calm_policy", "calm_overlap")),
+                policy="calm_overlap" if is_green_screen else str(_hc.get("calm_policy", "calm_overlap")),
                 abstain_below=float(_hc.get("calm_abstain_below", 0.0)),
                 calm_min_quality=float(_hc.get("calm_min_quality", 0.0)),
                 too_quiet_below=float(_hc.get("calm_too_quiet_below", 0.0)),
                 calm_min_gain=float(_hc.get("calm_min_gain", 0.0)),
+                green_screen_mode=is_green_screen,
             )
             # ---- load guard (external review D2) ---------------------------
             # auto_plan sized the PLANNED windows.  The search just moved the
@@ -1369,9 +1387,9 @@ def execute(
                 )
                 calm_boundaries[_i] = _plan_cut
                 if _i < len(calm_overlaps):
-                    calm_overlaps[_i] = 0    # a reverted seam is a plain cut
+                    calm_overlaps[_i] = int(_p2("calm_overlap_frames", _hc.get("calm_overlap_frames", 17))) if is_green_screen else 0
             segment_frames = calm_boundaries
-    for _n in _calm_notes:
+    for _n in _calm_notes or []:
         # 注：不再往 calm 段打 —— 已在 hunt 段按缝合并成一行（见上方组装处）。
         #     保留这个空转循环只为不动 find_calm_boundaries 的返回结构。
         pass
@@ -1400,6 +1418,8 @@ def execute(
     # soft_empty_cache, never unload_all_models).
     _empty_between = bool((plan.get("hardcut") or {}).get("empty_cache_between_segments", True))
     ov_input = max(0, int(_p2("overlap_frames", plan.get("temporal_overlap_frames", 0))))
+    if is_green_screen and ov_input == 0:
+        ov_input = int(_p2("calm_overlap_frames", (plan.get("hardcut") or {}).get("calm_overlap_frames", 17))) or 17
     _chunk = int(plan.get("temporal_chunk_frames") or 0)
     ov_tokens = ov_input
     if _chunk > 0 and ov_input >= _chunk:
@@ -1470,6 +1490,10 @@ def execute(
             + ("   ('+' = moved by the search, '*' = on the planned frame)"
                if any(b not in hunted for b in boundaries) else "")
         )
+        if is_green_screen:
+            _log_buf["cfg"].append(
+                "[HardCut]   绿幕模式已开启 (Green Screen Mode)：全程使用 overlap 平缓衔接，禁用硬切"
+            )
         if seam_hunt:
             _log_buf["cfg"].append(
                 f"[HardCut]   tolerance={seam_hunt.get('tolerance_frames')}f "
