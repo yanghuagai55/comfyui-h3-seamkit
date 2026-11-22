@@ -1,0 +1,211 @@
+# -*- coding: utf-8 -*-
+"""Route 3 · 压缩序列的 forward
+
+思路（不 fork 整个 `_forward`，只换「喂给 50 层的行集」）：
+
+1. 先用模型自己的 `_embed_and_pack` 在**完整布局**上算嵌入 —— 文本/条件/参考/音频的
+   位置编码、时间步全部沿用原生实现，零重复实现风险。
+2. 按 `route3_plan` 挑出 `keep = [Prefix | FG_full | BG_strided]` 这些行。
+3. 用挑出来的行跑 50 层（rope 表用 `position_ids[keep]`；mod_segments 前缀原样复用，
+   视频段并成一条）。
+4. 只对保留下来的视频行过 `final_layer`，再 scatter 回完整网格 → `unpatchify_video`。
+   中间帧由上层做残差传播（本文件不负责）。
+
+性质：
+* `s_bg=1`（全部帧都是 BG 关键帧、FG 为空、β=0）时，`keep` 就是恒等置换，
+  本函数必须与 `model.forward` **逐位一致** —— 这是自检的黄金用例。
+* `beta=None` 表示不做质量补偿，等价于「直接拼完跑普通 attention」的朴素压缩。
+"""
+
+from __future__ import annotations
+
+import types
+from contextlib import contextmanager
+
+import torch
+
+import comfy.ldm.common_dit
+from comfy.ldm.minimax.model import (FRAME_RESCALE, PackedLayout, SEG_TAG,
+                                     pack_audio, pdd_grid, unpatchify_video,
+                                     unpack_audio)
+from route3.splitstream_attn import beta_for_sequence, route3_plan, splitstream_attention
+from route3.route3_block import rms_rope_split_half_ref
+
+__all__ = ["splitstream_forward", "LayoutShim", "beta_attention"]
+
+
+class LayoutShim:
+    """`_run_blocks` 只读 `position_ids`（其余字段在 blocks_replace 里才用）。"""
+
+    def __init__(self, position_ids, segments):
+        self.position_ids = position_ids
+        self.segments = segments
+        self.seq_len = position_ids.shape[0]
+        self.signature = None
+
+
+def _seg_of(layout, kind):
+    return next(s for s in layout.segments if s[2] == kind)
+
+
+def splitstream_forward(model, x, timestep, context, transformer_options=None,
+                        minimax_payload=None, s_bg=5, beta=None, fg_mask=None,
+                        keep_audio=True, return_plan=False):
+    """返回 `[-video_out, -audio_out]`，与 `model.forward` 同签名同语义。"""
+    transformer_options = dict(transformer_options or {})
+    payload = dict(minimax_payload or {})
+    if "layout" in payload and payload["layout"] is not None:
+        payload.pop("layout")            # 我们自己建，避免签名不匹配
+
+    video_x, audio_x = x[0], x[1]
+    orig_t, orig_h, orig_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
+    video_x = comfy.ldm.common_dit.pad_to_patch_size(video_x, model.patch_size)
+    if video_x.shape[0] != 1:
+        raise ValueError("MiniMax H3 supports batch size 1")
+    device = video_x.device
+    dtype = context.dtype
+
+    latent_t, lat_h, lat_w = video_x.shape[2], video_x.shape[3], video_x.shape[4]
+    audio_t = audio_x.shape[-1]
+    text_len = context.shape[1]
+
+    layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
+                          keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+    va, vb, _ = _seg_of(layout, "video")
+    aa, ab, _ = _seg_of(layout, "audio")
+    n_video = vb - va
+
+    plan = route3_plan(prefix_end=va, latent_t=latent_t, lat_h=lat_h, lat_w=lat_w,
+                       s_bg=s_bg, fg_mask=fg_mask)
+
+    # keep = [0..va) + FG + BG，行号是完整布局的下标
+    fg_global = va + plan.fg_local
+    bg_global = va + plan.bg_local
+    keep = torch.cat([torch.arange(va, dtype=torch.long),
+                      fg_global, bg_global]).to(device)
+    keep_video = torch.cat([plan.fg_local, plan.bg_local]).to(device)   # 视频段内下标
+    s_kept = int(keep.numel())
+
+    # 时间步 / t_emb：与原生完全一致
+    shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", model.sigma_shift_video))
+    shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", model.sigma_shift_audio))
+    sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+    t_v = float(1.0 - sigma_v)
+    from comfy.ldm.minimax.model import time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP
+    t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+    vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
+    aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
+    seg_t = {"text": t_v, "video": t_v, "audio": t_a,
+             "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
+             "cond_audio": max(t_a, aud_aug), "ref_audio": max(t_a, aud_aug)}
+    unique_t = sorted({t_v, t_a} | {seg_t[k] for _, _, k in layout.segments})
+    t_row = {t: i for i, t in enumerate(unique_t)}
+
+    mod_segments = []
+    for a, b, kind in layout.segments:
+        if kind == "video":
+            mod_segments.append((va, s_kept, t_row[seg_t["video"]] * 3 + SEG_TAG["video"]))
+        else:
+            mod_segments.append((a, b, t_row[seg_t[kind]] * 3 + SEG_TAG[kind]))
+
+    h_full = model._embed_and_pack(video_x, audio_x, context, layout, payload, transformer_options)
+    h = h_full[keep]
+    pos = layout.position_ids[keep.cpu()].to(device)
+    shim = LayoutShim(pos, [(0, s_kept, "kept")])
+    t_emb = model._time_embedding(unique_t, device, dtype)
+
+    n_full = int(va + plan.fg_local.numel())          # branch1 键数（切点）
+    bg_mask_rows = torch.arange(n_full, s_kept, device=device)
+
+    phase_full = plan.full_phase()
+    with (beta_attention(model, n_full, beta, phase_full) if beta is not None else _nullctx()):
+        transformer_options["route3"] = {
+            "n_full": n_full, "plan": plan, "phase_full": phase_full,
+        }
+        h = model._run_blocks(h, t_emb, mod_segments, shim, transformer_options)
+
+    # final layer：只喂保留下来的视频行
+    v_kept, a_out = model.final_layer(
+        h, t_emb, (va, s_kept, t_row[seg_t["video"]]), (aa, ab, t_row[seg_t["audio"]]),
+        sigma_v, transformer_options.get("sample_sigmas"),
+        (pdd_grid(model.final_layer.pdd_steps, shift_v),
+         pdd_grid(model.final_layer.pdd_steps, shift_a)))
+
+    v_full = torch.zeros(n_video, *v_kept.shape[1:], dtype=v_kept.dtype, device=v_kept.device)
+    v_full[keep_video] = v_kept
+    video_out = unpatchify_video(v_full, latent_t, lat_h // 2, lat_w // 2,
+                                 model.latents_dim, model.patch_size)
+    video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
+    audio_out = unpack_audio(a_out)
+
+    out = [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
+    if return_plan:
+        return out, plan, keep_video
+    return out
+
+
+class _nullctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@contextmanager
+def beta_attention(model, n_full, beta, phase_full=None):
+    """给每层 attention 注入「BG 键加 beta + LSE 合并」。"""
+    originals = []
+    for i, blk in enumerate(model.blocks):
+        attn = blk.attn
+        originals.append((attn, attn.forward))
+        b = beta[i] if (beta is not None and beta.dim() == 3) else beta
+
+        def fwd(self, x, rope_freqs=None, transformer_options={}, _b=b):
+            return _attn_with_beta(self, x, rope_freqs, transformer_options, n_full, _b,
+                                   phase_full)
+
+        attn.forward = types.MethodType(fwd, attn)
+    try:
+        yield
+    finally:
+        for attn, orig in originals:
+            attn.forward = orig
+
+
+def _attn_with_beta(self, x, rope_freqs, transformer_options, n_full, beta, phase_full=None):
+    import comfy.model_management
+    from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
+    from route3.splitstream_attn import merge_lse, attn_lse
+
+    s = x.shape[0]
+    q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
+    v = v.view(s, self.heads, self.head_dim)
+    if rope_freqs is not None:
+        q = q.view(1, s, self.heads, self.head_dim)
+        k = k.view(1, s, self.heads, self.head_dim)
+        qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
+        kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
+        rot = rope_freqs.shape[-3] * 2
+        q, k = rms_rope_split_half_ref(q, k, rope_freqs, qw, kw,
+                                       epsilon=self.q_norm.eps, rot_dim=rot)
+        q, k = q[0], k[0]
+    else:
+        q = self.q_norm(q.view(s, self.heads, self.head_dim))
+        k = self.k_norm(k.view(s, self.heads, self.head_dim))
+
+    q = q.transpose(0, 1).unsqueeze(0)   # [1,H,S,D]
+    k = k.transpose(0, 1).unsqueeze(0)
+    v = v.transpose(0, 1).unsqueeze(0)
+
+    if beta is None or n_full <= 0 or n_full >= s:
+        out = optimized_attention(AttentionTensorContainer(q), AttentionTensorContainer(k),
+                                  AttentionTensorContainer(v), self.heads, mask=None,
+                                  skip_reshape=True, transformer_options=transformer_options)
+    else:
+        b = beta.to(q.device) if torch.is_tensor(beta) else beta
+        if phase_full is not None and torch.is_tensor(b) and b.dim() == 2:
+            b = beta_for_sequence(b, 0, phase_full.to(q.device))
+        out = splitstream_attention(q, k, v, n_full, beta=b, provider="auto")
+        out = out.transpose(1, 2).reshape(s, self.heads * self.head_dim)
+    return self.out_proj(out.squeeze(0) if out.dim() == 3 else out)

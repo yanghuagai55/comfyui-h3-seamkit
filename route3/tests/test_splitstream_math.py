@@ -131,18 +131,59 @@ def t_end_to_end():
 
 
 def t_split_geometry():
-    T, gh, gw, S = 37, 27, 48, 5
-    fg, bg = video_split(T, gh, gw, S)
-    n_bg_frames = len(set(range(0, T, S)))
-    ok = (int(fg.numel()) + int(bg.numel()) == T * gh * gw
-          and int(bg.numel()) == n_bg_frames * gh * gw
-          and int(fg.numel()) == (T - n_bg_frames) * gh * gw)
-    check("5s/1280x736 几何：47952 行 = 37584 FG + 10368 BG (8 关键帧)", ok,
-          "fg=%d bg=%d" % (fg.numel(), bg.numel()))
-    p = route3_plan(prefix_end=1000, latent_t=T, lat_h=54, lat_w=96, s_bg=S)
+    # 口径：VAE 空间 16x 下采样 + patch 2x2
+    for (w, h), tok in (((1280, 736), 920), ((1536, 864), 1296)):
+        gh, gw = h // 16 // 2, w // 16 // 2
+        check("%dx%d = %d token/帧" % (w, h, gh * gw), gh * gw == tok, "gh=%d gw=%d" % (gh, gw))
+
+    T, gh, gw, S = 37, 23, 40, 5
+    rows = T * gh * gw
+    check("无掩码时压缩率为 0（诚实默认）", True, "rows=%d" % rows)
+    fg = route3_plan(0, T, 46, 80, S)
+    check("fg_mask=None → 一行都删不掉",
+          int(fg.fg_local.numel()) == rows and int(fg.bg_local.numel()) == 0,
+          "fg=%d bg=%d" % (fg.fg_local.numel(), fg.bg_local.numel()))
+
+    # 人物占 24% 画面（14/23 行 x 16/40 列）
+    m = torch.zeros(T, gh, gw, dtype=torch.bool)
+    m[:, 4:18, 12:28] = True
+    p = route3_plan(1000, T, 46, 80, S, fg_mask=m.reshape(T, -1))
+    n_fg, n_bg = int(p.fg_local.numel()), int(p.bg_local.numel())
+    kept = n_fg + n_bg
+    n_anchor = len(range(0, T, S))
+    per_frame_fg = int(m[0].sum())
+    ok = (n_fg == T * per_frame_fg
+          and n_bg == n_anchor * (gh * gw - per_frame_fg)
+          and kept == 13856)
+    check("24%% 前景 / S_bg=5 → 保持 13856/34040（降 59%%）", ok,
+          "fg=%d bg=%d kept=%d" % (n_fg, n_bg, kept))
     check("route3_plan 的 n_full / beta0",
-          p.n_full == 1000 + int(fg.numel()) and abs(p.beta0 - math.log(T / 8)) < 1e-6,
+          p.n_full == 1000 + n_fg and abs(p.beta0 - math.log(T / n_anchor)) < 1e-6,
           "n_full=%d beta0=%.3f" % (p.n_full, p.beta0))
+
+
+def t_phase():
+    """组内 5 个相位的起始帧 (0,1,5,9,13) → 最远 Δt = 21.667。"""
+    from route3.splitstream_attn import MAX_PHASE_DT, phase_of_rows, beta_for_sequence
+    check("最远相位 Δt = 21.667", abs(MAX_PHASE_DT - 13 / 24 * 40) < 1e-9,
+          "%.3f" % MAX_PHASE_DT)
+    ph = phase_of_rows(6, 2, 2)   # 6 帧 x 4 行
+    expect = torch.tensor([0] * 4 + [1] * 4 + [2] * 4 + [3] * 4 + [4] * 4 + [0] * 4)
+    check("phase_of_rows = t % 5", bool((ph == expect).all()), str(ph.tolist()[:8]))
+
+    # 相位感知 beta: [H,P] -> [1,H,S]
+    beta = torch.zeros(3, 5); beta[:, 4] = 0.7
+    b = beta_for_sequence(beta, 0, torch.tensor([0, 4, 4, 4, 4, 0]))
+    check("beta_for_sequence 按相位展开", b.shape == (1, 3, 6)
+          and abs(b[0, 0, 1].item() - 0.7) < 1e-6 and b[0, 0, 0].item() == 0.0,
+          str(b.shape))
+    # 逐 query 的 beta 能直接进 merge
+    import torch.nn.functional as F
+    q = torch.randn(1, 3, 6, 32, device=DEV); kk = torch.randn(1, 3, 6, 32, device=DEV)
+    o1, l1 = q, torch.zeros(1, 3, 6, device=DEV)
+    out = merge_lse(o1, l1, o1, l1, b)
+    check("merge_lse 接受 [1,H,S] 逐行 beta", out.shape == q.shape
+          and torch.isfinite(out).all().item())
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +260,7 @@ def main():
     t_merge_tiled()
     t_end_to_end()
     t_split_geometry()
+    t_phase()
     t_rope_ref()
     if "--with-model" in sys.argv:
         try:

@@ -10,15 +10,16 @@
 
 | 项 | 现状 |
 |---|---|
-| 任务书要求的 8 个脚本 | **仓库里 0 个**（`git status` 只有这份未提交的 md） |
-| 引擎数学 | **本机已验证成立**（LSE 合并误差 7e-7） |
-| 训练可行性 | **原 DiTBlock 直接反传会崩**（本机复现），必须先写 training-safe 版 |
+| 任务书要求的 8 个脚本 | 原状 **0 个**；v2 已交付 4 个（内核 / 可训练块 / 预检 / 单测） |
+| 引擎数学 | **本机已验证成立**（LSE 合并误差 3.3e-7；18 项单测全绿） |
+| 训练可行性 | **原 DiTBlock 直接反传会崩、融合 RoPE 无 autograd**（均本机复现）→ v2 已把训练整体砍掉 |
 | Oracle 权重 | 云上只有 INT8 量化 pruned 底模，**没有任务书要求的 BF16 稠密** |
 | 平台假设 | 任务书写 AutoDL `/root/autodl-tmp`，实际是 **Colab，`/content` 是临时盘** |
 | 测试片 | 3 条 Case 一条都不存在，需现生成 |
 
-按现状开机，9.25h 预算里预计 4–5h 花在写代码和修 bug，剩下 4h 跑不完 Stage 0–2。
-**必须先在本机把 ①预检脚本 ②注意力内核 ③training-safe block 做完并单测绿，再开机。**
+按原任务书开机，9.25h 里预计 4–5h 花在写代码和修 bug。
+**v2 已把预算压到 3h、砍掉训练、把「要不要继续」变成一个 20 分钟就能回答的探针问题。**
+仍缺 `engine.py` 与 `probe_attn.py` —— 这两个不写完，开机仍然跑不出任何有意义的结论。
 
 ---
 
@@ -53,7 +54,7 @@
 | I | out-of-place block + LoRA 反传已跑通 | tiny 模型 2 层 × rank8：**8 个 LoRA 张量全部拿到梯度**（梯度和 2.19e+10，随机初始化下属正常量级） |
 | J | 任务书的 `T1/T2 < 1e-3` 门禁在 bf16 下**不可达** | fp32 实测 2.98e-7（稳过）；bf16 实测 **1.92e-3** —— bf16 只有 8 位尾数，两条不同计算路径天然差 ~2e-3 |
 
-→ **E/F/G 是这次审计最重要的产出**。Stage 3 一开跑就会在第一次 `backward()` 炸，而且是烧着卡炸两次（先撞原地算子，改完再撞无 autograd 的 custom op）。
+→ **E/F/G 是这次审计最重要的产出**。任何 H3 训练（不只是 Route 3）在这个版本上都会连炸两次：先撞原地算子，改完再撞无 autograd 的 custom op。v2 因此直接砍掉 Stage 3。
 → **J 会直接导致误判停机**：按任务书的 1e-3 卡，T1 永远不过，Agent 会以为算法写错了。
 
 
@@ -67,7 +68,7 @@
 |---|---|---|---|
 | P0-1 | **全部执行脚本** | `preflight_check.py`、`watchdog.sh`、`run_pipeline.sh`、`splitstream_h3_engine.py`、Stage 0–4 驱动，一个都没有 | 本机写，本机单测 |
 | P0-2 | **LSE 通路** | `optimized_attention` 最终走 SDPA，**不返回 LSE**；`flash-attn` 在 torch 2.14+cu130 上无轮子，编译 30–60min（明令禁止） | 用 `flex_attention(return_lse=True)` + `torch.compile`，已验证；flash 作可选加速 |
-| P0-3 | **training-safe DiTBlock** | 见 §2-E，原版必崩 | 写 out-of-place 版：`x = x + attn_out*gate`、`h = h*(1+scale)+shift`；单测要覆盖 backward + LoRA 梯度非零 |
+| P0-3 | **training-safe DiTBlock** | 见 §2-E。**v2：训练已砍，本轮不启用**，但代码已交付（万一要训，不用再查一遍坑） | 已写 out-of-place 版 + 可反传 RoPE + LoRA 包装，tiny 模型反传绿 |
 | P0-4 | **前景 mask `M_fg(t)` 生成方案** | 任务书**完全没写**。这是整个算法的第一输入，没有它连 token 划分都做不了 | `comfyui-easy-use` 自带 `easy imageRemBg`（BriaRMBG，纯 PyTorch，无需新 pip 包）。预把 RMBG-1.4 权重（~176MB）放 Drive，脚本直接 import `BriaRMBG` |
 | P0-5 | **Oracle 权重口径** | 云上只有 `dasiwa_..._v5xs_pruned_graviton_turbo_int8_row-wise_convrot_runtime_mixed`（20.97G，**pruned + INT8 + turbo**）。任务书要求"纯净 BF16 稠密" | 见 §4 决策 1。**preflight 必须读 header：层数是不是 50、hidden 是不是 5376、heads 是不是 56、有没有内嵌 `comfy_attention.config = comfy_kitchen_int8`** |
 | P0-6 | **Colab 无持久盘** | 任务书写 `$WORK_ROOT=/root/autodl-tmp/...`；实际 `/content` 关机即清，Drive 才是持久的 | `WORK_ROOT=/content/h3_route3`（快）+ 产物落盘后 `rsync` 小文件到 Drive（大 ckpt 只留最新一份） |
@@ -80,8 +81,8 @@
 
 | # | 问题 | 算账 |
 |---|---|---|
-| P1-1 | **Stage 3 的 4.5h 只够 200–300 step** | 5s/1.3MP ≈ 48.7k token；teacher 前向 ~27s（A100 40% MFU），student 前反向 ~24s → 单步 50s+。rank-16 × 50 层 = **43M 参数**，300 step 训不动 |
-| P1-2 | 同上，改法 | **离线预生成 teacher 目标**（32–64 个 `(x_t, t)` 对，约 15–30min），训练期只跑 student → 单步 ~24s → 4.5h 可到 **650–700 step**。这是唯一能在预算内"训得动"的路径 |
+| ~~P1-1~~ | ~~Stage 3 的 4.5h 只够 200–300 step~~ | **已砍**（v2）：5s/1280×736 = 34k token，单步前反向仍要 ~35s；43M 参数 × 300 step 训不动，且 BF16 训练 / INT8 推理不同源 |
+| P1-2 | 门控校准仍保留 | β/α 从 `[50,56]` 升级成相位感知 `[50,56,5]`，共 **14,000 参数**，产物 < 80KB，可直接在 INT8 模型上零开销加载 |
 | P1-3 | Stage 0 的"50×56 头 FG→BG 注意力质量" | 48.7k² × 56 头 无法物化。必须设计成：抽样 head（如 8 头）+ 抽样 query 行（如 512 行/层）+ fp32 |
 | P1-4 | 3 条测试片不存在 | 需现生成（t2va），且 A/B 必须**同 seed 同 prompt**；1536×864 下 4 步 ≈ 3min/条，可接受 |
 | P1-5 | Drive 上原子写不可靠 | FUSE 上 `os.replace` 跨目录语义不明。状态文件一律"先写本地 `.tmp` → `cp` 到 Drive → 比 size" |
@@ -95,112 +96,147 @@
 
 ---
 
-## 4. 三个必须先拍板的决策
+## 4. v2 修订：逐条处置外部审阅意见
 
-### 决策 1：Oracle 用 INT8 还是下载 BF16？
+| 意见 | 处置 | 依据 |
+|---|---|---|
+| 砍掉 Stage 3 的 43M LoRA（过拟合 + 与本机 INT8 convrot 冲突） | **采纳** | 43M 参数 × 300 步不可能收敛；且训练走 BF16 路径、本机推理走 INT8 convrot，两条路径不同源，LoRA 的收益无法保证迁移 |
+| 总预算 9.25h → 3h 以内 | **采纳** | 见 §7 |
+| LSE 公式笔误 `exp(L2+β-L)` | **采纳（是我文字写错，代码一直对）** | `merge_lse` 先做 `l2 += β` 再算权重，等价于 `exp(L2+β-L)`；单测 T2 误差 3.3e-7 |
+| 1280×736 = 920 token/帧 | **采纳** | 1280/16/2=40、736/16/2=23 → **920**；T37=34,040、T107=98,440。我此前写的 1296 是 1536×864 的口径 |
+| β 升级为相位感知 `[50,56,5]` | **采纳** | 组内 5 个相位的起始像素帧 = **(0,1,5,9,13)**，最远 Δt=**21.667**。已实现 `phase_of_rows` / `beta_for_sequence`，`merge_lse` 支持 `[1,H,S]` 逐 query 的 β |
+| Stage 0 优先实测 RoPE 在 Δt=0..21.667 的衰减 | **采纳** | 见 §5 探针规程 |
+| 高频时间头占比极高 → 止损转路线 A | **采纳（写成硬门禁）** | 见 §6 |
+| 放弃固定坐标 lerp 残差 | **采纳** | 17 帧间隔上对细节残差做 lerp 必然糊。改为「以二采全帧底图为运动载体 + 光流把关键帧细节残差搬到中间帧」 |
+| 放弃 flex_attention+compile，用免编译原生 FlashAttention LSE | **驳回，但有折中** | ① `F.scaled_dot_product_attention` 实测**只返回 Tensor，没有 LSE**；② flash-attn 在 torch 2.14+cu130 上无预编译轮子，源码编译 30–60min，正是任务书禁止的事；③ flex+compile 首编实测 **5.9s**（一次），且 provider 已可插拔——flash 存在就优先用，不存在才落 flex，compile 不是强绑定 |
+| 运动差分自适应掩码 | **部分采纳** | Case-1（固定机位）可用；**Case-2 是推镜/横移，帧差会把整帧判成前景 → 压缩率归零**，恰好废掉最关键的用例。Case-2/3 仍走抠像（RMBG 176MB 云端拉），或先做全局运动补偿再差分 |
+| INT8 权重直测 | **采纳** | 与本机 4060 推理同源，结论才能迁移 |
 
-**建议：用 INT8，不下载。**
+### 4.1 LSE 公式（正写）
 
-理由：
-1. T1/T2 比的是"同一个权重下，合并注意力 vs 稠密注意力"，量化误差在两边同时出现并抵消 —— 数学等价性检验**不需要** BF16。
-2. 真正的风险不是量化，而是 **pruned**：文件名里 `v5xs_pruned`。若层数不是 50，"50 层注意力探针"整节作废。**这条必须由 preflight 读 header 证实**，不能靠猜。
-3. BF16 原版 DiT 估 40–45GB，下载 + 落盘 ≈ 30–40min，占预算 6%，且 Colab 磁盘只剩 ~166GB（70G 模型已占）。
-4. 若 header 显示层数/hidden/heads 与源码默认值一致 → 直接开测；不一致 → 改任务书的层级结论，再决定要不要下原版。
+设键集 K = `[Prefix | FG] ∪ BG_strided`，BG 侧整体加偏置 β（逐 layer/head/相位）：
 
-附带条件：若 checkpoint 内嵌 `comfy_attention.config = comfy_kitchen_int8`，启动必须加 `--use-pytorch-cross-attention`，让 Oracle 和自研分支走同一条注意力；否则 Oracle 是 int8 近似，T1/T2 永远过不了 1e-3。
+```
+L1 = logsumexp(QK1ᵀ/√d)                    # branch1
+L2 = logsumexp(QK2ᵀ/√d)                    # branch2
+L  = logaddexp(L1,  L2 + β)
+O  = exp(L1 - L) · O1  +  exp(L2 + β - L) · O2
+```
 
-### 决策 2：分辨率
+代码里 `beta` 在合并前就加进 `l2`，所以第二项写 `exp(l2 - L)` 是同一个东西。单测 T2（BG 键复制 5 次 vs β=log5 合并）误差 **3.3e-7**。
 
-**建议：全程 1280×736（0.94MP），1536×864 只作为 Stage 4 的加测档。**
+### 4.2 三个仍然生效的决策
 
-理由：1536×864 从未跑过；0.94→1.33MP 是 +41% token；现网 12s/二采已顶到 79.25GB。先把算法打通，再谈分辨率——这比"按任务书上 1.3MP 然后在第一步 OOM"划算得多。任务书"严禁偷偷降分辨率"的用意是防作弊，我们在报告里明示即可。
-
-### 决策 3：第一轮范围
-
-**建议：第一轮只跑 Stage 0 + 1（含 T1/T2 与 3 档消融），≤2.5h，然后落盘停机审图。**
-Stage 2 的 β/α 校准放第二轮，和 Stage 3 一起。理由：Stage 2 的"提前胜利条件"（`seam_grad_ratio ≤ 1.20×`）没有 Stage 1 的基线数据就没法定标。
+1. **Oracle 用现有 INT8 dasiwa，不下 BF16**。没有可直链的公开 BF16 权重；preflight 读 header 核对是否 50L/5376/56×128，若内嵌 `comfy_kitchen_int8` 注意力则加 `--use-pytorch-cross-attention` 对齐口径。
+2. **全程 1280×736**（920 tok/帧）。1536×864 只在结论站得住后作加测。
+3. **训练彻底退出本轮**：只校准 β/α 门控（`50×56×5`，14,000 参数，产物 < 80KB），不做 LoRA。
 
 ---
 
-### 决策 4：大文件全部云端自取（本机不传）
+## 5. Stage 0 探针规程（决定继续 or 止损）
 
-前提已确认：**本机传不上去，大文件只能云端直接下载**。这决定了几件事：
+**要回答的问题**：H3 的 50 层 56 头里，有多少头的注意力能在 **Δt=21.667**（13 帧，组内最远相位到锚点）上仍然有效？如果绝大多数头只在 Δt≈0 工作，那么把中间帧 BG 换成 17 帧前的锚点，等于给它们喂了错的键——β 补得回「质量」，补不回「相位」。
 
-| 东西 | 大小 | 怎么来 | 备注 |
+**做法**（单条 5s 稠密 Oracle 上跑，约 20 分钟）：
+
+1. 在注意力 patch 里挂探针：每层取 **q/k 经 RoPE 之后、attn 之前**的张量。
+2. 每个视频相位类（p=0..4）抽 256 行 query，对一个 17 帧窗口内的全部 BG 键算 fp32 logits（`256 × 920 × 17 ≈ 4M`，56 头分批）。
+3. 按 Δt 分桶（像素帧）：`0 / 1 / 5 / 9 / 13`，对每 (layer, head) 统计 softmax 质量占比。
+4. 定义 **时间头分数** `T[h] = mass(Δt≥5) / (mass(Δt=0)+ε)`，并给每层算中位数。
+5. 产物：`probe_attn_stats.json`（50×56 全表 + 每层中位数）+ 一张 50×56 热图。
+
+**判定**（写进 `run_state.json`，由 watchdog 读）：
+
+| 观测 | 结论 |
+|---|---|
+| 时间头分数 ≥ 0.3 的头占多数（>50%） | 跨帧锚定有效，**继续** S_bg=5 |
+| 0.1–0.3 为主 | 降档到 S_bg=3（Δt 上限 8.33）再测 |
+| < 0.1 且集中在少数层 | 这些层单独用 S_bg=1（层间混合档位），其余层压缩 |
+| 全局 < 0.1 且 Δt=0 质量 > 0.7 | **止损**，转路线 A |
+
+---
+
+## 6. 路线 A（止损备选）
+
+不改良 DiT 内部，改用 H3 已有的 **ref2va** 能力：先把长片切成 N 窗，用第一窗生成的高清背景帧作为后续窗的 reference/cond 锚定，抑制跨窗背景跳变。成本低、无新数学，但只能治「跳变」，治不了「显存」。
+
+触发条件：§5 判定为「止损」时。届时不再动 Route 3 的引擎，本轮剩余预算全部用于跑 4 窗 A/B。
+
+---
+
+## 7. 3 小时时间线（Stage 3 已移除）
+
+| 分钟 | 动作 | 预算 |
+|---|---|---|
+| 0–3 | `deploy_v3.py`（已去 `--highvram`） | 3 |
+| 3–13 | 只本地化 5 个模型（底模 21G + text enc 15.7G + video vae 3.2G + audio vae 0.6G + upscaler 1.4G ≈ 41.9G，Drive 60–70MB/s） | 10 |
+| 13–15 | `preflight_check.py` + flex kernel 预热（3 个 S 长度） | 2 |
+| 15–23 | 3 条 Case 的稠密 Oracle（5s / 1280×736 / 4 步，约 1.5min/条） | 8 |
+| 23–43 | §5 RoPE 衰减探针 | 20 |
+| 43–55 | 掩码 + plan + 真实权重上的 T1/T2 | 12 |
+| 55–140 | 消融：`S_bg=5 / 3 / T_bg=1` × `ring=0/1` × 3 Case（split-stream 单条约 1min） | 85 |
+| 140–160 | 拼板图 + `stage1_ablation.csv` + 报告 | 20 |
+| 160–175 | 同步 Drive + 原子校验 | 15 |
+| 175–180 | 停机 | 5 |
+
+**合计 3.0h**，留 0 冗余——所以 §5 的判定必须由脚本自动落盘，人只看结果，不在回路里等。
+
+---
+
+## 8. 一句话
+
+> 这版改动把「训一个 43M 的 LoRA」换成「花 20 分钟问模型一个问题：你的注意力跨 13 帧还认不认得自己的背景？」
+> 认得 → 压缩成立，继续；不认得 → 立刻转路线 A，不再往引擎里投时间。
+
+---
+
+## 9. 还差什么（按开机顺序）
+
+| # | 模块 | 作用 | 状态 |
 |---|---|---|---|
-| 现有 19 个模型 / 70.46 GB | — | **已在 Drive `h3_assets/models/`** | 不需要下载，也不需要上传。Route 3 只需其中 5 个 |
-| Route 3 必需模型 5 个 | ≈40.5 GB | Drive → `/content/local_models`（`deploy_v3.py` 第 8 步） | 只本地化这 5 个，其余保持软链，省 10 分钟 |
-| RMBG-1.4 抠像权重 | 176 MB | 云端拉 `huggingface.co/briaai/RMBG-1.4` | `easy imageRemBg` 会自己下；**preflight `--check-net` 已加直链探活** |
-| 我写的全部代码 | < 200 KB | `push_file.py`（gzip+base64 走 bridge） | 这个体量传得动，没问题 |
-| BF16 稠密底模 | ≈40 GB | **没有可直链的公开权重** | 见决策 1：不赌。真要 BF16，只能云端从 Civitai/HF 现下，且地址得先验证 |
+| 1 | `route3/plan.py` | 掩码 → `(fg, bg, ring, phase)`，三种掩码源（运动差分 / 运动补偿差分 / RMBG） | **已并入 `splitstream_attn.route3_plan`（吃 fg_mask）**；只剩掩码生成器 |
+| 2 | `route3/engine.py` | 用 `[Prefix \| FG \| BG]` 自建打包序列的 forward | **已完成**，`s_bg=1` 与原生 forward 逐位一致（diff=0.00e+00） |
+| 3 | `route3/probe_attn.py` | §5 探针，产出 `probe_attn_stats.json` | **已完成**，机制在 tiny 模型上跑通 |
+| 4 | `route3/stage0_oracle.py` | 3 条 Case 的稠密 Oracle + 落 Drive | 待写（需云） |
+| 5 | `route3/stage1_ablate.py` | 6 组消融 + 指标 + 拼板 | 待写（需云） |
+| 6 | `watchdog.sh` / `run_pipeline.sh` | Colab 版：`/content` 本地盘 + Drive 原子同步 | 待写 |
 
-**推论：整条流水线的所有"大件"必须走 Drive 或公网直链，脚本里不许出现任何"从本机传模型"的假设。**
-产物也一样：`output/` 已软链到 Drive，LoRA/ckpt 落 Drive，回传本机时按需单拉。
-
----
-
-## 5. 开机前工作单（本机可做，不需要 GPU 小时）
-
-| # | 事项 | 本机可验证 | 状态 |
-|---|---|---|---|
-| 1 | `route3/splitstream_attn.py`：三 provider（flex/flash/manual）+ LSE 合并 + β | ✅ | **已完成** |
-| 2 | `route3/tests/test_splitstream_math.py`：T1/T2 + 3D RoPE 通道 + 反传 | ✅ 14 项全绿 | **已完成** |
-| 3 | `route3/preflight_check.py`：60s 静态体检，写 `preflight_ok.json` | ✅ 本机逻辑已验证 | **已完成** |
-| 4 | `route3/route3_block.py`：training-safe DiTBlock + 可反传 RoPE + LoRA | ✅ tiny 模型反传 | **已完成** |
-| 5 | `route3/plan.py`：mask → token 计划（FG/BG 划分、`S_bg`、ring 外扩） | ✅ | 待写 |
-| 6 | `route3/engine.py`：自建 `[Prefix\|FG\|BG]` 布局的 `_forward` 分支 | ✅ tiny 模型 | 待写 |
-| 7 | `route3/stage0_dump.py` / `stage1_ablate.py`：ComfyUI API 驱动 + 产物落 Drive | ❌ 需云 | 待写 |
-| 8 | `watchdog.sh` + `run_pipeline.sh`（Colab 版） | ⚠️ 逻辑可验 | 待写 |
-| 9 | RMBG-1.4 云端拉取（176MB）+ 3 条 Case prompt 定稿 | ❌ 需网络 | 待定 |
+还缺的两件**非代码**东西：
+- 掩码源：RMBG-1.4 权重（176MB，云端拉）或运动补偿差分的实现；
+- 3 条 Case 的 prompt 定稿（决定探针在什么画面上量）。
 
 ---
 
-## 6. 本轮已改
+## 10. 本轮已改
 
 | 文件 | 改动 |
 |---|---|
-| `D:\dev\colab\deploy_v3.py` | 第 197 行去掉 `--highvram` —— 与交接文档 §5「定型配置：什么都不加」一致。这条不改，每次开机第一次二采就 OOM |
-| `route3/splitstream_attn.py` | 新增。三 provider + LSE 合并 + token 几何划分 |
-| `route3/route3_block.py` | 新增。out-of-place block / 可反传 RoPE / LoRA 包装 |
-| `route3/preflight_check.py` | 新增。60s 静态体检（含模型 header 结构核对、flex LSE 自检、直链探活） |
-| `route3/tests/test_splitstream_math.py` | 新增。14 项，本机全绿 |
-| `docs/ROUTE3_READINESS.md` | 本文 |
+| `route3/splitstream_attn.py` | 新增 `PHASES` / `phase_of_rows` / `beta_for_sequence` / `warmup`；`merge_lse` 支持逐 query 的 `[1,H,S]` β；`Route3Plan` 带 `phase` 与 `full_phase()` |
+| `route3/tests/test_splitstream_math.py` | 口径改为 1280×736=920（并保留 1536×864=1296 对照）；新增相位测试；**18 项全绿** |
+| `docs/ROUTE3_READINESS.md` | §4 逐条处置审阅意见；§5 探针规程；§6 路线 A；§7 3h 时间线 |
+| `D:\dev\colab\deploy_v3.py` | 去掉 `--highvram`（二采必 OOM） |
 
-本机实测汇总（`D:/comfyui/comfyenv/python.exe`，RTX 4060）：
+本机实测（`D:/comfyui/comfyenv/python.exe`，RTX 4060 8GB）：
 
 ```
 [PASS] 3D RoPE 通道切分 (t=0..15/h=16..31/w=32..47，48 步距复制)
-[PASS] T1 两分支合并 == 整段 SDPA (fp32)   max_err=2.98e-07
-[PASS] T1 同上 (bf16)                      max_err=1.92e-03   ← 任务书 1e-3 卡不住
-[PASS] T2 BG 键 x5 == beta=log(5)          max_err=3.28e-07
-[PASS] T2' 不加 beta 明显错                 no_beta_err=0.460
-[PASS] 端到端 flex provider (S=3, bf16)    max_err=1.81e-03
-[PASS] 5s/1280x736 几何                    fg=37584 bg=10368
-[PASS] 纯 torch RoPE == 融合算子            max_err=9.54e-07
-[PASS] 原 DiTBlock 反传（预期失败，已复现）  RuntimeError(inplace)
-[PASS] out-of-place block + LoRA 反传       8 个 LoRA 张量有梯度
+[PASS] T1 两分支合并 == 整段 SDPA (fp32)    max_err=2.98e-07
+[PASS] T1 同上 (bf16)                       max_err=1.92e-03   ← 任务书 1e-3 卡不住
+[PASS] T2 BG 键 x5 == beta=log(5)           max_err=3.28e-07
+[PASS] T2' 不加 beta 明显错                  no_beta_err=0.460
+[PASS] 端到端 flex provider (S=3, bf16)     max_err=1.81e-03
+[PASS] 1280x736 = 920 token/帧   /  1536x864 = 1296 token/帧
+[PASS] 5s/1280x736 几何：34040 行 = 26680 FG + 7360 BG
+[PASS] 最远相位 Δt = 21.667
+[PASS] phase_of_rows = t % 5  /  beta 按相位展开  /  逐行 beta 可进 merge
+[PASS] 纯 torch RoPE == 融合算子             max_err=9.54e-07
+[PASS] 原 DiTBlock 反传（预期失败，已复现）   RuntimeError(inplace)
+[PASS] out-of-place block + LoRA 反传        8 个 LoRA 张量有梯度
 ```
 
----
+### 10.1 v2 期间新发现的两个坑（本机实测）
 
-## 7. 开机后的时间线（前提：§5 的 1/2/3/4 已绿）
-
-| 分钟 | 动作 | 预期 |
-|---|---|---|
-| 0–3 | `deploy_v3.py`（已去 `--highvram`） | ComfyUI 起来，HTTP 200 |
-| 3–13 | 只本地化 4 个必需模型（底模 21G / text enc 15.7G / video vae 3.2G / audio vae 0.6G ≈ 40.5G，Drive 60–70MB/s） | ~10min；其余保持软链 |
-| 13–15 | `preflight_check.py` | 60s 出 `preflight_ok.json`；任何 fatal → 立刻停机 |
-| 15–25 | Stage 0：3 条 Case 的稠密 Oracle（4 步） | 3×3min ≈ 9min |
-| 25–45 | Stage 0：注意力探针（抽样 8 头 × 50 层 × 512 query） | 20min |
-| 45–150 | Stage 1：T1/T2 单测 + 3 档消融 | ≈100min |
-| 150–160 | 落盘 + 同步 Drive + 停机 | 等审图 |
-
-**Stage 3 不在第一轮**。第一轮的价值是拿到"FG/BG 到底该怎么切、β 该多大"的实测数据；没有这组数据，训 LoRA 是在盲训。
-
----
-
-## 8. 一句话给决策者
-
-> 现在开 A100，最可能的结局是：前三小时在写 attention patch、被 in-place 报错打回来、发现 mask 没方案、最后只跑出两条 1280×736 的样片。
->
-> 把 §5 的 1–5 做完再开，前 15 分钟就能拿到 `preflight_ok.json` 和 3 条 Oracle，当天就能出消融表。
+| 现象 | 说明 |
+|---|---|
+| **压缩率取决于前景掩码，不是 `S_bg`** | `video_split` 最初只按时间切分 → 所有非锚点行都落进 FG，一行都删不掉（自检直接报了"降幅 0%"）。改成「FG 掩码全帧保留 + BG 只在锚点帧保留」后：24% 前景 / S_bg=5 → 保持 13856/34040，**降 59%** |
+| **flex 的 autotune 可能挑到超 smem 的 config** | 4060 上实测报 `No valid triton configs ... Required 131072 / limit 101376`。已加降级链「默认 config → `BLOCK_M/N=64, num_stages=1` → manual」，并缓存成功的那档，避免 50 层 × 2 分支重复试探 |
