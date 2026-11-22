@@ -31,7 +31,7 @@ from comfy.ldm.minimax.model import (FRAME_RESCALE, PackedLayout, SEG_TAG,
 from route3.splitstream_attn import beta_for_sequence, route3_plan, splitstream_attention
 from route3.route3_block import rms_rope_split_half_ref
 
-__all__ = ["splitstream_forward", "LayoutShim", "beta_attention"]
+__all__ = ["splitstream_forward", "LayoutShim", "beta_attention", "fill_dropped"]
 
 
 class LayoutShim:
@@ -48,9 +48,42 @@ def _seg_of(layout, kind):
     return next(s for s in layout.segments if s[2] == kind)
 
 
+def fill_dropped(v_full, keep_mask_2d):
+    """把被删掉的帧的速度，用同位置相邻两个保留帧线性插值补上。
+
+    为什么必须补：ComfyUI 的采样器每一步都对**整个 latent 体**做积分，被删掉的行
+    如果没有速度，就会原地不动 → 冻结成噪声。所以引擎不能只返回紧凑序列的输出，
+    必须散回全尺寸并把空缺填好，才能当 `forward` 的 drop-in。
+
+    v_full      : [T*P, ...] 已按 t*P+p 排好，保留行已填
+    keep_mask_2d: [T, P] bool
+    """
+    T, P = keep_mask_2d.shape
+    shape = v_full.shape[1:]
+    v = v_full.view(T, P, *shape)
+    keep = keep_mask_2d.to(v.device)
+    tt = torch.arange(T, device=v.device)[:, None].expand(T, P)
+    prev = torch.where(keep, tt, torch.full_like(tt, -1)).cummax(0).values
+    nxt = torch.where(keep, tt, torch.full_like(tt, T)).flip(0).cummin(0).values.flip(0)
+
+    pv = prev.clamp(min=0)
+    # 没有后继保留帧时，退化成「沿用前一个保留帧」，不能去读被删掉的行
+    nx = torch.where(nxt >= T, pv, nxt.clamp(max=T - 1))
+    denom = (nx - pv).clamp(min=1).to(v.dtype)
+    frac = ((tt - pv).to(v.dtype) / denom).clamp(0.0, 1.0)
+    frac = torch.where((prev < 0) | (nxt >= T), torch.zeros_like(frac), frac)
+
+    def gather_t(i):
+        return v.gather(0, i.unsqueeze(-1).expand(-1, -1, *shape))
+
+    filled = gather_t(pv) * (1 - frac).view(T, P, *([1] * len(shape))) +         gather_t(nx) * frac.view(T, P, *([1] * len(shape)))
+    out = torch.where(keep.view(T, P, *([1] * len(shape))), v, filled)
+    return out.reshape(T * P, *shape)
+
+
 def splitstream_forward(model, x, timestep, context, transformer_options=None,
                         minimax_payload=None, s_bg=5, beta=None, fg_mask=None,
-                        keep_audio=True, return_plan=False):
+                        keep_audio=True, return_plan=False, full_velocity=False):
     """返回 `[-video_out, -audio_out]`，与 `model.forward` 同签名同语义。"""
     transformer_options = dict(transformer_options or {})
     payload = dict(minimax_payload or {})
@@ -133,6 +166,11 @@ def splitstream_forward(model, x, timestep, context, transformer_options=None,
 
     v_full = torch.zeros(n_video, *v_kept.shape[1:], dtype=v_kept.dtype, device=v_kept.device)
     v_full[keep_video] = v_kept
+    if full_velocity:
+        gh, gw = lat_h // 2, lat_w // 2
+        km = torch.zeros(latent_t * gh * gw, dtype=torch.bool, device=v_kept.device)
+        km[keep_video] = True
+        v_full = fill_dropped(v_full, km.view(latent_t, gh * gw))
     video_out = unpatchify_video(v_full, latent_t, lat_h // 2, lat_w // 2,
                                  model.latents_dim, model.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
