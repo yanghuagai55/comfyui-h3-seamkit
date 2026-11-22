@@ -45,6 +45,7 @@
 |---|---|---|
 | A | `flex_attention` 能返 LSE，且数值精确 | `return_lse=True`，与 `logsumexp` 最大误差 **4.8e-7** |
 | B | `torch.compile(flex_attention, dynamic=False)` 可用 | 首次编译 5.9s；S=8192/56头 **68ms ≈ 28 TF**（同尺寸 SDPA 103ms）；S=48k 推算单层 2.3s |
+| B2 | **零编译 LSE 存在**（cudnn / memeff） | cudnn 8192²×56头 **71.9ms**，Q≠K 误差 9.5e-7，`out` 可反传；memeff 95.7ms / 20.1 TF。见 §4 修订表 |
 | C | **LSE 合并数学成立** | "BG 键复制 S=5 次" ≡ "加 `log(5)` 偏置后两分支 LSE 合并"，最大误差 **7.2e-7** |
 | D | **β 不可省** | 同一组数据不加 β 误差 **0.391**，而输出量级仅 0.093 → 不加偏置等于把背景全丢掉 |
 | E | **原 `DiTBlock` 无法反传** | `RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation: [207, 256] ... is at version 15; expected 12`（`_mod_gate` 的 `x[a:b].addcmul_` 改的正是 `norm1(x)` 存给反向的 x） |
@@ -107,9 +108,9 @@
 | β 升级为相位感知 `[50,56,5]` | **采纳** | 组内 5 个相位的起始像素帧 = **(0,1,5,9,13)**，最远 Δt=**21.667**。已实现 `phase_of_rows` / `beta_for_sequence`，`merge_lse` 支持 `[1,H,S]` 逐 query 的 β |
 | Stage 0 优先实测 RoPE 在 Δt=0..21.667 的衰减 | **采纳** | 见 §5 探针规程 |
 | 高频时间头占比极高 → 止损转路线 A | **采纳（写成硬门禁）** | 见 §6 |
-| 放弃固定坐标 lerp 残差 | **采纳** | 17 帧间隔上对细节残差做 lerp 必然糊。改为「以二采全帧底图为运动载体 + 光流把关键帧细节残差搬到中间帧」 |
-| 放弃 flex_attention+compile，用免编译原生 FlashAttention LSE | **驳回，但有折中** | ① `F.scaled_dot_product_attention` 实测**只返回 Tensor，没有 LSE**；② flash-attn 在 torch 2.14+cu130 上无预编译轮子，源码编译 30–60min，正是任务书禁止的事；③ flex+compile 首编实测 **5.9s**（一次），且 provider 已可插拔——flash 存在就优先用，不存在才落 flex，compile 不是强绑定 |
-| 运动差分自适应掩码 | **部分采纳** | Case-1（固定机位）可用；**Case-2 是推镜/横移，帧差会把整帧判成前景 → 压缩率归零**，恰好废掉最关键的用例。Case-2/3 仍走抠像（RMBG 176MB 云端拉），或先做全局运动补偿再差分 |
+| 放弃固定坐标 lerp 残差 | **改为 A/B 对照，不删** | 任务书 v3 §4.2.3 把法 A（lerp）留作对照组、法 B（光流 warp）主推 —— 这是对的：没有对照组就说不清 warp 到底赚了多少。已实现 `assembly.py`：已知 2×4 平移下 **法 B 误差 0.073 vs 法 A 0.294（低 75%）** |
+| 放弃 flex_attention+compile，用免编译原生 FlashAttention LSE | **采纳 —— 我上一条判断错了，撤回** | ATen 直接暴露了 `_scaled_dot_product_cudnn_attention` / `_scaled_dot_product_efficient_attention`，**零编译、支持 Q≠K、返回 fp32 自然对数 LSE**。本机实测：cudnn 误差 **9.5e-7**、`out` 可反传（q/k 都有梯度）、非连续输入也接受；8192²×56 头 **71.9ms / 26.8 TF**，与 flex 的 68.2ms 基本持平但省掉首编。`_scaled_dot_product_flash_attention` 在 Windows 版 torch 上确实报 `USE_FLASH_ATTENTION was not enabled for build` |
+| 运动差分自适应掩码 | **采纳（但必须先做全局补偿）** | 任务书 v3 的 `Active = M_fg ∪ HighMotionBG ∪ Ring` 已经把「局部」写清楚了。已实现 `masks.py`：先估分块位移把全局运镜补偿掉，再看残差。实测：纯推镜 **0.9%** 活跃，加一个不跟镜头走的物体 → **9.5%**（只抓物体） |
 | INT8 权重直测 | **采纳** | 与本机 4060 推理同源，结论才能迁移 |
 
 ### 4.1 LSE 公式（正写）
@@ -124,6 +125,23 @@ O  = exp(L1 - L) · O1  +  exp(L2 + β - L) · O2
 ```
 
 代码里 `beta` 在合并前就加进 `l2`，所以第二项写 `exp(l2 - L)` 是同一个东西。单测 T2（BG 键复制 5 次 vs β=log5 合并）误差 **3.3e-7**。
+
+### 4.1b 二采必须保留（v3 任务书的核心修订）
+
+我上一版把「lerp 残差」连二采一起简化掉了，这是错的。任务书 v3 把二采写成承重件：
+
+1. **BG 关键帧默认 `m = 1` 参与完整二采重绘**（`denoise = 0.30~0.40`）。也就是说背景不是锁死在
+   一采 4 步 0.4MP 的糊底上，而是真的被 H3 按 1.3MP 重画一遍 —— 只是把「重绘自由度」从
+   「每帧瞎画」收束到「每 17 帧画准一次」。这一步决定了 `bg_hf_sharpness ≥ 0.90× Oracle` 能不能成立。
+2. **中间帧靠法 A / 法 B 从关键帧残差还原**：`z_p1_up`（一采上采样，全帧、自带 24fps 运镜）
+   + 关键帧细节残差。法 A 是固定坐标 lerp，法 B 是 latent 空间分块位移场双向 warp。
+3. **静机位档（T_bg=1）** 直接把二采画好的 `z_bg_out(0)` 铺满背景区（仅当外部给了 4K 底图才 `m=0` 锁定）。
+
+**代价必须写进预算**：二采 5 步 @1920×1104（patch 网格 60×35 = 2100/帧）比一采贵得多。
+稠密 Oracle 的二采单条约 5 分钟；压缩后（token 降到 ~40%）约 1 分钟。
+所以 **Oracle 也必须跑二采** —— 否则没有 1.3MP 的基准，`bg_hf_sharpness` 无从比较。
+
+已实现：`route3/assembly.py`（法 A / 法 B / 静机位复用）。
 
 ### 4.2 三个仍然生效的决策
 
@@ -164,24 +182,24 @@ O  = exp(L1 - L) · O1  +  exp(L2 + β - L) · O2
 
 ---
 
-## 7. 3 小时时间线（Stage 3 已移除）
+## 7. 3 小时时间线（Stage 3 已移除，二采保留）
 
 | 分钟 | 动作 | 预算 |
 |---|---|---|
 | 0–3 | `deploy_v3.py`（已去 `--highvram`） | 3 |
-| 3–13 | 只本地化 5 个模型（底模 21G + text enc 15.7G + video vae 3.2G + audio vae 0.6G + upscaler 1.4G ≈ 41.9G，Drive 60–70MB/s） | 10 |
-| 13–15 | `preflight_check.py` + flex kernel 预热（3 个 S 长度） | 2 |
-| 15–23 | 3 条 Case 的稠密 Oracle（5s / 1280×736 / 4 步，约 1.5min/条） | 8 |
-| 23–43 | §5 RoPE 衰减探针 | 20 |
-| 43–55 | 掩码 + plan + 真实权重上的 T1/T2 | 12 |
-| 55–140 | 消融：`S_bg=5 / 3 / T_bg=1` × `ring=0/1` × 3 Case（split-stream 单条约 1min） | 85 |
-| 140–160 | 拼板图 + `stage1_ablation.csv` + 报告 | 20 |
-| 160–175 | 同步 Drive + 原子校验 | 15 |
-| 175–180 | 停机 | 5 |
+| 3–13 | 只本地化 5 个模型（≈41.9G，Drive 60–70MB/s） | 10 |
+| 13–15 | `preflight_check.py` + flex kernel 预热 | 2 |
+| 15–33 | **3 条 Oracle 的一采 + 二采**（5s / 1280×736；稠密二采约 5min/条） | 18 |
+| 33–53 | §5 RoPE 衰减探针（抽 8 头 × 50 层） | 20 |
+| 53–63 | 活跃掩码（全局补偿差分 + 可选抠像）+ 真实权重上的 T1/T2 | 10 |
+| 63–100 | 消融 12 条：`S_bg=5/3 × ring=0/1` + `T_bg=1` × 3 Case（每条一采+二采 ≈ 2.2min） | 37 |
+| 100–118 | 法 A vs 法 B 的中间帧 A/B（复用已有 latent，只加解码与拼板） | 18 |
+| 118–140 | `bg_hf_sharpness` / `seam_grad_ratio` / 拼板图 / 报告 | 22 |
+| 140–160 | 同步 Drive + 原子校验 | 20 |
+| 160–180 | 停机缓冲 | 20 |
 
-**合计 3.0h**，留 0 冗余——所以 §5 的判定必须由脚本自动落盘，人只看结果，不在回路里等。
-
----
+**合计 3.0h**。二采占了大头（Oracle 18min + 消融内嵌），所以消融只做 4 个档位、不做 6 个。
+若探针判定「止损」，跳过 63–118，直接转路线 A（省 55 分钟）。
 
 ## 8. 一句话
 
@@ -194,12 +212,13 @@ O  = exp(L1 - L) · O1  +  exp(L2 + β - L) · O2
 
 | # | 模块 | 作用 | 状态 |
 |---|---|---|---|
-| 1 | `route3/plan.py` | 掩码 → `(fg, bg, ring, phase)`，三种掩码源（运动差分 / 运动补偿差分 / RMBG） | **已并入 `splitstream_attn.route3_plan`（吃 fg_mask）**；只剩掩码生成器 |
+| 1 | 掩码 → `(fg, bg, ring, phase)` | `route3/masks.py` 已实现全局补偿差分 + ring + 降采样；`route3_plan` 吃 `fg_mask` | **已完成**（抠像源待接） |
 | 2 | `route3/engine.py` | 用 `[Prefix \| FG \| BG]` 自建打包序列的 forward | **已完成**，`s_bg=1` 与原生 forward 逐位一致（diff=0.00e+00） |
 | 3 | `route3/probe_attn.py` | §5 探针，产出 `probe_attn_stats.json` | **已完成**，机制在 tiny 模型上跑通 |
 | 4 | `route3/stage0_oracle.py` | 3 条 Case 的稠密 Oracle + 落 Drive | 待写（需云） |
 | 5 | `route3/stage1_ablate.py` | 6 组消融 + 指标 + 拼板 | 待写（需云） |
-| 6 | `watchdog.sh` / `run_pipeline.sh` | Colab 版：`/content` 本地盘 + Drive 原子同步 | 待写 |
+| 6 | `route3/assembly.py` | 法 A / 法 B / 静机位复用 | **已完成**（法 B 比法 A 低 75%） |
+| 7 | `watchdog.sh` / `run_pipeline.sh` | Colab 版：`/content` 本地盘 + Drive 原子同步 | 待写 |
 
 还缺的两件**非代码**东西：
 - 掩码源：RMBG-1.4 权重（176MB，云端拉）或运动补偿差分的实现；
@@ -234,9 +253,22 @@ O  = exp(L1 - L) · O1  +  exp(L2 + β - L) · O2
 [PASS] out-of-place block + LoRA 反传        8 个 LoRA 张量有梯度
 ```
 
-### 10.1 v2 期间新发现的两个坑（本机实测）
+### 10.1 v2 期间新发现的坑（本机实测）
 
 | 现象 | 说明 |
 |---|---|
 | **压缩率取决于前景掩码，不是 `S_bg`** | `video_split` 最初只按时间切分 → 所有非锚点行都落进 FG，一行都删不掉（自检直接报了"降幅 0%"）。改成「FG 掩码全帧保留 + BG 只在锚点帧保留」后：24% 前景 / S_bg=5 → 保持 13856/34040，**降 59%** |
+| **MemEff 的 LSE 会被 padding 到 8 的倍数** | `S=95 → lse 96`、`S=17 → lse 32`，而 `out` 保持真实长度。不切掉 `[..., :S]` 就会和 β 形状对不上；若 S 恰好对齐则**静默错位**。cudnn 不 padding |
 | **flex 的 autotune 可能挑到超 smem 的 config** | 4060 上实测报 `No valid triton configs ... Required 131072 / limit 101376`。已加降级链「默认 config → `BLOCK_M/N=64, num_stages=1` → manual」，并缓存成功的那档，避免 50 层 × 2 分支重复试探 |
+
+### 10.2 provider 落地顺序（实测后定稿）
+
+```
+推理：cudnn  →  memeff  →  flash(Linux)  →  flex  →  manual
+训练：flex（需要 lse 可反传时；但 β/α 校准不需要 —— β 是加在 merge 里的外部标量，
+      梯度由 merge 的解析式给出，与内核是否给 lse 梯度无关）
+```
+
+`cudnn` 与 `memeff` 速度基本持平（26.8 vs 20.1 TF），但 cudnn 的 LSE 不 padding、`out` 可反传，
+所以排第一。第一次成功后缓存，50 层 × 2 分支不再重复试探；失败时清缓存重新探。
+

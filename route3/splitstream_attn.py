@@ -74,12 +74,34 @@ def warmup(shapes, dtype=torch.bfloat16, device="cuda"):
     return round(time.time() - t0, 1)
 
 
+def _attn_lse_cudnn(q, k, v):
+    """cuDNN FlashAttention，零编译，支持 Q != K，lse 是 fp32 自然对数。
+
+    **实测（本机 torch 2.14.0+cu130 / 4060，Q=256 K=128 H=4 D=128 bf16）**：
+    误差 9.5e-7；返回 lse 形状 [B,H,Q,1]（要 squeeze 掉最后一维）；out 可反传（q/k 都有梯度）。
+    非连续输入（从 [1,S,H,D] 转置而来）也接受。
+    """
+    out, lse = torch.ops.aten._scaled_dot_product_cudnn_attention(
+        q, k, v, None, True, 0.0, False)[:2]
+    lse = lse.float().squeeze(-1)
+    return out, lse[..., :q.shape[-2]]
+
+
+def _attn_lse_memeff(q, k, v):
+    """MemEff（xFormers 系），零编译，支持 Q != K，lse 已是 [B,H,Q] fp32。"""
+    out, lse = torch.ops.aten._scaled_dot_product_efficient_attention(
+        q, k, v, None, True, 0.0, False)[:2]
+    # ⚠ 实测：MemEff 会把 lse padding 到 8 的倍数（S=95 → 96，S=17 → 32），
+    # 而 out 保持真实长度。不切掉就会和 β 的形状对不上，或者在 S 恰好对齐时静默错位。
+    return out, lse.float()[..., :q.shape[-2]]
+
+
 def _attn_lse_flash(q, k, v):
     from flash_attn import flash_attn_func
     o, lse, _ = flash_attn_func(
         q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(),
         v.transpose(1, 2).contiguous(), return_attn_probs=True)
-    return o.transpose(1, 2), lse.float()
+    return o.transpose(1, 2), lse.float()[..., :q.shape[-2]]
 
 
 def _attn_lse_manual(q, k, v, chunk=None):
@@ -97,17 +119,29 @@ def _attn_lse_manual(q, k, v, chunk=None):
     return torch.cat(outs, dim=2), torch.cat(lses, dim=2)
 
 
-_PROVIDERS = {"flex": _attn_lse_flex, "flash": _attn_lse_flash, "manual": _attn_lse_manual}
+_PROVIDERS = {"cudnn": _attn_lse_cudnn, "memeff": _attn_lse_memeff,
+              "flex": _attn_lse_flex, "flash": _attn_lse_flash,
+              "manual": _attn_lse_manual}
+
+# 推理默认顺序：零编译的 ATen 融合算子优先，flex 只作兜底
+# （cudnn 71.9ms vs flex 68.2ms @8192x8192x56 头，速度基本持平，但省掉 6s 首编与
+#   autotune 撞 smem 的风险；需要 lse 可反传时才必须用 flex）
+_ORDER = ("cudnn", "memeff", "flash", "flex", "manual")
 
 
 def provider_report():
-    out = {"flex_available": True, "flash_available": False, "compiled": False}
+    import torch
+    out = {"available": [], "compiled": "fn" in _FLEX}
+    for n in ("cudnn", "memeff"):
+        out["available"].append(n) if hasattr(torch.ops.aten, "_scaled_dot_product_%s_attention"
+                                              % ("cudnn" if n == "cudnn" else "efficient")) else None
     try:
         import flash_attn  # noqa: F401
-        out["flash_available"] = True
+        out["available"].append("flash")
     except Exception:
         pass
-    out["compiled"] = "fn" in _FLEX
+    out["available"] += ["flex", "manual"]
+    out["flash_available"] = "flash" in out["available"]
     return out
 
 
@@ -131,9 +165,7 @@ def attn_lse(q, k, v, provider: str = "auto"):
             _STATE["last_error"] = "cached %s: %s" % (cached, repr(e)[:160])
             _STATE["provider"] = None
 
-    order = ["flash", "flex", "manual"]
-    if not provider_report()["flash_available"]:
-        order.remove("flash")
+    order = [p for p in _ORDER if p in provider_report()["available"]]
     for name in order:
         try:
             out = _PROVIDERS[name](q, k, v)
