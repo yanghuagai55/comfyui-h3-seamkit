@@ -37,6 +37,14 @@ def main():
                        text_dim=64, timestep_input_dim=256, time_embed_hidden_size=256,
                        time_embed_dim=128, dtype=torch.float32, device=DEV,
                        operations=comfy.ops.disable_weight_init).to(DEV).eval()
+    # disable_weight_init 分配出的参数在全新 CUDA 页上全为 0，必须显式填充非零权重，否则是在比 0==0！
+    with torch.no_grad():
+        for name, p in m.named_parameters():
+            if p.ndim == 1 and ("norm" in name or "scale" in name):
+                p.fill_(1.0)
+                p.add_(torch.randn_like(p) * 0.05)
+            else:
+                p.normal_(0.0, 0.05)
     # ComfyUI 实际加载的权重是 requires_grad=False；带 grad 时融合 RoPE 直接拒绝执行
     m.requires_grad_(False)
     mm.in_training = False
@@ -62,8 +70,10 @@ def main():
 
     d0 = (ref[0] - got[0]).abs().max().item()
     d1 = (ref[1] - got[1]).abs().max().item()
-    check("s_bg=1 + 非平凡重排：视频与原生 forward 逐位一致", d0 < 1e-6, "max_diff=%.2e" % d0)
-    check("s_bg=1 + 非平凡重排：音频一致", d1 < 1e-6, "max_diff=%.2e" % d1)
+    ref_mag = ref[0].abs().max().item()
+    check("非零权重基线有效 (ref_max > 0.1)", ref_mag > 0.1, "ref_max=%.3e" % ref_mag)
+    check("s_bg=1 + 非平凡重排：视频与原生 forward 逐位一致", d0 < 1e-5, "max_diff=%.2e" % d0)
+    check("s_bg=1 + 非平凡重排：音频一致", d1 < 1e-5, "max_diff=%.2e" % d1)
     check("s_bg=1 一行不删（fg+bg == 全部，且 bg>0）",
           int(plan.fg_local.numel() + plan.bg_local.numel()) == plan.video_rows
           and int(plan.bg_local.numel()) > 0,
@@ -85,6 +95,25 @@ def main():
     check("相位长度对齐压缩后序列",
           plan2.full_phase().numel() == plan2.n_full + int(plan2.bg_local.numel()),
           "S=%d" % plan2.full_phase().numel())
+
+    # 验证 full_velocity=True 在 Flow Matching 下通过 x0_hat 插值完全消去被删帧的独立噪声 ε(t)
+    with torch.no_grad():
+        sigma_test = 0.5
+        ts_half = torch.tensor([sigma_test * 1000.0], device=DEV)
+        x_clean = torch.zeros(1, 24, T, H, W, device=DEV)
+        eps_indep = torch.randn_like(x_clean) * 2.0
+        x_noisy = (1.0 - sigma_test) * x_clean + sigma_test * eps_indep
+        v_out = splitstream_forward(
+            m, [x_noisy.clone(), a.clone()], ts_half, ctx, {}, {}, s_bg=3, beta=None,
+            fg_mask=fm, full_velocity=True,
+        )[0]
+        # CONST.calculate_denoised = x_t - sigma * model_output
+        x0_hat = x_noisy - sigma_test * v_out
+        # 在被删 BG 区域（如 t=1, row=0, col=0），x0_hat(t=1) 必须严格等于 lerp(x0_hat(0), x0_hat(3), 1/3)
+        expected_t1_bg = (2.0 / 3.0) * x0_hat[:, :, 0, :2, :2] + (1.0 / 3.0) * x0_hat[:, :, 3, :2, :2]
+        err_x0 = (x0_hat[:, :, 1, :2, :2] - expected_t1_bg).abs().max().item()
+    check("full_velocity 按 x0_hat 插值完全消去被删帧独立噪声 ε(t)", err_x0 < 1e-5,
+          "err_x0=%.2e" % err_x0)
 
     print("\n%d 项失败%s" % (len(FAIL), (": " + ", ".join(FAIL)) if FAIL else ""))
     return 1 if FAIL else 0

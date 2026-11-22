@@ -1,0 +1,518 @@
+{
+  "3": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "deepseek.png"
+    }
+  },
+  "8": {
+    "class_type": "MiniMaxH3AudioConditioningT8",
+    "inputs": {
+      "task_type": "Ref2VA",
+      "audio_mode": "native",
+      "audio_denoise_strength": 1,
+      "add_source_as_reference": false,
+      "prompt_primary_audio_ordinal": 0,
+      "strict_prompt_tags": true,
+      "ref_image_size": "max",
+      "reference_video_policy": "official_2_to_15s",
+      "allow_above_reference_area": true,
+      "clip": [
+        "26",
+        0
+      ],
+      "video_vae": [
+        "20",
+        0
+      ],
+      "audio_vae": [
+        "12",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "3",
+        0
+      ],
+      "prompt": [
+        "102",
+        1
+      ],
+      "width": [
+        "102",
+        3
+      ],
+      "height": [
+        "102",
+        4
+      ],
+      "length": [
+        "102",
+        7
+      ]
+    }
+  },
+  "9": {
+    "class_type": "PrimitiveStringMultiline",
+    "inputs": {
+      "value": "subject_definitions:\n<Subject 1> is <DeepSeek> in <Picture 1>, a petite young woman 150 cm tall, with very long deep-navy-blue hair reaching her ankles, sea-blue eyes, wearing a navy-blue maid dress with white lace trim on the collar, cuffs and hem, a white pinafore apron embroidered with a small whale, a white frilled maid headband with a blue bow, a navy ribbon bow at the chest, white over-knee socks, navy Mary Jane shoes, and a small whale tail emerging from the back of her skirt.\n\nsummary:\n[reference generation] The target video is a 5-second continuous single-take clip in front of a solid green screen with native stereo sound, focusing smoothly on the subject's actions and performance without camera cuts.\n\nretention_analysis:\n<Subject 1>: fully_preserved - Facial features, hairstyle, clothing details, color scheme, and body proportions remain completely identical and consistent throughout the entire clip.\n\ndetailed_description:\nPhotorealistic style, clean 8k resolution, cinematic lighting. Shot against a flat, pure solid chromakey green background (studio green screen) with uniform, soft, and shadow-free lighting.\n\nThe subject stands in the center of the frame and performs a smooth, continuous sequence: she begins with both arms relaxed at her sides, gaze fixed softly on the lens, chest rising in one slow breath. Her shoulders loosen first, then both arms lift outward to her sides, palms rotating upward as they rise to shoulder height. She steps half a pace toward the camera and extends both arms further, hands opening wide in an inviting embrace, fingers spreading gently. Her head tilts slightly, eyes crinkle, and a warm relieved smile spreads across her face. The long navy hair and the white apron hem sway gently with the movement. She holds the open-armed pose through the end, breathing steadily. The camera remains stable with a subtle, steady push-in, keeping her framed from the knees up.\n\noverall_soundscape:\nSoft fabric rustle as her arms lift, a light footstep on the floor when she steps forward, steady gentle breathing throughout, no other ambient noise.\n\nnon_diegetic_music:\nN/A\n"
+    },
+    "_meta": {
+      "title": "Input Text (Prompt)"
+    }
+  },
+  "12": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+    }
+  },
+  "16": {
+    "class_type": "MiniMaxH3AVDecodeT8",
+    "inputs": {
+      "av_latent": [
+        "40",
+        0
+      ],
+      "video_vae": [
+        "20",
+        0
+      ],
+      "audio_vae": [
+        "12",
+        0
+      ]
+    }
+  },
+  "17": {
+    "class_type": "MiniMaxH3MemoryEfficientSageAttentionPatch",
+    "inputs": {
+      "model": [
+        "22",
+        0
+      ]
+    }
+  },
+  "19": {
+    "class_type": "ModelAttentionBackend",
+    "inputs": {
+      "attention": "pytorch attention",
+      "model": [
+        "17",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "注意力后端 · comfy kitchen int8（一采二采共用）"
+    }
+  },
+  "20": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_int8_convrot.safetensors"
+    }
+  },
+  "22": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
+      "strength_model": 1,
+      "model": [
+        "31",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "LoRA · 一采二采公用（分叉点）"
+    }
+  },
+  "25": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 342114565407140
+    }
+  },
+  "26": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+      "type": "minimax",
+      "device": "default"
+    }
+  },
+  "28": {
+    "class_type": "easy cleanGpuUsed",
+    "inputs": {
+      "anything": [
+        "8",
+        0
+      ]
+    }
+  },
+  "29": {
+    "class_type": "BasicGuider",
+    "inputs": {
+      "model": [
+        "30",
+        0
+      ],
+      "conditioning": [
+        "28",
+        0
+      ]
+    }
+  },
+  "30": {
+    "class_type": "MiniMaxH3DualClockSamplerT8",
+    "inputs": {
+      "steps": 4,
+      "shift_video": 12,
+      "shift_audio": 3,
+      "sampler_name": "dual_clock_euler",
+      "scheduler": "native_flow",
+      "model": [
+        "88",
+        0
+      ],
+      "av_latent": [
+        "8",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "一采"
+    }
+  },
+  "31": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "dasiwa_minimax_h3_ref2va_v5xs_pruned_graviton_turbo_int8_row-wise_convrot_runtime_mixed.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "34": {
+    "class_type": "MiniMaxLowVRAMAttention",
+    "inputs": {
+      "head_chunks": 6,
+      "model": [
+        "106",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "★ 仅二采 · LowVRAMAttention (head_chunks=10)"
+    }
+  },
+  "35": {
+    "class_type": "MiniMaxChunkFeedForward",
+    "inputs": {
+      "chunks": 4,
+      "seq_threshold": 4096,
+      "model": [
+        "34",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "★ 仅二采 · ChunkFeedForward (chunks=4)"
+    }
+  },
+  "38": {
+    "class_type": "MiniMaxH3DualClockSamplerT8",
+    "inputs": {
+      "steps": 3,
+      "shift_video": 12,
+      "shift_audio": 3,
+      "sampler_name": "dual_clock_euler",
+      "scheduler": "native_flow",
+      "model": [
+        "87",
+        0
+      ],
+      "av_latent": [
+        "41",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "二采 sampler setup · av_latent 接 HIGH"
+    }
+  },
+  "39": {
+    "class_type": "BasicScheduler",
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 3,
+      "denoise": 0.3,
+      "model": [
+        "87",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "二采 Sigma · simple/3步/denoise 0.30"
+    }
+  },
+  "40": {
+    "class_type": "MiniMaxH3HardCutUpscale",
+    "inputs": {
+      "model": [
+        "38",
+        0
+      ],
+      "conditioning": [
+        "41",
+        0
+      ],
+      "latent": [
+        "93",
+        1
+      ],
+      "noise": [
+        "25",
+        0
+      ],
+      "sampler": [
+        "38",
+        1
+      ],
+      "sigmas": [
+        "39",
+        0
+      ],
+      "plan": [
+        "102",
+        0
+      ],
+      "pass2_plan": [
+        "107",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "二采执行器（不等长分块 · 硬切）· 报告=report"
+    }
+  },
+  "41": {
+    "class_type": "MiniMaxH3AudioConditioningT8",
+    "inputs": {
+      "task_type": "Ref2VA",
+      "audio_mode": "native",
+      "audio_denoise_strength": 1,
+      "add_source_as_reference": false,
+      "prompt_primary_audio_ordinal": 0,
+      "strict_prompt_tags": true,
+      "ref_image_size": "max",
+      "reference_video_policy": "official_2_to_15s",
+      "allow_above_reference_area": true,
+      "clip": [
+        "26",
+        0
+      ],
+      "video_vae": [
+        "20",
+        0
+      ],
+      "audio_vae": [
+        "12",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "3",
+        0
+      ],
+      "prompt": [
+        "102",
+        1
+      ],
+      "width": [
+        "102",
+        5
+      ],
+      "height": [
+        "102",
+        6
+      ],
+      "length": [
+        "102",
+        7
+      ]
+    },
+    "_meta": {
+      "title": "HIGH Conditioning（二采用 · 宽高由二采 ResolutionSelector 驱动）"
+    }
+  },
+  "57": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "102",
+        2
+      ]
+    },
+    "_meta": {
+      "title": "分块报告 + 报错（同款报告也直接印在 #56 上）"
+    }
+  },
+  "60": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "40",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "分块报告 + 报错"
+    }
+  },
+  "77": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "frame_rate": 24,
+      "loop_count": 0,
+      "filename_prefix": "MiniMaxH3/exp_4v10a",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 15,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "16",
+        0
+      ],
+      "audio": [
+        "16",
+        1
+      ]
+    }
+  },
+  "87": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "H3_Combat_V2.safetensors",
+      "strength_model": 0.4900000000000001,
+      "model": [
+        "35",
+        0
+      ]
+    }
+  },
+  "88": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "H3_Combat_V2.safetensors",
+      "strength_model": 0.7000000000000002,
+      "model": [
+        "106",
+        0
+      ]
+    }
+  },
+  "93": {
+    "class_type": "MiniMaxH3FirstPassSampler",
+    "inputs": {
+      "noise": [
+        "25",
+        0
+      ],
+      "guider": [
+        "29",
+        0
+      ],
+      "sampler": [
+        "30",
+        1
+      ],
+      "sigmas": [
+        "30",
+        2
+      ],
+      "latent_image": [
+        "8",
+        1
+      ],
+      "plan": [
+        "102",
+        0
+      ]
+    }
+  },
+  "102": {
+    "class_type": "MiniMaxH3HardCutFirstPassPlan",
+    "inputs": {
+      "total_seconds": 5,
+      "use_cache": false,
+      "cache_key": "s15_cam_wenxi",
+      "cache_path": "",
+      "require_sage_patch": false,
+      "loose_prompt": true,
+      "target_segment_seconds": 6.4,
+      "first_megapixels": 0.4,
+      "second_megapixels": 1.3,
+      "aspect_ratio": "16:9 (Widescreen)",
+      "multiple": 32,
+      "boundary_search_frames": 17,
+      "green_screen_mode": true,
+      "prompt": [
+        "9",
+        0
+      ]
+    }
+  },
+  "106": {
+    "class_type": "SolAttnMiniMax",
+    "inputs": {
+      "tau": 1.3,
+      "start_percent": 0.2,
+      "end_percent": 0.9,
+      "min_tokens": 12288,
+      "sink_conditioning": "exact_kv_and_rows",
+      "morton": false,
+      "morton_curve": "2d_frame",
+      "centroid_tail": true,
+      "routed_cap_percent": 0,
+      "reuse_qkv_memory": false,
+      "verbose": false,
+      "dense_blocks": "",
+      "model": [
+        "19",
+        0
+      ]
+    }
+  },
+  "107": {
+    "class_type": "MiniMaxH3HardCutPass2Plan",
+    "inputs": {
+      "cfg": 1,
+      "model_name": "minimax_h3_latent_upscaler_3d_fp16.safetensors",
+      "precision": "bf16",
+      "release_policy": "clear_after",
+      "anchor_strength": 0.999,
+      "second_pass_audio_policy": "joint_av_preserve_input",
+      "seam_tolerance_frames": 4,
+      "calm_search_window": 51,
+      "calm_policy": "auto",
+      "overlap_frames": 17,
+      "auto_calm_search": true,
+      "calm_overlap_frames": 17,
+      "profile_camera_compensate": true,
+      "profile_reduce": "mean",
+      "calm_abstain_below": 0,
+      "calm_min_quality": 0.8,
+      "hunt_persistence": true,
+      "hunt_min_persistence": 0.8,
+      "hunt_search_window": 34,
+      "calm_too_quiet_below": 0.05,
+      "calm_min_gain": 0.15,
+      "auto_seam_hunt": true,
+      "anchor_tokens": 1,
+      "upscale_pad_tokens": 3,
+      "seam_blend": true,
+      "dump_latents": false,
+      "dump_dir": "latent_dump",
+      "show_memory_log": true
+    }
+  }
+}

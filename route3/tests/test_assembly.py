@@ -56,5 +56,15 @@ m = torch.zeros(3, H, W, dtype=torch.bool, device=DEV); m[:, 10:30, 20:50] = Tru
 st2 = reconstruct_static(torch.stack([f0, f1, f2]), f0, fg_mask=m)
 check("静机位档：前景保留原帧",
       bool((st2[2][:, 10:30, 20:50] - f2[:, 10:30, 20:50]).abs().max().item() < 1e-6))
+
+# 尾帧外推（模拟 T=37 / s_bg=5 → anchors 止于 35，t=36 必须顺流外推而不是退回糊底）
+f3 = shift_img(tex, 3, 6)
+gt3 = f3 + shift_img(D, 3, 6)
+z4 = torch.stack([f0, f1, f2, f3])
+out4 = reconstruct_moving(z4, delta_keys, [0, 2], method="flow", tiles=(6, 8), search=5)
+e_tail_flow = (out4[3] - gt3).abs().mean().item()
+e_tail_raw = (f3 - gt3).abs().mean().item()
+check("尾帧外推（t > anchors[-1]）显著优于退回糊底", e_tail_flow < e_tail_raw * 0.5,
+      "tail_flow=%.4f raw_blur=%.4f" % (e_tail_flow, e_tail_raw))
 print("\n%d 项失败%s" % (len(FAIL), (": " + ", ".join(FAIL)) if FAIL else ""))
 sys.exit(1 if FAIL else 0)

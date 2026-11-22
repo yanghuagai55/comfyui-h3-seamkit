@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 
 import numpy as np
@@ -21,22 +22,56 @@ import torch.nn.functional as F
 __all__ = ["video_frames", "hf_energy", "seam_grad_ratio", "psnr", "evaluate"]
 
 
+def _ffmpeg_bin():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
 def video_frames(path, size=None, limit=None):
-    """→ [T,H,W,3] uint8。size=(W,H)。"""
-    if size is None:
-        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                                "-show_entries", "stream=width,height", "-of", "csv=p=0",
-                                str(path)], capture_output=True, text=True).stdout.strip()
-        w, h = [int(v) for v in probe.split(",")[:2]]
-        size = (w, h)
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", "scale=%d:%d" % size,
-                          "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
-                         capture_output=True).stdout
-    if not raw:
-        raise RuntimeError("ffmpeg 解码失败: %s" % path)
-    w, h = size
-    fr = np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3)
-    return fr[:limit] if limit else fr
+    """→ [T,H,W,3] uint8。size=(W,H)。优先 ffmpeg，Windows 无系统 ffmpeg 时自动走 imageio_ffmpeg / cv2。"""
+    ffmpeg = _ffmpeg_bin()
+    ffprobe = shutil.which("ffprobe")
+    if ffmpeg and (size is not None or ffprobe):
+        if size is None:
+            probe = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
+                                    "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                                    str(path)], capture_output=True, text=True).stdout.strip()
+            w, h = [int(v) for v in probe.split(",")[:2]]
+            size = (w, h)
+        raw = subprocess.run([ffmpeg, "-v", "error", "-i", str(path), "-vf", "scale=%d:%d" % size,
+                              "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                             capture_output=True).stdout
+        if raw:
+            w, h = size
+            fr = np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3)
+            return fr[:limit] if limit else fr
+
+    # Fallback: OpenCV (自带在 ComfyUI 环境，不依赖系统 PATH)
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(path))
+        frames = []
+        while True:
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            if size is not None:
+                bgr = cv2.resize(bgr, (int(size[0]), int(size[1])), interpolation=cv2.INTER_AREA)
+            frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            if limit and len(frames) >= limit:
+                break
+        cap.release()
+        if frames:
+            return np.stack(frames, axis=0)
+    except Exception:
+        pass
+    raise RuntimeError("视频解码失败（ffmpeg 与 cv2 均不可用）: %s" % path)
 
 
 def _gray_t(x):

@@ -33,7 +33,7 @@ Nodes
 from comfy_api.latest import ComfyExtension
 
 from .route3.nodes import (MiniMaxH3Route3Apply, MiniMaxH3Route3Assemble,
-                         MiniMaxH3Route3Probe)
+                         MiniMaxH3Route3AutoMask, MiniMaxH3Route3Probe)
 
 from .nodes import (
     MiniMaxH3HardCutFirstPassPlan,
@@ -84,6 +84,7 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3Route3Apply,
             MiniMaxH3Route3Probe,
             MiniMaxH3Route3Assemble,
+            MiniMaxH3Route3AutoMask,
         ]
 
 

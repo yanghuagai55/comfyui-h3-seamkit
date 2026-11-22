@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from route3.splitstream_attn import FRAME_PER_TOKEN
+from .splitstream_attn import FRAME_PER_TOKEN
 
 __all__ = ["token_spans", "MaskProvider", "save_mask", "load_mask"]
 

@@ -56,36 +56,51 @@ def check_env():
 
 
 def check_flex():
-    """LSE 通路 —— 整个 Route 3 的地基，不通就不要开机。"""
+    """LSE 通路 —— 零编译 ATen cuDNN / MemEff 优先，flex 作可选训练兜底。"""
+    import math
     import torch
     print("=== 2. LSE 通路 ===")
+    torch.manual_seed(0)
+    q = torch.randn(1, 8, 512, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 256, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 8, 256, 128, device="cuda", dtype=torch.bfloat16)
+    s = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(128)
+    lse_ref = torch.logsumexp(s, -1)
+
+    ok_aten = False
+    for label, fn_name, sq in (
+        ("ATen cuDNN LSE（首选零编译）", "_scaled_dot_product_cudnn_attention", True),
+        ("ATen MemEff LSE（备选零编译）", "_scaled_dot_product_efficient_attention", False),
+    ):
+        fn = getattr(torch.ops.aten, fn_name, None)
+        if fn is None:
+            add(label, False, "torch 无此算子", fatal=False)
+            continue
+        try:
+            t0 = time.time()
+            out, lse = fn(q, k, v, None, True, 0.0, False)[:2]
+            torch.cuda.synchronize()
+            lse = lse.float().squeeze(-1) if sq else lse.float()
+            lse = lse[..., :q.shape[-2]]
+            err = (lse - lse_ref).abs().max().item()
+            good = err < 1e-2
+            ok_aten = ok_aten or good
+            add(label, good, "%.1fms / lse_err=%.2e" % ((time.time() - t0) * 1e3, err), fatal=False)
+        except Exception as e:
+            add(label, False, repr(e)[:140], fatal=False)
+
+    add("至少一条零编译 LSE 通路可用", ok_aten, "cudnn / memeff", fatal=True)
+
     try:
         from torch.nn.attention.flex_attention import flex_attention
-        add("flex_attention 可导入", True)
-    except Exception as e:
-        add("flex_attention 可导入", False, repr(e))
-        return
-    torch.manual_seed(0)
-    q = torch.randn(1, 8, 1024, 128, device="cuda", dtype=torch.bfloat16)
-    t0 = time.time()
-    try:
+        t0 = time.time()
         fn = torch.compile(flex_attention, dynamic=False)
         o, lse = fn(q, q, q, return_lse=True)
         torch.cuda.synchronize()
+        add("flex_attention + compile（可选训练兜底）", True,
+            "首编 %.1fs" % (time.time() - t0), fatal=False)
     except Exception as e:
-        add("flex + torch.compile + return_lse", False, repr(e)[:200])
-        return
-    import math
-    s = (q.float() @ q.float().transpose(-1, -2)) / math.sqrt(128)
-    err = (lse.float() - torch.logsumexp(s, -1)).abs().max().item()
-    add("flex + torch.compile + return_lse", err < 1e-2,
-        "首编 %.1fs / lse_err=%.2e" % (time.time() - t0, err),
-        extra={"compile_s": round(time.time() - t0, 1), "lse_err": err})
-    try:
-        import flash_attn  # noqa: F401
-        add("flash-attn（可选加速）", True, getattr(flash_attn, "__version__", "?"), fatal=False)
-    except Exception:
-        add("flash-attn（可选加速）", False, "未安装 —— 不影响，用 flex", fatal=False)
+        add("flex_attention + compile（可选训练兜底）", False, repr(e)[:120], fatal=False)
 
 
 def check_ck():
@@ -150,7 +165,7 @@ ROLES = {
     "文本编码器": (["**/qwen3vl*safetensors"], 10e9),
     "视频 VAE": (["**/minimax_h3_video_vae*.safetensors"], 1e9),
     "音频 VAE": (["**/minimax_h3_audio_vae*.safetensors"], 0.3e9),
-    "latent 上采样": (["**/h3_upscaler*.safetensors"], 0.5e9),
+    "latent 上采样": (["**/*upscaler*.safetensors", "**/h3_upscaler*.safetensors"], 0.5e9),
 }
 
 

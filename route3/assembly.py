@@ -134,6 +134,19 @@ def reconstruct_moving(z_p1_up, delta_keys, anchor_idx, method="flow",
             d = flow_residual(d0, d1, frac, fl) if method == "flow" \
                 else lerp_residual(d0, d1, frac)
             out[j] = out[j] + d
+    # 尾帧外推：MiniMax H3 的 5s=T37 / 15s=T107 除以 s_bg=5 总会多出 1~2 个尾帧，
+    # 若不顺流外推最后一个锚点的残差，片尾最后 4 帧会突然退回一采糊底。
+    if anchors and method != "none":
+        t_first = anchors[0]
+        for j in range(0, t_first):
+            d = warp(delta_keys[t_first], estimate_tile_flow(z_p1_up[t_first], z_p1_up[j], tiles=tiles, search=search)) \
+                if method == "flow" else delta_keys[t_first]
+            out[j] = out[j] + d
+        t_last = anchors[-1]
+        for j in range(t_last + 1, T):
+            d = warp(delta_keys[t_last], estimate_tile_flow(z_p1_up[t_last], z_p1_up[j], tiles=tiles, search=search)) \
+                if method == "flow" else delta_keys[t_last]
+            out[j] = out[j] + d
     return out
 
 

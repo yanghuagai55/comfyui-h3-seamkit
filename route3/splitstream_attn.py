@@ -260,7 +260,10 @@ def video_split(latent_t: int, gh: int, gw: int, s_bg: int = 5, fg_mask=None):
     规则
     ----
     前景行：全部帧保留；
-    背景行：只在锚点帧（t % s_bg == 0）保留。
+    背景行：
+      * s_bg == 1：每帧都保留（0% 压缩，用于与原生 forward 做逐位等价自检）；
+      * s_bg <= 0 或 s_bg >= latent_t：静机位单帧档（T_bg = 1），仅保留第 0 帧背景；
+      * 1 < s_bg < latent_t：多速率关键帧档，仅在锚点帧（t % s_bg == 0）保留。
 
     返回 (fg_local, bg_local)：视频段内的行下标（0 = 第一帧第一行）。
     """
@@ -276,7 +279,10 @@ def video_split(latent_t: int, gh: int, gw: int, s_bg: int = 5, fg_mask=None):
             raise ValueError("fg_mask 大小 %d != %d" % (m.numel(), rows))
         is_fg = m.to(torch.bool).cpu()   # 行号/掩码一律留 CPU，省显存也省同步
 
-    is_anchor = (t_of_row % max(1, s_bg) == 0)
+    if s_bg <= 0 or s_bg >= latent_t:
+        is_anchor = (t_of_row == 0)
+    else:
+        is_anchor = (t_of_row % s_bg == 0)
     keep = is_fg | is_anchor
     fg = (keep & is_fg).nonzero(as_tuple=True)[0]
     bg = (keep & ~is_fg).nonzero(as_tuple=True)[0]
@@ -322,8 +328,15 @@ def route3_plan(prefix_end: int, latent_t: int, lat_h: int, lat_w: int,
     gh, gw = lat_h // 2, lat_w // 2
     fg, bg = video_split(latent_t, gh, gw, s_bg, fg_mask=fg_mask)
     # BG 被压缩多少倍，就补回多少质量（Stage 2 再按 layer/head/相位 校准）
-    n_keep = 1 if (s_bg <= 0 or s_bg >= latent_t) else math.ceil(latent_t / s_bg)
-    beta0 = math.log(max(1.0, latent_t / n_keep)) if (s_bg > 1 and fg_mask is not None) else 0.0
+    if s_bg == 1 or fg_mask is None:
+        n_keep = latent_t
+        beta0 = 0.0
+    elif s_bg <= 0 or s_bg >= latent_t:
+        n_keep = 1
+        beta0 = math.log(max(1.0, float(latent_t)))
+    else:
+        n_keep = math.ceil(latent_t / s_bg)
+        beta0 = math.log(max(1.0, latent_t / n_keep))
     return Route3Plan(prefix_end=prefix_end, video_start=prefix_end,
                       video_rows=latent_t * gh * gw, fg_local=fg, bg_local=bg,
                       s_bg=s_bg, n_full=prefix_end + int(fg.numel()), beta0=beta0,

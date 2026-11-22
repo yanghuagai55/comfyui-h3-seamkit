@@ -25,7 +25,7 @@ import types
 
 import torch
 
-from route3.engine import splitstream_forward
+from .engine import splitstream_forward
 
 __all__ = ["install", "malloc_graph_active", "Route3State"]
 
@@ -57,8 +57,10 @@ class Route3State:
 
 
 def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
-            strict_malloc=True):
+            strict_malloc=True, use_beta=True):
     """返回装了 Route 3 forward 的 ModelPatcher（clone，不改原对象）。"""
+    from comfy.ldm.minimax.model import time_shift_sigma
+
     m = model_patcher.clone()
     dm = m.get_model_object("diffusion_model")
     orig = dm.forward
@@ -75,25 +77,41 @@ def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
             st.passthrough += 1
             st.note("mask", "带 denoise_mask 的步回落原生 forward（此时不压缩）")
             return orig(x, timestep, context, transformer_options,
-                        minimax_payload=minimax_payload, **kw)
+                        minimax_payload=minimax_payload,
+                        denoise_mask=denoise_mask,
+                        audio_denoise_mask=audio_denoise_mask, **kw)
         if not torch.is_tensor(x[0]) or x[0].shape[0] != 1:
             st.passthrough += 1
             return orig(x, timestep, context, transformer_options,
-                        minimax_payload=minimax_payload, **kw)
+                        minimax_payload=minimax_payload,
+                        denoise_mask=denoise_mask,
+                        audio_denoise_mask=audio_denoise_mask, **kw)
 
         lat_t, lat_h, lat_w = x[0].shape[2], x[0].shape[3], x[0].shape[4]
         mask = fg_mask_fn(lat_t, lat_h, lat_w) if fg_mask_fn is not None else None
 
+        # 与 MiniMaxH3Model.forward 完全对齐的 audio_scale 换算（兼容 ModelSamplingAV 与 dual_clock_euler）
+        scale = float((minimax_payload or {}).get("audio_scale", 1.0))
+        audio_src = x[1]
+        x_in = x
+        if scale != 1.0:
+            shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
+            shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
+            sigma_v = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+            sigma_a = time_shift_sigma(sigma_v, shift_v, shift_a)
+            carry = (sigma_a / sigma_v).to(audio_src.dtype)
+            x_in = [x[0], audio_src * carry]
+
         # 和原生 forward 一样：malloc graph 开着就 begin/end + 拷进预分配缓冲
         import comfy.model_prefetch as _mp
-        mg = _mp.malloc_graph_enabled(x[0].device)
+        mg = _mp.malloc_graph_enabled(x_in[0].device)
         if mg:
-            buf = [torch.empty_like(x[0]), torch.empty_like(x[1])]
-            _mp.malloc_graph_begin(x[0].device)
+            buf = [torch.empty_like(x_in[0]), torch.empty_like(x_in[1])]
+            _mp.malloc_graph_begin(x_in[0].device)
         out, plan, _ = splitstream_forward(
-            self, x, timestep, context, transformer_options, minimax_payload,
+            self, x_in, timestep, context, transformer_options, minimax_payload,
             s_bg=s_bg, beta=beta, fg_mask=mask, full_velocity=True,
-            return_plan=True)
+            return_plan=True, use_beta=use_beta)
         st.last_plan = plan.to_dict()
         if mg:
             buf[0].copy_(out[0])
@@ -101,7 +119,10 @@ def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
             del out
             _mp.malloc_graph_end()
             out = buf
-        if mask is not None:
+        if scale != 1.0:
+            out[1] = ((1.0 - scale) * (audio_src * carry)
+                      + (1.0 + (scale - 1.0) * sigma_a).to(out[1].dtype) * out[1])
+        if mask is not None and s_bg != 1:
             st.compressed += 1
         else:
             st.passthrough += 1

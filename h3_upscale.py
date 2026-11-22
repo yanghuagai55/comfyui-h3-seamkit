@@ -1526,6 +1526,7 @@ def execute(
         print(f"[HardCut] log error: {_log_exc}", flush=True)
 
     accumulated = None
+    accumulated_up = None
     segment_reports = []
     prev_end_frame = None
     seam_marks = []
@@ -1662,6 +1663,13 @@ def execute(
             _trim_lo = start_token - pt_lo          # 头部要裁掉的 padding token 数
             _n_tok = end_token - start_token        # 窗口 own token 数
             chunk_video = chunk_video[:, :, _trim_lo:_trim_lo + _n_tok].contiguous()
+        # 同步在 CPU 上累积全片 3D 上采样底图（0 MB 显存开销），供下游 Route3Assemble 做残差传播
+        _cv_cpu = chunk_video.detach().cpu()
+        accumulated_up = (
+            _cv_cpu if accumulated_up is None
+            else core._append_video(accumulated_up, _cv_cpu, start_token)
+        )
+        del _cv_cpu
         chunk_conditioning = core.reanchor_conditioning(
             conditioning, start_frame, end_frame, tuple(chunk_video.shape[-2:])
         )
@@ -1844,6 +1852,12 @@ def execute(
             },
         )
     output = {"samples": comfy.nested_tensor.NestedTensor((accumulated, audio))}
+    upscaled_output = {
+        "samples": comfy.nested_tensor.NestedTensor(
+            (accumulated_up if accumulated_up is not None else accumulated.detach().cpu(),
+             audio.detach().cpu())
+        )
+    }
     report = {
         "schema": "h3.hardcut.upscale.v1",
         "status": "completed",
@@ -1856,7 +1870,7 @@ def execute(
     }
     if seam_hunt is not None:
         report["seam_hunt"] = seam_hunt
-    return output, json.dumps(report)
+    return output, json.dumps(report), upscaled_output
 
 
 class MiniMaxH3HardCutUpscale(io.ComfyNode):
@@ -1894,10 +1908,14 @@ class MiniMaxH3HardCutUpscale(io.ComfyNode):
                 ),
                 io.Conditioning.Input("negative", optional=True),
             ],
-            outputs=[io.Latent.Output("latent"), io.String.Output("report")],
+            outputs=[
+                io.Latent.Output("latent"),
+                io.String.Output("report"),
+                io.Latent.Output("upscaled_latent"),
+            ],
         )
 
     @classmethod
     def execute(cls, **kwargs):
-        output, report = execute(**kwargs)
-        return io.NodeOutput(output, report)
+        output, report, upscaled_output = execute(**kwargs)
+        return io.NodeOutput(output, report, upscaled_output)
