@@ -36,8 +36,8 @@ from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL, LOAD_PASS
 #   15s (362f x 1.355MP = 490.5) single-block activation peak = 2.97 GiB (< stock 5s 3.35 GiB)
 LOAD_PASS_CHUNKED_EXACT = 335.0
 LOAD_FAIL_CHUNKED_EXACT = 380.0
-LOAD_PASS_CHUNKED_STREAMING = 360.0
-LOAD_FAIL_CHUNKED_STREAMING = 520.0
+LOAD_PASS_CHUNKED_STREAMING = 510.0
+LOAD_FAIL_CHUNKED_STREAMING = 620.0
 
 
 def effective_load_thresholds(model) -> tuple[float, float, dict | None]:
@@ -1599,6 +1599,7 @@ def execute(
                 f"[HardCut]   Chunked QKV SageAttention 已挂载 "
                 f"(head_chunks={_cs_info.get('head_chunks')}, "
                 f"out_proj_mode={_cs_info.get('out_proj_mode')}, "
+                f"attn={_cs_info.get('attention_mode', 'dense_sage')}, "
                 f"arch={_cs_info.get('arch')})："
                 f"负载代理 = {_fmax * _cv_mp:.1f}（8GB 稳妥线 {_eff_load_pass:.0f} / 警戒线 {_eff_load_fail:.0f}，"
                 f"已替代旧版 191.0 锚）",

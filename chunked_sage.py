@@ -140,6 +140,258 @@ _sageplus_sm89_available = bool(
     and hasattr(_qattn_sm89, "qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf")
     and _get_cuda_version() >= (12, 8)
 )
+_sol_attn_available = bool(
+    _ck is not None
+    and hasattr(_ck, "sol_attn")
+    and hasattr(_ck, "sol_attn_is_available")
+    and _ck.sol_attn_is_available()
+)
+
+
+# ---------------------------------------------------------------------------
+# Sol-Attn (comfy_kitchen sparse SageAttention) Morton & routing helpers
+# ---------------------------------------------------------------------------
+
+_SOL_BLOCK_SIZE = 64
+_MORTON_CPU_CACHE: dict[tuple[tuple[int, int, int], str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_MORTON_DEV_CACHE: dict[tuple[tuple[int, int, int], str, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _part1by2(value: torch.Tensor) -> torch.Tensor:
+    value = value & 0x1FFFFF
+    value = (value | (value << 32)) & 0x1F00000000FFFF
+    value = (value | (value << 16)) & 0x1F0000FF0000FF
+    value = (value | (value << 8)) & 0x100F00F00F00F00F
+    value = (value | (value << 4)) & 0x10C30C30C30C30C3
+    value = (value | (value << 2)) & 0x1249249249249249
+    return value
+
+
+def _morton_perm_aligned(
+    grid: tuple[int, int, int],
+    start: int,
+    device: torch.device,
+    curve: str = "2d_frame",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return `(perm_dev, inv_dev, perm_cpu)` aligned to Sol-Attn's 64-token block grid."""
+    pad = (-int(start)) % _SOL_BLOCK_SIZE
+    cpu_key = (grid, curve, pad)
+    cpu_hit = _MORTON_CPU_CACHE.get(cpu_key)
+    if cpu_hit is None:
+        frames, height, width = grid
+        linear = torch.arange(frames * height * width, dtype=torch.int64)
+        area = height * width
+        z = linear // area
+        rem = linear - z * area
+        y = rem // width
+        x = rem - y * width
+        if curve == "2d_frame":
+            code = (z << 42) | _part1by2(x) | (_part1by2(y) << 1)
+        else:
+            code = _part1by2(x) | (_part1by2(y) << 1) | (_part1by2(z) << 2)
+        perm = linear[torch.argsort(code)]
+        if pad:
+            perm = torch.roll(perm, pad)
+        inv = torch.argsort(perm)
+        cpu_hit = (perm, inv)
+        _MORTON_CPU_CACHE[cpu_key] = cpu_hit
+
+    dev_key = (grid, curve, pad, str(device))
+    dev_hit = _MORTON_DEV_CACHE.get(dev_key)
+    if dev_hit is None:
+        # Keep device cache bounded to avoid lingering memory across shape changes
+        if len(_MORTON_DEV_CACHE) >= 8:
+            _MORTON_DEV_CACHE.clear()
+        dev_hit = (cpu_hit[0].to(device), cpu_hit[1].to(device))
+        _MORTON_DEV_CACHE[dev_key] = dev_hit
+    return dev_hit[0], dev_hit[1], cpu_hit[0]
+
+
+def _permute_span_inplace(
+    h: torch.Tensor,
+    start: int,
+    stop: int,
+    idx: torch.Tensor,
+    col_chunk: int = 1344,
+) -> None:
+    """In-place row permutation of `h[start:stop]` in column chunks (~4x lower peak scratch VRAM)."""
+    view = h[start:stop]
+    cols = view.shape[1]
+    for c0 in range(0, cols, col_chunk):
+        c1 = min(c0 + col_chunk, cols)
+        view[:, c0:c1] = view[:, c0:c1].index_select(0, idx)
+
+
+def _parse_dense_blocks(spec: str, count: int) -> frozenset[int]:
+    """Parse block index/range spec like '0-1,48-49' or '-1' into absolute block indices."""
+    s = "".join(str(spec or "").split())
+    if not s:
+        return frozenset()
+    out: set[int] = set()
+    for part in s.split(","):
+        if not part:
+            continue
+        m = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
+        if m is None:
+            raise ValueError(f"Invalid sol_dense_blocks entry {part!r}; expected e.g. '0-1,48-49'")
+        lo = int(m.group(1))
+        hi = lo if m.group(2) is None else int(m.group(2))
+        lo = lo if lo >= 0 else count + lo
+        hi = hi if hi >= 0 else count + hi
+        if lo > hi:
+            lo, hi = hi, lo
+        out.update(range(max(lo, 0), min(hi, count - 1) + 1))
+    return frozenset(out)
+
+
+class _PermutedLayoutProxy:
+    """Lightweight proxy exposing Morton-permuted `position_ids` without mutating cached `PackedLayout`."""
+
+    def __init__(self, base_layout, position_ids: torch.Tensor):
+        self._base = base_layout
+        self.position_ids = position_ids
+
+    def __getattr__(self, name: str):
+        return getattr(self._base, name)
+
+
+def _build_sol_context(layout, seq_len: int, sol_cfg: dict, transformer_options: dict):
+    """Decide whether this forward pass runs Sol-Attn sparse mode and compute sink/Morton metadata."""
+    if not sol_cfg or sol_cfg.get("attention_mode") != "sol_attn_sparse":
+        return None, None
+    if not _sol_attn_available or seq_len < int(sol_cfg.get("sol_min_tokens", 12288)):
+        return None, None
+
+    sigmas = transformer_options.get("sigmas") if isinstance(transformer_options, dict) else None
+    if sigmas is not None and torch.is_tensor(sigmas) and sigmas.numel() > 0:
+        sigma = float(sigmas.flatten()[0].item())
+        if sigma > float(sol_cfg.get("sol_max_sigma", 0.95)) + 1e-6:
+            return None, None
+        if sigma < float(sol_cfg.get("sol_min_sigma", 0.0)) - 1e-6:
+            return None, None
+
+    segs = getattr(layout, "segments", None) or []
+    vid_span = next(((a, b) for a, b, kind in segs if kind == "video"), None)
+    aud_span = next(((a, b) for a, b, kind in segs if kind == "audio"), None)
+
+    sink_mode = str(sol_cfg.get("sol_sink_mode", "exact_kv_and_rows"))
+    sink_blocks = (0, 0)
+    sink_q = (0, 0)
+    if sink_mode != "off" and vid_span is not None:
+        va, vb = int(vid_span[0]), int(vid_span[1])
+        if seq_len >= vb and va > 0:
+            sink_blocks = (0, (va + _SOL_BLOCK_SIZE - 1) // _SOL_BLOCK_SIZE)
+            if sink_mode == "exact_kv_and_rows":
+                if aud_span is not None:
+                    sink_q = (int(aud_span[0]) // _SOL_BLOCK_SIZE, sink_blocks[1])
+                else:
+                    sink_q = sink_blocks
+
+    morton_info = None
+    sig = getattr(layout, "signature", None)
+    if (
+        vid_span is not None
+        and isinstance(sig, tuple)
+        and len(sig) == 5
+        and torch.is_tensor(getattr(layout, "position_ids", None))
+        and layout.position_ids.shape[0] == seq_len
+    ):
+        va, vb = int(vid_span[0]), int(vid_span[1])
+        _tlen, lat_t, lat_h, lat_w, _at = sig
+        grid = (int(lat_t), int(lat_h) // 2, int(lat_w) // 2)
+        if grid[0] * grid[1] * grid[2] == (vb - va) and (vb - va) > 0:
+            morton_info = (va, vb, grid)
+
+    sol_ctx = {
+        "tau": float(sol_cfg.get("sol_tau", 1.3)),
+        "topk_ratio": float(sol_cfg.get("sol_topk_ratio", 0.0)),
+        "token_aug": int(sol_cfg.get("sol_token_aug", 64)),
+        "sink_blocks": sink_blocks,
+        "sink_q": sink_q,
+        "dense_blocks": sol_cfg.get("sol_dense_blocks_set", frozenset()),
+    }
+    return sol_ctx, morton_info
+
+
+def _attend_group(
+    q_g: torch.Tensor,
+    k_g: torch.Tensor,
+    make_v_fn,
+    dtype: torch.dtype,
+    sol_ctx: dict | None = None,
+    block_idx: int | None = None,
+) -> torch.Tensor:
+    """Dispatch one head group `[1, S, g, 128]` to either `ck.sol_attn` sparse Sage or dense KJ Sage."""
+    if (
+        sol_ctx is not None
+        and (block_idx is None or block_idx not in sol_ctx["dense_blocks"])
+        and q_g.is_cuda
+        and q_g.dtype in (torch.bfloat16, torch.float16)
+        and q_g.shape[-1] == 128
+        and _sol_attn_available
+    ):
+        v_g = make_v_fn()
+        o_g = _ck.sol_attn(
+            q_g,
+            k_g,
+            v_g,
+            tau=sol_ctx["tau"],
+            topk_ratio=sol_ctx["topk_ratio"],
+            sink_blocks=list(sol_ctx["sink_blocks"]),
+            sink_q=list(sol_ctx["sink_q"]),
+            tail=True,
+            token_aug=sol_ctx["token_aug"],
+        )
+        del q_g, k_g, v_g
+        return o_g
+    return _staged_sageattn_nhd(q_g, k_g, make_v_fn, dtype)
+
+
+def _make_sol_run_blocks(orig_run_blocks_fn, sol_cfg: dict):
+    """Wrap `MiniMaxH3Model._run_blocks` to manage zero-spike Morton reordering & Sol-Attn context."""
+    def chunked_sage_sol_run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
+        s = h.shape[0]
+        sol_ctx, morton_info = _build_sol_context(layout, s, sol_cfg, transformer_options)
+        if sol_ctx is None:
+            return orig_run_blocks_fn(self, h, t_emb, mod_segments, layout, transformer_options)
+
+        prev_ctx = transformer_options.get("_chunked_sage_sol_ctx")
+        transformer_options["_chunked_sage_sol_ctx"] = sol_ctx
+
+        active_morton = None
+        run_layout = layout
+        run_mod_segments = mod_segments
+        if morton_info is not None:
+            va, vb, grid = morton_info
+            perm_dev, inv_dev, perm_cpu = _morton_perm_aligned(grid, va, h.device, curve="2d_frame")
+            _permute_span_inplace(h, va, vb, perm_dev)
+            pos_perm = layout.position_ids.clone()
+            pos_perm[va:vb] = pos_perm[va:vb].index_select(0, perm_cpu.to(pos_perm.device))
+            run_layout = _PermutedLayoutProxy(layout, pos_perm)
+            # Permute per-token mod_row tensor if video segment uses non-uniform denoise_mask
+            new_segs = []
+            for a, b, row in mod_segments:
+                if a == va and b == vb and isinstance(row, torch.Tensor):
+                    new_segs.append((a, b, row.index_select(0, perm_dev.to(row.device))))
+                else:
+                    new_segs.append((a, b, row))
+            run_mod_segments = new_segs
+            active_morton = (va, vb, inv_dev)
+
+        try:
+            h = orig_run_blocks_fn(self, h, t_emb, run_mod_segments, run_layout, transformer_options)
+        finally:
+            if prev_ctx is None:
+                transformer_options.pop("_chunked_sage_sol_ctx", None)
+            else:
+                transformer_options["_chunked_sage_sol_ctx"] = prev_ctx
+            if active_morton is not None:
+                va, vb, inv_dev = active_morton
+                if torch.is_tensor(h) and h.ndim == 2 and h.shape[0] >= vb:
+                    _permute_span_inplace(h, va, vb, inv_dev)
+        return h
+
+    return chunked_sage_sol_run_blocks
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +963,8 @@ def _run_chunked_attention_int8(
     head_chunks: int,
     token_chunk: int,
     eff_mode: str,
+    sol_ctx: dict | None = None,
+    block_idx: int | None = None,
 ) -> None:
     """INT8 TensorWise ConvRot fast path: pre-quantize once, head-group Q/K/V, accumulate into `x`."""
     s, hidden = x.shape
@@ -782,7 +1036,7 @@ def _run_chunked_attention_int8(
                             dtype, _slice_bias(b_qkv, 2 * inner + _c0, 2 * inner + _c1),
                         ).view(1, s, _g, head_dim)
 
-                    o_g = _staged_sageattn_nhd(q_g, k_g, _make_v, dtype)
+                    o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
                     del q_g, k_g
                     o_g_2d = o_g.view(s, g * head_dim)
                     b_group = b_out if g_idx == 0 else None
@@ -839,7 +1093,7 @@ def _run_chunked_attention_int8(
                 dtype, _slice_bias(b_qkv, 2 * inner + _c0, 2 * inner + _c1),
             ).view(1, s, _g, head_dim)
 
-        out_nhd[:, :, hs:he] = _staged_sageattn_nhd(q_g, k_g, _make_v, dtype)
+        out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
         del q_g, k_g
         hs = he
 
@@ -869,6 +1123,8 @@ def _run_chunked_attention_dense(
     head_chunks: int,
     token_chunk: int,
     eff_mode: str,
+    sol_ctx: dict | None = None,
+    block_idx: int | None = None,
 ) -> None:
     """Dense BF16/FP16/LoRA path: zero full `[S, 21504]` QKV buffer, 100% algebraically exact in both modes."""
     s = x.shape[0]
@@ -912,7 +1168,7 @@ def _run_chunked_attention_dense(
                         def _make_v(_c0=c0, _c1=c1, _g=g):
                             return _project_rows(nw1, 2 * inner + _c0, 2 * inner + _c1).view(1, s, _g, head_dim)
 
-                        o_g = _staged_sageattn_nhd(q_g, k_g, _make_v, dtype)
+                        o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
                         del q_g, k_g
                         o_g_2d = o_g.view(s, g * head_dim)
                         w_out_g = w_out[:, c0:c1]
@@ -940,7 +1196,7 @@ def _run_chunked_attention_dense(
             def _make_v(_c0=c0, _c1=c1, _g=g):
                 return _project_rows(nw1, 2 * inner + _c0, 2 * inner + _c1).view(1, s, _g, head_dim)
 
-            out_nhd[:, :, hs:he] = _staged_sageattn_nhd(q_g, k_g, _make_v, dtype)
+            out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
             del q_g, k_g
             hs = he
 
@@ -1014,6 +1270,8 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
         if isinstance(transformer_options, dict) and transformer_options.get("minimax_head_chunks"):
             n_groups = max(n_groups, int(transformer_options["minimax_head_chunks"]))
         n_groups = min(n_groups, heads)
+        sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
+        block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
 
         qw = mm.cast_to(self.q_norm.weight, device=device) if rope_freqs is not None else None
         kw = mm.cast_to(self.k_norm.weight, device=device) if rope_freqs is not None else None
@@ -1051,7 +1309,7 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                     def _make_v(_c0=c0, _c1=c1, _g=g):
                         return _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[2 * inner + _c0 : 2 * inner + _c1], _sc(2 * inner + _c0, 2 * inner + _c1), dtype, _bs(2 * inner + _c0, 2 * inner + _c1)).view(1, s, _g, head_dim)
 
-                    out_nhd[:, :, hs:he] = _staged_sageattn_nhd(q_g, k_g, _make_v, dtype)
+                    out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
                     del q_g, k_g
                     hs = he
                 del x_qdata, x_scale
@@ -1069,7 +1327,7 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                     def _make_v(_c0=c0, _c1=c1, _g=g):
                         return F.linear(x, w_qkv[2 * inner + _c0 : 2 * inner + _c1], b_qkv[2 * inner + _c0 : 2 * inner + _c1] if b_qkv is not None else None).view(1, s, _g, head_dim)
 
-                    out_nhd[:, :, hs:he] = _staged_sageattn_nhd(q_g, k_g, _make_v, dtype)
+                    out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
                     del q_g, k_g
                     hs = he
                 del x
@@ -1143,6 +1401,8 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
             n_groups = max(n_groups, int(transformer_options["minimax_head_chunks"]))
         n_groups = min(n_groups, self.attn.heads)
         eff_mode = _resolve_out_proj_mode(out_proj_mode, s, device)
+        sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
+        block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
 
         has_qkv_extra_scales = (
             getattr(self.attn.qkv_proj, "pre_quant_scale", None) is not None
@@ -1155,12 +1415,14 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                     _run_chunked_attention_int8(
                         self, self.attn, x, shift_msa, scale_msa, gate_msa, mod_segments,
                         rope_freqs, w_qkv, b_qkv, n_groups, token_chunk, eff_mode,
+                        sol_ctx=sol_ctx, block_idx=block_idx,
                     )
                     handled = True
                 elif not isinstance(w_qkv, qops.QuantizedTensor):
                     _run_chunked_attention_dense(
                         self, self.attn, x, shift_msa, scale_msa, gate_msa, mod_segments,
                         rope_freqs, w_qkv, b_qkv, n_groups, token_chunk, eff_mode,
+                        sol_ctx=sol_ctx, block_idx=block_idx,
                     )
                     handled = True
                 else:
@@ -1327,6 +1589,82 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                     advanced=True,
                     tooltip="同时对 video_patch_proj 与 final_layer 按 token 分块（100% 逐位一致，消除首尾 FP32 显存尖峰）。",
                 ),
+                io.Combo.Input(
+                    "attention_mode",
+                    options=["dense_sage", "sol_attn_sparse"],
+                    default="dense_sage",
+                    tooltip=(
+                        "注意力加速内核：\n"
+                        "• dense_sage：100% 稠密 KJ SageAttention2++（最保守基准）；\n"
+                        "• sol_attn_sparse：融合 comfy_kitchen Sol-Attn 稀疏 SageAttention（2d_frame Morton 重排 + 质心尾项守恒 + 条件 sink），"
+                        "8GB 下显存几乎不变，10s 864p 提速 ~2.4×、10s 1080p 提速 ~3.1×、15s 1080p 提速 ~3.4×！"
+                    ),
+                ),
+                io.Float.Input(
+                    "sol_tau",
+                    default=1.3,
+                    min=0.3,
+                    max=3.0,
+                    step=0.05,
+                    tooltip="Sol-Attn 稀疏路由阈值（仅 sol_attn_sparse 生效；越大越稀疏越快，1.3 为 H3 甜点，1.0 更保守）。",
+                ),
+                io.Int.Input(
+                    "sol_token_aug",
+                    default=64,
+                    min=0,
+                    max=256,
+                    step=64,
+                    tooltip="Sol-Attn 每查询块额外精确补采的 top 未路由 token 数（0/64/128/256；64 可将单层精度拉升至 cos=0.9992，仅慢 ~7%）。",
+                ),
+                io.Float.Input(
+                    "sol_topk_ratio",
+                    default=0.0,
+                    min=0.0,
+                    max=0.9,
+                    step=0.05,
+                    advanced=True,
+                    tooltip="设为 >0 时改用固定 top-k 块比例（如 0.20）替代 sol_tau。",
+                ),
+                io.Combo.Input(
+                    "sol_sink_mode",
+                    options=["exact_kv_and_rows", "exact_kv", "off"],
+                    default="exact_kv_and_rows",
+                    advanced=True,
+                    tooltip="条件行（文本/参考图/音频）精确保护：exact_kv_and_rows 同时保护音频查询行（音画同步最稳）。",
+                ),
+                io.Int.Input(
+                    "sol_min_tokens",
+                    default=12288,
+                    min=0,
+                    max=262144,
+                    step=1024,
+                    advanced=True,
+                    tooltip="低于该 token 数自动退回稠密 KJ SageAttention。",
+                ),
+                io.String.Input(
+                    "sol_dense_blocks",
+                    default="",
+                    advanced=True,
+                    tooltip="可选：强制保持稠密的层号（如 '0-1,48-49'；留空则全部 50 层走稀疏）。",
+                ),
+                io.Float.Input(
+                    "sol_max_sigma",
+                    default=0.95,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip="仅对 sigma ≤ 该值的步启用稀疏（默认 0.95 保留一采第 0 步纯噪构图稠密，二采全步稀疏）。",
+                ),
+                io.Float.Input(
+                    "sol_min_sigma",
+                    default=0.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip="仅对 sigma ≥ 该值的步启用稀疏（设为 0.15 可让末步回落稠密精修）。",
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -1341,6 +1679,15 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
         out_proj_mode: str = "auto",
         token_chunk_size: int = 8192,
         chunk_io_layers: bool = True,
+        attention_mode: str = "dense_sage",
+        sol_tau: float = 1.3,
+        sol_token_aug: int = 64,
+        sol_topk_ratio: float = 0.0,
+        sol_sink_mode: str = "exact_kv_and_rows",
+        sol_min_tokens: int = 12288,
+        sol_dense_blocks: str = "",
+        sol_max_sigma: float = 0.95,
+        sol_min_sigma: float = 0.0,
     ) -> io.NodeOutput:
         if _cuda_archs is None:
             raise RuntimeError(
@@ -1365,6 +1712,28 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
 
         head_chunks = max(1, min(int(head_chunks), int(blocks[0].attn.heads)))
         token_chunk_size = max(1024, int(token_chunk_size))
+        eff_attn_mode = str(attention_mode)
+        if eff_attn_mode == "sol_attn_sparse" and not _sol_attn_available:
+            logger.warning(
+                "MiniMaxH3ChunkedSageAttentionPatch: comfy_kitchen.sol_attn unavailable; "
+                "falling back to dense_sage."
+            )
+            eff_attn_mode = "dense_sage"
+
+        sol_dense_set = _parse_dense_blocks(sol_dense_blocks, len(blocks))
+        sol_token_aug = max(0, min(256, (int(sol_token_aug) // 64) * 64))
+        sol_cfg = {
+            "attention_mode": eff_attn_mode,
+            "sol_tau": float(sol_tau),
+            "sol_token_aug": sol_token_aug,
+            "sol_topk_ratio": float(sol_topk_ratio),
+            "sol_sink_mode": str(sol_sink_mode),
+            "sol_min_tokens": int(sol_min_tokens),
+            "sol_dense_blocks": str(sol_dense_blocks),
+            "sol_dense_blocks_set": sol_dense_set,
+            "sol_max_sigma": float(sol_max_sigma),
+            "sol_min_sigma": float(sol_min_sigma),
+        }
 
         attn_fwd = _make_chunked_attn_forward(head_chunks, token_chunk_size)
         block_fwd = _make_chunked_block_forward(head_chunks, str(out_proj_mode), token_chunk_size)
@@ -1377,6 +1746,19 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             m.add_object_patch(
                 f"diffusion_model.blocks.{idx}.forward",
                 types.MethodType(block_fwd, block),
+            )
+
+        if eff_attn_mode == "sol_attn_sparse":
+            orig_rb = diffusion_model._run_blocks
+            orig_rb_fn = (
+                orig_rb.__func__
+                if (isinstance(orig_rb, types.MethodType) and orig_rb.__self__ is diffusion_model)
+                else type(diffusion_model)._run_blocks
+            )
+            rb_wrapped = _make_sol_run_blocks(orig_rb_fn, sol_cfg)
+            m.add_object_patch(
+                "diffusion_model._run_blocks",
+                types.MethodType(rb_wrapped, diffusion_model),
             )
 
         if chunk_io_layers:
@@ -1407,16 +1789,27 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             "out_proj_mode": str(out_proj_mode),
             "token_chunk_size": token_chunk_size,
             "chunk_io_layers": bool(chunk_io_layers),
+            "attention_mode": eff_attn_mode,
+            "sol_tau": float(sol_tau),
+            "sol_token_aug": sol_token_aug,
+            "sol_topk_ratio": float(sol_topk_ratio),
+            "sol_sink_mode": str(sol_sink_mode),
             "arch": _cuda_archs[0] if _cuda_archs else "unknown",
             "sageplus_sm89": _sageplus_sm89_available,
+            "sol_attn_available": _sol_attn_available,
         }
 
         logger.info(
             "Applied MiniMaxH3ChunkedSageAttentionPatch (%d blocks, head_chunks=%d, "
-            "out_proj_mode=%s, token_chunk=%d, chunk_io=%s, arch=%s, sageplus=%s)",
+            "out_proj_mode=%s, attn=%s, tau=%.2f, aug=%d, sink=%s, token_chunk=%d, "
+            "chunk_io=%s, arch=%s, sageplus=%s)",
             len(blocks),
             head_chunks,
             out_proj_mode,
+            eff_attn_mode,
+            float(sol_tau),
+            sol_token_aug,
+            sol_sink_mode,
             token_chunk_size,
             chunk_io_layers,
             _cuda_archs[0] if _cuda_archs else "unknown",

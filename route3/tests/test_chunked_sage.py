@@ -279,6 +279,109 @@ def test_effective_load_thresholds():
     print("[PASS] test_effective_load_thresholds")
 
 
+@torch.inference_mode()
+def test_sol_attn_morton_and_sparse_path():
+    # 1. Dense blocks parser
+    assert cs._parse_dense_blocks("", 50) == frozenset()
+    assert cs._parse_dense_blocks("0-1, 48-49, -1", 50) == frozenset({0, 1, 48, 49})
+    assert cs._parse_dense_blocks("5-3", 50) == frozenset({3, 4, 5})
+
+    # 2. Morton round-trip bit-exactness with non-64-aligned start + column-chunked in-place permute
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    start = 277
+    grid = (4, 8, 12)
+    n_vid = 4 * 8 * 12
+    total = start + n_vid
+    h0 = torch.randn(total, 5376, dtype=torch.bfloat16, device=device)
+    h = h0.clone()
+    perm, inv, _ = cs._morton_perm_aligned(grid, start, device, curve="2d_frame")
+    cs._permute_span_inplace(h, start, total, perm, col_chunk=1344)
+    assert torch.equal(h[:start], h0[:start]), "Prefix modified by Morton permute!"
+    assert not torch.equal(h[start:], h0[start:]), "Video span not permuted!"
+    cs._permute_span_inplace(h, start, total, inv, col_chunk=1344)
+    assert torch.equal(h, h0), "Morton round-trip NOT bit-exact!"
+
+    # 3. _build_sol_context sigma gate & sink calculation
+    from comfy.ldm.minimax.model import PackedLayout
+    layout = PackedLayout(text_len=128, latent_t=10, latent_h=32, latent_w=48, audio_t=100)
+    sol_cfg = {
+        "attention_mode": "sol_attn_sparse",
+        "sol_tau": 1.3,
+        "sol_token_aug": 64,
+        "sol_topk_ratio": 0.0,
+        "sol_sink_mode": "exact_kv_and_rows",
+        "sol_min_tokens": 1024,
+        "sol_dense_blocks_set": frozenset(),
+        "sol_max_sigma": 0.95,
+        "sol_min_sigma": 0.05,
+    }
+    if cs._sol_attn_available:
+        ctx_hi, _ = cs._build_sol_context(layout, layout.seq_len, sol_cfg, {"sigmas": torch.tensor([0.99])})
+        assert ctx_hi is None, "Expected sigma > sol_max_sigma to skip Sol-Attn"
+        ctx_lo, _ = cs._build_sol_context(layout, layout.seq_len, sol_cfg, {"sigmas": torch.tensor([0.01])})
+        assert ctx_lo is None, "Expected sigma < sol_min_sigma to skip Sol-Attn"
+        ctx_ok, m_info = cs._build_sol_context(layout, layout.seq_len, sol_cfg, {"sigmas": torch.tensor([0.30])})
+        assert ctx_ok is not None and m_info is not None
+        assert ctx_ok["sink_blocks"][0] == 0 and ctx_ok["sink_blocks"][1] > 0
+        assert ctx_ok["sink_q"][1] == ctx_ok["sink_blocks"][1]
+        assert m_info[2] == (10, 16, 24)
+
+    # 4. End-to-end Sol-Attn + Morton through _make_sol_run_blocks on real dasiwa blocks.0
+    if torch.cuda.is_available() and cs._sol_attn_available and os.path.exists(CKPT_PATH):
+        from safetensors import safe_open
+        dtype = torch.bfloat16
+        ops = comfy.ops.mixed_precision_ops(compute_dtype=dtype)
+        block = DiTBlock(
+            hidden=5376, heads=56, head_dim=128, ffn=14336, t_dim=8,
+            eps=1e-5, qk_eps=1e-5, apply_silu=False, adaln_dtype=torch.float32,
+            gate_compress=False, dtype=dtype, device="cpu", operations=ops,
+        )
+        sd = {}
+        with safe_open(CKPT_PATH, framework="pt", device="cpu") as f:
+            for k in f.keys():
+                if k.startswith("blocks.0."):
+                    sd[k[len("blocks.0."):]] = f.get_tensor(k)
+        block.load_state_dict(sd, strict=False)
+        block.to(device=device).requires_grad_(False).eval()
+        block.attn.forward = types.MethodType(cs._make_chunked_attn_forward(head_chunks=14, token_chunk=2048), block.attn)
+        block.forward = types.MethodType(cs._make_chunked_block_forward(head_chunks=14, out_proj_mode="exact", token_chunk=2048), block)
+
+        class _MiniRunner:
+            def _run_blocks(self, h_in, t_emb, mod_segs, lay, topts):
+                pos = lay.position_ids.to(torch.float32).to(h_in.device)
+                inv_f = torch.linspace(0.01, 1.0, 16, device=h_in.device)
+                per_ax = pos.unsqueeze(-1) * inv_f.view(1, 1, -1)
+                t_f, h_f, w_f = per_ax.unbind(dim=1)
+                half = torch.cat((t_f, h_f, w_f), dim=-1)
+                rope = rope_rotation_table(torch.cat((half, half), dim=-1), h_in.dtype)
+                topts["block_index"] = 0
+                return block(h_in, t_emb, mod_segs, rope, transformer_options=topts)
+
+        runner = _MiniRunner()
+        lay = PackedLayout(text_len=128, latent_t=8, latent_h=32, latent_w=48, audio_t=80)
+        S = lay.seq_len
+        gen = torch.Generator(device=device).manual_seed(99)
+        x0 = torch.randn(S, 5376, dtype=dtype, device=device, generator=gen) * 0.4
+        t_emb = torch.randn(2, 8, dtype=dtype, device=device, generator=gen) * 0.2
+        mod_segs = [(0, 128, 1), (128, 288, 5), (288, S, 0)]
+
+        out_dense = runner._run_blocks(x0.clone(), t_emb, mod_segs, lay, {"sigmas": torch.tensor([0.30])})
+        sol_rb = types.MethodType(cs._make_sol_run_blocks(_MiniRunner._run_blocks, sol_cfg), runner)
+        out_sol = sol_rb(x0.clone(), t_emb, mod_segs, lay, {"sigmas": torch.tensor([0.30])})
+        cos = nn.functional.cosine_similarity(out_sol.float().flatten(), out_dense.float().flatten(), dim=0).item()
+        assert cos > 0.99, f"Sol-Attn + Morton cos too low: {cos}"
+
+        # Verify sol_dense_blocks="0" forces block 0 dense even with Morton active!
+        sol_cfg_d0 = dict(sol_cfg, sol_dense_blocks_set=frozenset({0}))
+        sol_rb_d0 = types.MethodType(cs._make_sol_run_blocks(_MiniRunner._run_blocks, sol_cfg_d0), runner)
+        out_d0 = sol_rb_d0(x0.clone(), t_emb, mod_segs, lay, {"sigmas": torch.tensor([0.30])})
+        cos_d0 = nn.functional.cosine_similarity(out_d0.float().flatten(), out_dense.float().flatten(), dim=0).item()
+        assert cos_d0 > 0.9999, f"Dense block 0 under Morton diverged: cos={cos_d0}"
+        print(f"[PASS] test_sol_attn_morton_and_sparse_path (sol_cos={cos:.6f}, dense_under_morton_cos={cos_d0:.7f})")
+    else:
+        print("[PASS] test_sol_attn_morton_and_sparse_path (CPU/parser/Morton checks)")
+
+
 if __name__ == "__main__":
     test_split_heads_even()
     test_slice_mod_segments()
@@ -286,4 +389,5 @@ if __name__ == "__main__":
     test_final_layer_and_patch_proj_bit_exact()
     test_dense_bf16_block_and_external_deferral()
     test_real_dasiwa_int8_bit_exact()
+    test_sol_attn_morton_and_sparse_path()
     print("ALL CHUNKED SAGE TESTS PASSED!")
