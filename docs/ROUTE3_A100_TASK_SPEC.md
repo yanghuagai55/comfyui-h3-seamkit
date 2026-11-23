@@ -1,9 +1,9 @@
 # 任务书（v3 · 本地双时钟同源 + 真机冒烟校准版）：MiniMax H3 路线 3「多速率前/背景双流引擎」A100 验证规程
 
-> **算力预算**：云端 **Colab A100 80GB**，总计 **≤ 3.0 小时（硬停机红线 180 分钟，软停 165 分钟）** —— 相比 v2（9.25h）砍掉高风险 LoRA 训练、启用一采落盘缓存，实测预计 **1.5–2.2 小时**完成全量验证。
-> **基准工作流**：全面切换为用户**本地一采双时钟工作流**（[local_dualclock_api.json](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/workflows/local_dualclock_api.json)，由 `泛化验证-pad3-优化-v2-一采双时钟.json` 导出，**不再使用 `WenWu_H3_A100_FINAL_api.json`**）。
-> **同源权重**：全程直测现网 `dasiwa_minimax_h3_ref2va_v5xs_pruned_graviton_turbo_int8_row-wise_convrot_runtime_mixed.safetensors`（与本机 **RTX 4060 Laptop 8GB** 完全同源，结论零偏差回迁）。
-> **定位红线**：MiniMax H3 是完整的 **50 层视听叙事大模型**，不是静图模型。必须同时覆盖 **动态运镜叙事（`S_bg=5 / 3` + 关键帧 `m=1` 完整二采重绘 + 光流残差 warp）** 与 **静机位极限档（`s_bg=0 / T_bg=1`）**，全链路保留原生双声道音频。
+> **算力与目标定位**：云端 **Colab A100-40GB**（剩余约 **3 小时**），**一切实验服务于本机 RTX 4060 Laptop 8GB 回迁**——不再浪费算力做超高分辨率压测，全程锁定 8GB 可落地的 `0.94–1.3MP`（`1280×736` / `1568×864`）与 `5s / 15s` 长片降窗验证。
+> **已达成里程碑（A100-40GB 1.3MP 9 条实测全过）**：`s_bg=3` 在 3 条片子上**全绿过关**（`fg_psnr 24.88–28.36 dB`、`bg_hf 0.901–0.981`、`seam 0.727–0.828`），全面取代 `s_bg=5` 成为默认主推甜点！
+> **基准工作流**：全面切换为用户**本地一采双时钟工作流**（[local_dualclock_api.json](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/workflows/local_dualclock_api.json)，**不再使用 `WenWu_H3_A100_FINAL_api.json`**）。
+> **同源权重**：全程直测现网 `dasiwa_minimax_h3_ref2va_v5xs_pruned_graviton_turbo_int8_row-wise_convrot_runtime_mixed.safetensors`（与本机 8GB 完全同源）。
 
 ---
 
@@ -107,25 +107,27 @@ nohup bash "$REPO_ROOT/route3/run_pipeline.sh" >> "$WORK_ROOT/logs/pipeline.log"
 
 ---
 
-## 📋 五、3 小时 A100 分阶段日程与硬止损门禁
+## 📋 五、剩余 3 小时 A100-40GB 冲刺日程（面向本机 8GB 回迁，不做无意义超高分辨率测试）
 
-| 阶段 | 预算 | 执行脚本 | 必须产物 | 🟡 Go / No-Go 硬门禁 |
+> **已完成（首轮 A100-40GB 1.3MP 9 条消融）**：
+> - `s_bg=3` **3/3 全绿**：`case1` 28.36 dB / `case2` 24.88 dB / `case3` 25.63 dB，`seam 0.727–0.828`（Oracle 204s → 54–93s）；
+> - `s_bg=5` 因与 H3 5-token VAE 周期 `(1,4,4,4,4)` 共振（100% 锚点落单帧 I-token `p=0`、80% P-token 零同型键），全线低 `1.6–2.0 dB` → **淘汰出主推，默认甜点锁死 `s_bg=3`（可加测互质的 `s_bg=4`）**。
+
+| 阶段 | 预算 | 核心目标（直奔本机 8GB 痛点） | 必须产物 | 🟡 验收口径 |
 |---|---|---|---|---|
-| **0. Pre-flight** | **5 min** | `route3/preflight_check.py` | `preflight_ok.json` | 校验 GPU/显存/磁盘/权重 header（50L/5376/56×128）+ 零编译 LSE 实测；任何失败立即停机 |
-| **1. Stage 0** | **20 min** | `route3/stage0_oracle.py --strip-lowvram --probe --resume` | 3 条完整二采 Oracle mp4 + 冻结一采 AV latent `.pt` + `mask.npz` + `probe_attn_stats.json` | 仅作**诊断与 U 型层画像**（不盲目 auto-abort）；确认 3 条 Oracle 成片、掩码与冻结 `.pt` 全部落盘即进 Stage 1a |
-| **2a. Stage 1a *(金丝雀门禁)*** | **3 min** | `route3/stage1_ablate.py --only case2_dolly --combos 5:1:flow`（`MiniMaxH3AVLatentLoad` 0秒跳一采） | `stage1_canary/case2_dolly_s5_r1_flow.mp4` + 指标 CSV | **真正物理止损门禁**：最难动态运镜 `case2_dolly` 满足 **`fg_psnr ≥ 22 dB`**、**`bg_hf_sharpness ≥ 0.80× Oracle`**、**`seam_grad_ratio ≤ 2.2×`** → 放行全量 Stage 1b；不达标则对照 `probe_attn_stats.json` U 型画像决定「保留末 5 层稠密 / 降 `S_bg=3`」或直接止损转**路线 A** |
-| **2b. Stage 1b *(全量消融)*** | **55 min** | `route3/stage1_ablate.py --combos 5:1:flow,5:1:lerp,5:0:flow,3:1:flow` + 静机位专享 `case1_static × 0:1:flow` | `stage1_ablation.csv` + `stage1_contact_sheet.png` + 全量有声对比 mp4 | 至少 1 组动态档满足：**`fg_psnr ≥ 24 dB`**、**`bg_hf_sharpness ≥ 0.85× Oracle`**、**`seam_grad_ratio ≤ 1.8×`**，且 `flow` 优于 `lerp` |
-| **3. Stage 2 *(可选)*** | **30 min** | 仅当 Stage 1b `seam_grad_ratio ∈ (1.2, 1.8]` 时启动 | `splitstream_gates.pt`（`< 80 KB`，$\beta[50,56,5]$） | 校准后 `seam_grad_ratio ≤ 1.20×`、`bg_hf_sharpness ≥ 0.90× Oracle` 即收工 |
-| **4. 15s 压测 & 备份** | **30 min** | `DURATION=15.0`（`T=107`, 362f）单/双窗对比 + Drive 同步 | `FINAL_REPORT.md` + 15s 对比 mp4 | 15s 长片相对原 4 窗分块背景跳变显著下降、音画同步无崩坏，全部产物同步至 Drive 后关机 |
+| **A. `flow v2` 复测** | **15 min** | 拉取升级版 [assembly.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/assembly.py)（全 24 通道 + 纹理门控 + 前后向一致性 + 全局中位兜底 + `bicubic`）与 `auto_fg_mask`，复用已有冻结一采缓存，只重跑 `case2`/`case3` × `s_bg=3` (`flow v2` vs `lerp`) | `stage1_flow_v2_compare.png` + 新 CSV（含 `fg_ssim`） | 确认湿地面红砖污块彻底消失、移动车辆进入 `FG_full` 消除青绿重影、`bg_hf ∈ [0.88, 1.03]` |
+| **B. 随机基线 & 纯净测速** | **15 min** | 在 `case2` 同份冻结一采上换二采 `seed+1` 跑 1 条稠密 Oracle 量 **`PSNR_stoch / SSIM_stoch`**；同时剥离冷启动/缓存抖动，在预热后测纯净二采耗时与峰值显存（Oracle vs `s_bg=3` vs `s_bg=4`） | `stochastic_baseline.json` + 干净耗时/显存账本 | 用相对门槛 `PSNR ≥ PSNR_stoch - 1.5 dB` + `fg_ssim ≥ 0.85` 替代一刀切 24 dB；拿到无抖动的真实加速比 |
+| **C. 15s 长片降窗实战** *(高 ROI)* | **50 min** | 在本机 8GB 真实常用画布（`0.94MP 1280×736` 与 `1.0–1.2MP`）跑 **15s（362f / `T=107`）**：对比「原 4 窗 SeamKit 分块」vs「Route 3 `s_bg=3`（与 `s_bg=4`）1–2 窗直出」 | `15s_compare_seamkit_vs_r3.mp4` + 跨窗跳变对比 | 验证 15s 长片能不能靠 Route 3 **把 4 窗压成 1–2 窗**、从根源消灭跨窗背景跳变，且音画同步不崩 |
+| **D. 8GB 补丁同源回归 + 可选末层/β 微调** | **40 min** | 开回本机 8GB 补丁（`#34 MiniMaxLowVRAMAttention(6)` + `#35 MiniMaxChunkFeedForward(4)`）跑 1 条 `s_bg=3` 验收零回退；若 `case3` 夜景光影仍有轻微偏移，按需跑 20–30 min `β[50,56,5]` 标量校准（`< 80 KB`）或测“末 5 层 L45–L49 保稠密” | `8gb_parity_ok.json` + `FINAL_REPORT.md` +（可选）`splitstream_gates.pt` | 确认 8GB 补丁链下数值与画质零退化，全部核心产物同步至 Google Drive 后停机 |
 
-> **总计**：约 **2.0–2.6 小时**（留 20–30 分钟停机缓冲），硬上线 **3.0 小时**。
+> **剩余 3h 合计**：约 **2.0 小时**完成全部高价值验证，留足 **1 小时安全余量**，绝不花时间去压测 8GB 卡根本跑不动的超高分辨率。
 
 ---
 
 ## 🎯 六、核心测试用例规格（5s / 124 帧 / `T=37` / `1280×736 = 0.94MP`，同 seed）
 
 1. **`case1_static`（静机位表演叙事）**：固定机位汉服人物慢速呼吸、眨眼、连贯手势 + 暖光室内 + 房间底噪（标定 `s_bg=0` 极限压缩上限与发丝/衣纹保真；也可追加用户自带 `deepseek.png` 绿幕 Ref2VA 用例）。
-2. **`case2_dolly`（动态推镜 + 大位移 — 重点拷问）**：缓慢推进镜头跟拍行人横穿湿润砖墙巷道 + 明显前景-背景视差 + 脚步声（检验 `s_bg=5` 下 `flow` vs `lerp` 残差传播与全局补偿掩码）。
+2. **`case2_dolly`（动态推镜 + 大位移 — 重点拷问）**：缓慢推进镜头跟拍行人横穿湿润砖墙巷道 + 明显前景-背景视差 + 脚步声（检验 `s_bg=3` 下 `flow v2` vs `lerp` 残差传播与全局补偿掩码）。
 3. **`case3_neon`（强光影 + 景别切换 — 重点拷问）**：夜景霓虹强侧逆光室内/街景、中景转特写 + 地面/墙面投影交互 + 连续环境音（检验跨镜连贯与阴影环 `ring=1` vs `ring=0` 效果）。
 
 > **说明**：[stage0_oracle.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/stage0_oracle.py) 与 [stage1_ablate.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/stage1_ablate.py) 已内置自动判断：当 prompt 不含 `<Picture` 标记时自动把 `local_dualclock_api.json` 从 `Ref2VA` 切为 `T2VA` 并剥离参考图；当 prompt 包含 `<Picture 1>`（如用户自带的 `deepseek.png` 绿幕用例）时自动保留 `Ref2VA` 链路。
@@ -139,3 +141,45 @@ nohup bash "$REPO_ROOT/route3/run_pipeline.sh" >> "$WORK_ROOT/logs/pipeline.log"
 3. `stage1_ablation.csv` + `stage1_contact_sheet.png`（可直接 5 秒肉眼对比 Oracle / `flow` / `lerp` / `s_bg=3` / `s_bg=0`）
 4. `splitstream_gates.pt`（若触发 Stage 2，`< 80 KB`，零开销加载到本机 INT8 模型）
 5. `FINAL_REPORT.md` + 3 条 5s 对比成片 +（若通过）1 条 15s 长片对比成片
+
+---
+
+## ✅ 八、云端 A100 + 本机 8GB 真机实测收口与 `s_bg=4` 证伪定案（2026-11-22）
+
+### 8.1 云端 A100-40GB 最终结论（1.3MP `1568×864` & 15s 362f）
+- **默认推荐配置锁死：`s_bg=3 + method="lerp" + auto-beta0`**（[nodes.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/nodes.py) 与 [wf.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/wf.py) 默认值已切换）：
+  - 5s 三场景 **3/3 全绿**：`case1_static` `28.45 dB / SSIM 0.9299 / bg_hf 0.941`，`case2_dolly` `24.82 / 0.8346 / 0.941`（**超越跨 seed 稠密 Oracle 随机基线 `24.13 / 0.7998`**），`case3_neon` `25.39 / 0.8933 / 0.987`。
+  - `lerp` 相对 `flow v2`：`fg_psnr` 差 `≤ 0.05 dB`、`bg_hf` 三场景全面胜出（`0.941 / 0.941 / 0.987` vs `0.940 / 0.920 / 0.943`），且耗时 **`< 1 ms`**（省去 Python 光流循环 `50–150s`）。
+  - 15s（362 帧）：采样器单步 `22.4 → 7.36 s/it`（**`3.04×`**），全流程受一采/362f 解码/模型换入稀释为 **`288s → 220s`（`1.31×`）**；全帧时序核验显示 2-win `s3_lerp` 与 4-win 稠密在自然运镜峰值帧完全一致（`f171/195/219/243`），接缝 `f187` 处零跳变，整体高频锐度保住稠密的 **`95.3%`**。
+  - 8GB 补丁（`MiniMaxLowVRAMAttention(6)` + `MiniMaxChunkFeedForward(4)`）在 A100 回归验证零画质回退（`24.83 / 0.8342 / 0.943` vs `24.82 / 0.8346 / 0.941`）。
+
+### 8.2 本机 8GB RTX 4060 Laptop 真机验证 + `s_bg=4` 机制证伪实验（`case2_dolly`, 5s `1312×736`, `T=37`, 32kHz 立体声）
+固定同一份冻结一采（`MiniMaxH3AVLatentLoad` 0 秒复用，保留原声轨），对比 `s_bg=3` 与 `s_bg=4` 在不同 `β` 下的表现（以同机 `oracle_dense` 为分母，并附加同核 `cuDNN BF16` 下相对 `s3_lerp` 的背景 99.9% 极值误差）：
+
+| 变体 | `s_bg` | `β` | 二采耗时 | 峰值显存 | `180p fg_psnr` | `fg_ssim` | `bg_hf` | `full-res bg_psnr` | 相对 `s3` 背景 `p99.9` 误差 | 肉眼伪影核验 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `oracle_dense` | 稠密 | — | `282.8s` *(含TE+一采)* | `7365 MiB` | — | — | `1.000` | — | — | 基准（含 SageAttention） |
+| **`s3_lerp`** | **3** | `1.046` *(auto)* | `130.9s` | `7801 MiB` | `22.66` | `0.8443` | `0.969` | **`24.89`** | `0.0` *(基线)* | **零色斑**，与 Oracle 肉眼不可分 |
+| `s4_default` | 4 | `1.308` *(auto)* | `114.8s` | `7583 MiB` | `21.69` | `0.8131` | `1.011` ↑ | `22.95` | `107.3` | **严重黄褐/红褐矩形贴块**（完美复现 A100） |
+| `s4_beta105` | 4 | `1.046` *(同 s3)* | `114.7s` | `7583 MiB` | `21.94` | `0.8243` | `1.009` ↑ | `23.12` | `105.3` | **色斑依旧明显**（地面/左墙/远楼仍有大块色斑） |
+| **`s4_beta050`** | **4** | **`0.500`** *(0.38×)* | **`114.7s`** | `7583 MiB` | **`22.78`** | **`0.8472`** | **`0.987`** | **`23.91`** | **`96.0`** | **~95% 色斑消失**，前景反超 `s3`，仅墙角极弱残影 |
+
+- **证伪定案（推翻两种单一归因，确立耦合失稳机制）**：
+  1. **排除「纯 2-hop 几何断崖不可救」**：保持完全相同的 `s_bg=4`（2-hop）几何不变，只把 `β` 从 `1.308` 压到 `0.500`，黄褐矩形贴块即消除 ~95%，`fg_psnr` 回升 `+1.09 dB`（反超 `s_bg=3`）、`bg_hf` 从异常 `1.011` 回落正常 `0.987`。
+  2. **排除「`β=1.05` 是跨步长通用安全常数」**：在**完全相同的 `β = 1.046`** 下，`s_bg=3` 零色斑，而 `s_bg=4` 依然长出大片色斑——说明步长拉大导致锚点间真实注意力相关性衰减更陡，`β_true_equiv(s)` 远小于理论上限 `ln(s)`，未衰减的 `β0` 与更陡的 2-hop 相关性衰减叠加，在 50 层 DiT 内触发局部背景锚点自激塌缩。
+  3. **工程落地**：生产默认稳选 **`s_bg=3 + lerp + auto-beta0`**（本机 8GB `bg_psnr 24.89` 全程零色斑）；代码已新增 `beta_scale` / `beta_max` 参数（[engine.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/engine.py) / [nodes.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/nodes.py)），支持进阶用户用 `s_bg=4 + beta_scale=0.38`（或 `beta_max=0.50`）再省 ~12% 二采耗时；同时已修复 `h3_upscale.py` 逐窗 `reset_peak_memory_stats()` 真峰值日志与 `nodes.py` 张量 `beta_path` 加载格式化 bug。
+
+---
+
+## 🗺️ 九、远期优化规划（二采极致省显存 + SageAttention 兼容，待核心画质彻底稳定后推进）
+
+1. **接入本机 `sageattention(..., return_lse=True)` 作为 Route 3 首选 LSE 后端**：
+   - 现状：Route 3 二采走 `cuDNN` BF16 FlashAttention，覆盖了 `#17 SageAttention INT8`（不报错，但少吃一层 INT8 加速）。
+   - 已核验本机 `comfyenv` 的 `sageattention`（`sageattn` / `sageattn_qk_int8_pv_fp16_cuda` / `fp8`）原生支持 `return_lse=True`；后续在 [route3/splitstream_attn.py](file:///d:/comfyui/ComfyUI/custom_nodes/comfyui-h3-seamkit/route3/splitstream_attn.py) 校准 `ln` vs `log2` 换算后接入，实现「Route 3 减 token + Sage INT8」双加速叠加、零冲突。
+2. **「一采不改、二采只画人物」绿幕极致省显存两条路线（人物仅占 ~22% 画布）**：
+   - **路线 A · 绿幕双锚 `I+P`（只留 `t=0, 1` 两帧纯绿锚 + 可选纯绿区空间抽稀）**：保留完整 16:9 原生 RoPE（零变形风险），二采 token 直接砍掉 **73%~77%**，`qkv` 激活显存从 `2.1 GB → 0.56 GB`，8GB 卡释放出 ~2–3 GB 显存多常驻 6–8 层 DiT 权重，反过来缓解 PCIe 搬运瓶颈。
+   - **路线 B · 二采 ROI 人物外接框裁剪**：按一采绿幕掩码裁出含 64px 绿边的紧矩形框（对齐 32 倍数，如 `1568×864 → 768×864`）再送 3D 上采样与二采，出图后贴回纯绿画布——**连 3D 上采样与 VAE 解码显存一起砍半**，且原生直通 `#17 SageAttention` 零冲突（需实测 2D RoPE 子坐标切片防比例微偏移）。
+3. **已排除的不可行方向（物理边界记录，避免后续走弯路）**：
+   - **不对人物前景内部做时间冻结/丢弃 token**：H3 视频 P-token 已是 `4×16×16`（1024×）高密度潜变量，人物内部任何呼吸/微动/光影变化一旦被冻结或按 `32×32px` 丢弃，空间相邻 patch 轨迹撕裂，直接产生硬边方框切块或隔帧糊脸。
+   - **不对 H3 50 层 DiT 做无训练的通用 token 合并（ToMe）**：50 层注意力强依赖精确 `(t,y,x)` 3D RoPE 相位，无训练 merge 会打碎空间/时间相位对齐，画质劣于抽帧。
+   - **复杂实景有运镜场景不能靠纯 0 步插值（`lerp/flow`）完全追平稠密**：两个相隔 ~0.67s 的锚点高频残差加权平均必有方差衰减，导致 `drp↔ANC` 清晰度呼吸跳变；实景稳画质需结合「末步全稠密收尾（`last_step_dense`）」等步骤级混合策略。

@@ -170,7 +170,7 @@
       "sampler_name": "dual_clock_euler",
       "scheduler": "native_flow",
       "model": [
-        "88",
+        "106",
         0
       ],
       "av_latent": [
@@ -225,7 +225,7 @@
       "sampler_name": "dual_clock_euler",
       "scheduler": "native_flow",
       "model": [
-        "87",
+        "35",
         0
       ],
       "av_latent": [
@@ -244,7 +244,7 @@
       "steps": 3,
       "denoise": 0.3,
       "model": [
-        "87",
+        "35",
         0
       ]
     },
@@ -388,28 +388,6 @@
       ]
     }
   },
-  "87": {
-    "class_type": "LoraLoaderModelOnly",
-    "inputs": {
-      "lora_name": "H3_Combat_V2.safetensors",
-      "strength_model": 0.4900000000000001,
-      "model": [
-        "35",
-        0
-      ]
-    }
-  },
-  "88": {
-    "class_type": "LoraLoaderModelOnly",
-    "inputs": {
-      "lora_name": "H3_Combat_V2.safetensors",
-      "strength_model": 0.7000000000000002,
-      "model": [
-        "106",
-        0
-      ]
-    }
-  },
   "93": {
     "class_type": "MiniMaxH3FirstPassSampler",
     "inputs": {
@@ -443,18 +421,15 @@
     "class_type": "MiniMaxH3HardCutFirstPassPlan",
     "inputs": {
       "total_seconds": 5,
-      "use_cache": false,
-      "cache_key": "s15_cam_wenxi",
-      "cache_path": "",
-      "require_sage_patch": false,
-      "loose_prompt": true,
       "target_segment_seconds": 6.4,
       "first_megapixels": 0.4,
       "second_megapixels": 1.3,
       "aspect_ratio": "16:9 (Widescreen)",
-      "multiple": 32,
+      "green_screen_mode": false,
+      "use_cache": false,
+      "cache_key": "r3_run",
+      "cache_path": "",
       "boundary_search_frames": 17,
-      "green_screen_mode": true,
       "prompt": [
         "9",
         0
@@ -485,34 +460,15 @@
   "107": {
     "class_type": "MiniMaxH3HardCutPass2Plan",
     "inputs": {
-      "cfg": 1,
       "model_name": "minimax_h3_latent_upscaler_3d_fp16.safetensors",
-      "precision": "bf16",
-      "release_policy": "clear_after",
-      "anchor_strength": 0.999,
-      "second_pass_audio_policy": "joint_av_preserve_input",
-      "seam_tolerance_frames": 4,
-      "calm_search_window": 51,
-      "calm_policy": "auto",
+      "seam_mode": "auto",
       "overlap_frames": 17,
-      "auto_calm_search": true,
-      "calm_overlap_frames": 17,
-      "profile_camera_compensate": true,
-      "profile_reduce": "mean",
-      "calm_abstain_below": 0,
-      "calm_min_quality": 0.8,
-      "hunt_persistence": true,
-      "hunt_min_persistence": 0.8,
-      "hunt_search_window": 34,
-      "calm_too_quiet_below": 0.05,
-      "calm_min_gain": 0.15,
-      "auto_seam_hunt": true,
-      "anchor_tokens": 1,
+      "seam_blend": false,
+      "cfg": 1,
+      "route3_enabled": true,
       "upscale_pad_tokens": 3,
-      "seam_blend": true,
-      "dump_latents": false,
-      "dump_dir": "latent_dump",
-      "show_memory_log": true
+      "precision": "bf16",
+      "dump_latents": false
     }
   }
 }

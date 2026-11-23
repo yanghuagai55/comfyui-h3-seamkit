@@ -35,7 +35,31 @@ from .nodes_latent_cache import (
     save_av_latent,
     zero_audio_part,
 )
-from .nodes_guard import _attn_forward_name
+def _attn_forward_name(model) -> str:
+    """检测注意力实现名（先查 KJNodes object_patches，再兜底直接属性）。"""
+    patched_note = ""
+    try:
+        patches = dict(getattr(model, "object_patches", None) or {})
+    except Exception:
+        patches = {}
+    for key, fn in patches.items():
+        k = str(key)
+        if ".attn.forward" not in k:
+            continue
+        name = getattr(fn, "__name__", "") or ""
+        if not patched_note:
+            patched_note = f"patched({k.split('diffusion_model.')[-1]})={name!r}"
+        if "sageattn" in name:
+            return name
+    try:
+        dm = model.get_model_object("diffusion_model")
+        blocks = getattr(dm, "blocks", None)
+        if not blocks:
+            return patched_note
+        fwd = getattr(getattr(blocks[0], "attn", None), "forward", None)
+        return getattr(fwd, "__name__", "") or patched_note
+    except Exception:
+        return patched_note
 
 
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)

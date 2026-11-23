@@ -76,6 +76,9 @@ def main():
     ap.add_argument("--first-mp", type=float, default=0.0, help="一采 MP；0 = 保持工作流原值")
     ap.add_argument("--second-mp", type=float, default=1.3,
                     help="二采 MP（最终画质）。默认 1.3 ≈ 1536x864；别超 1.4")
+    ap.add_argument("--segment-seconds", type=float, default=0.0,
+                    help="target_segment_seconds（每段最长秒数，硬红线）。"
+                         "0=沿用工作流；5.0→15s 切 4 窗；9.0→2 窗；16.5→1 窗")
     ap.add_argument("--cases", default="", help="cases.json；留空用内置 3 条")
     ap.add_argument("--only", default="", help="只跑某个 case 名")
     ap.add_argument("--probe", action="store_true", help="在第一个 Case 二采上挂输出替换误差探针")
@@ -98,6 +101,9 @@ def main():
 
     base = W.load(a.api)
     cli = W.Comfy(a.server)
+    _loras = None if a.dry_run else W.lora_names(cli)
+    if _loras is not None:
+        print("[lora] 可用 %d 个" % len(_loras), flush=True)
     if not a.dry_run and a.probe and not cli.has_node("MiniMaxH3Route3Probe"):
         raise RuntimeError(
             "ComfyUI 未注册 MiniMaxH3Route3Probe 节点 —— 请重启 ComfyUI 让最新 route3 生效！"
@@ -140,7 +146,13 @@ def main():
         d_node = W.patch_duration(wf, a.duration)
         second = a.megapixels or a.second_mp
         mp_nodes = W.set_pass_megapixels(wf, a.first_mp or None, second)
+        seg_nodes = W.patch_segment_seconds(wf, a.segment_seconds) if a.segment_seconds else []
         W.patch_seed(wf, a.seed)
+        if not a.dry_run:
+            W.prune_missing_loras(wf, _loras)
+            fixed = W.autofix_combos(wf, cli)
+            if fixed:
+                print("[autofix] " + "; ".join(fixed), flush=True)
         p2 = W.find_pass2_sampler(wf)
         if not p2:
             raise RuntimeError("工作流中未定位到二采采样器/执行器节点")
@@ -154,8 +166,9 @@ def main():
             )
 
         print(
-            "[%s] prompt<-%s dur<-%s mp<-%s pass2=%s(%s) probe=%s clean=%s"
-            % (cname, p_nodes, d_node, mp_nodes, p2, wf[p2]["class_type"], attach_probe, notes),
+            "[%s] prompt<-%s dur<-%s mp<-%s seg<-%s pass2=%s(%s) probe=%s clean=%s"
+            % (cname, p_nodes, d_node, mp_nodes, seg_nodes, p2, wf[p2]["class_type"],
+               attach_probe, notes),
             flush=True,
         )
         W.save(wf, os.path.join(a.out, cname + ".api.json"))
@@ -166,6 +179,7 @@ def main():
             "duration": float(a.duration),
             "megapixels": float(second),
             "first_mp": float(a.first_mp),
+            "segment_seconds": float(a.segment_seconds),
             "seed": int(a.seed),
             "cache_key": cache_key,
             "cache_dir": cache_dir,

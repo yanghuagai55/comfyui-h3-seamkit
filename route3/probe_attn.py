@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 
 from .route3_block import rms_rope_split_half_ref
+from .splitstream_attn import bg_anchor_indices
 
 __all__ = ["probe_attention", "summarize", "dump", "BUCKETS_PREV", "BUCKETS_NEAREST", "BUCKETS"]
 
@@ -92,13 +93,13 @@ def probe_attention(model, x, timestep, context, transformer_options=None,
         if fg_bool.numel() != s_v:
             fg_bool = fg_bool[:s_v]
 
-    # 锚点帧掩码：t % s_bg == 0（s_bg<=0 则只留第 0 帧）
-    if s_bg <= 0 or s_bg >= latent_t:
-        anchor_mask = (t_index == 0)
-        n_anchors = 1
-    else:
-        anchor_mask = (t_index % s_bg == 0)
-        n_anchors = math.ceil(latent_t / s_bg)
+    # 锚点帧掩码：与 Route3Apply / Route3Assemble 共用唯一真相源 bg_anchor_indices
+    anc_list = bg_anchor_indices(latent_t, s_bg)
+    anc_t = torch.zeros(latent_t, dtype=torch.bool)
+    if anc_list:
+        anc_t[anc_list] = True
+    anchor_mask = anc_t[t_index]
+    n_anchors = max(1, len(anc_list))
     fg_local = fg_bool.nonzero(as_tuple=True)[0]
     bg_all_bool = ~fg_bool
     bg_all_local = bg_all_bool.nonzero(as_tuple=True)[0]

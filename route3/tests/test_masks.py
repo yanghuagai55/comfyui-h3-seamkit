@@ -93,5 +93,50 @@ check("微动保底把静立人物捞回来", cov(with_micro, person) > 0.9,
 check("保底不会把整帧都点亮", float(with_micro.float().mean()) < 0.45,
       "总覆盖 %.0f%%" % (100 * float(with_micro.float().mean())))
 
+# ---- 12fps 动漫隔帧桥接 + 切镜绝不串镜测试 ----
+from route3.masks import _temporal_bridge_same_shot
+m_twos = torch.zeros(7, 8, 8, dtype=torch.bool)
+# 镜头1 (0..3)：隔帧 1, 0, 1, 0；镜头2 (4..6)：全 0（t=3->4 为镜头硬切）
+m_twos[0, 2:5, 2:5] = True
+m_twos[2, 2:5, 2:5] = True
+m_twos[4, 2:5, 2:5] = True  # 若不防切镜，t=3 会被 t=2 & t=4 误桥接！
+fr_twos = torch.zeros(7, 3, 8, 8)
+fr_twos[:4] = 0.1
+fr_twos[4:] = 0.9
+bridged = _temporal_bridge_same_shot(m_twos, fr_twos)
+check("12fps 动漫隔帧空洞 (t=1) 被同镜头闭运算填平", bool(bridged[1, 3, 3].item()) is True)
+check("硬切边界 (t=3->4) 绝不跨镜桥接掩码", bool(bridged[3, 3, 3].item()) is False)
+
+# ---- 保守空间降采样 + patch 级 ring 回归（消灭运动指尖/发梢被 avg_pool>0.5 啃出缺口）----
+from route3.mask_provider import MaskProvider
+fr_thin = torch.zeros(6, 3, 64, 64, device=DEV)
+fg_thin = torch.zeros(6, 64, 64, dtype=torch.bool, device=DEV)
+fg_thin[:, 20:22, 20:22] = True   # 极细 2x2px 指尖（仅占 16x16 patch 的 1/64 << 50%）
+m_thin0, _ = active_mask(fr_thin, fg_mask=fg_thin, ring=0, patch_grid=(16, 16), micro=False)
+m_thin1, _ = active_mask(fr_thin, fg_mask=fg_thin, ring=1, patch_grid=(16, 16), micro=False)
+check("极细指尖降采样绝不被 >0.5 均值阈值啃掉 (ring=0 仍保留)", bool(m_thin0[0, 5, 5].item()) is True)
+check("ring=1 在 patch 网格上真实外扩 3x3 保护环", int(m_thin1[0].sum().item()) == 9,
+      "sum=%d" % int(m_thin1[0].sum().item()))
+prov_thin = MaskProvider(m_thin0.cpu())
+g_thin = prov_thin.for_grid(latent_t=2, lat_h=16, lat_w=16).view(2, 8, 8)
+check("MaskProvider.for_grid 保守空间 max_pool 绝不啃掉细指尖", bool(g_thin[0, 2, 2].item()) is True)
+
+# ---- 硬切镜不炸 95% 假前景 + 同镜头展开绝不跨镜串帧 ----
+from route3.masks import _expand_temporal_mask, _detect_frame_cuts
+fr_cut = torch.zeros(10, 3, 32, 32, device=DEV)
+fr_cut[:5] = 0.1
+fr_cut[5:] = 0.9
+m_cut, _ = active_mask(fr_cut, fg_mask=None, ring=0, patch_grid=(16, 16), micro=False)
+check("硬切镜当帧运动尖峰已屏蔽（不炸 95% 假前景）", float(m_cut[5].float().mean()) < 0.05,
+      "cut_cov=%.2f" % float(m_cut[5].float().mean()))
+cuts_det = _detect_frame_cuts(fr_cut)
+sub_m = torch.zeros(3, 8, 8, dtype=torch.bool)
+sub_m[0, :3, :3] = True     # idx=0 (镜头1)
+sub_m[1, 5:, 5:] = True     # idx=5 (镜头2)
+sub_m[2, 5:, 5:] = True     # idx=9 (镜头2)
+exp_m = _expand_temporal_mask(sub_m, [0, 5, 9], 10, cuts=cuts_det)
+check("抽样掩码按镜头硬切隔离展开：镜头1尾帧 t=4 绝不吸附镜头2(t=5)",
+      bool(exp_m[4, 1, 1].item()) is True and bool(exp_m[4, 6, 6].item()) is False)
+
 print("\n%d 项失败%s" % (len(FAIL), (": " + ", ".join(FAIL)) if FAIL else ""))
 sys.exit(1 if FAIL else 0)

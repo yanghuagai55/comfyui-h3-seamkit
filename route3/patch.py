@@ -56,8 +56,9 @@ class Route3State:
                 "passthrough": self.passthrough, "last_plan": self.last_plan}
 
 
-def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
-            strict_malloc=True, use_beta=True):
+def install(model_patcher, s_bg=3, beta=None, fg_mask_fn=None, state=None,
+            strict_malloc=True, use_beta=True, beta_scale=1.0, beta_max=0.0,
+            last_step_dense=True):
     """返回装了 Route 3 forward 的 ModelPatcher（clone，不改原对象）。"""
     from comfy.ldm.minimax.model import time_shift_sigma
 
@@ -65,6 +66,15 @@ def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
     dm = m.get_model_object("diffusion_model")
     orig = dm.forward
     st = state or Route3State()
+    if hasattr(m, "model_options") and isinstance(m.model_options, dict):
+        m.model_options["route3_info"] = {
+            "s_bg": int(s_bg),
+            "beta_scale": float(beta_scale),
+            "beta_max": float(beta_max),
+            "has_mask": fg_mask_fn is not None,
+            "last_step_dense": bool(last_step_dense),
+        }
+        m.model_options["route3_fg_mask_fn"] = fg_mask_fn
 
     if strict_malloc and malloc_graph_active(torch.device("cuda")):
         logging.info("[route3] malloc graph 已开启 —— 由本模块按原生 forward 的方式包裹，"
@@ -87,8 +97,45 @@ def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
                         denoise_mask=denoise_mask,
                         audio_denoise_mask=audio_denoise_mask, **kw)
 
+        # 末步全稠密收尾（last_step_dense=True）：前 N-1 步走 Route 3 压缩定结构，
+        # 最后 1 步自动回切原生全稠密 forward（直通 SageAttention），全帧联合细化背景细节，
+        # 彻底消灭复杂实景视频中「非锚点帧 → 锚点帧」的清晰度呼吸跳变！
+        if last_step_dense:
+            topts = transformer_options or {}
+            last_sig = topts.get("route3_last_sigma", None)
+            if last_sig is None:
+                ss = topts.get("sample_sigmas", None)
+                if torch.is_tensor(ss):
+                    pos = ss.flatten().float()
+                    pos = pos[pos > 1e-6]
+                    if pos.numel() >= 2:
+                        last_sig = float(pos[-1].item())
+            if last_sig is not None and float(last_sig) > 0.0:
+                sigma_cur = float((timestep.flatten()[0] / 1000.0).float().item())
+                if sigma_cur <= float(last_sig) * 1.02:
+                    st.passthrough += 1
+                    # 切换回原生全稠密 forward 前先清理压缩步的 MallocGraph，防止两套不同序列长度的分配图叠加引发析构栈溢出
+                    try:
+                        import comfy.model_prefetch as _mp_clean
+                        _mp_clean.cleanup_malloc_graph()
+                    except Exception:
+                        pass
+                    print("[route3] last_step_dense -> full dense native forward (sigma=%.4f <= %.4f)"
+                          % (sigma_cur, float(last_sig)), flush=True)
+                    return orig(x, timestep, context, transformer_options,
+                                minimax_payload=minimax_payload,
+                                denoise_mask=denoise_mask,
+                                audio_denoise_mask=audio_denoise_mask, **kw)
+
         lat_t, lat_h, lat_w = x[0].shape[2], x[0].shape[3], x[0].shape[4]
-        mask = fg_mask_fn(lat_t, lat_h, lat_w) if fg_mask_fn is not None else None
+        start_tok = int((transformer_options or {}).get("route3_start_token", 0))
+        if fg_mask_fn is not None:
+            try:
+                mask = fg_mask_fn(lat_t, lat_h, lat_w, start_tok)
+            except TypeError:
+                mask = fg_mask_fn(lat_t, lat_h, lat_w)
+        else:
+            mask = None
 
         # 与 MiniMaxH3Model.forward 完全对齐的 audio_scale 换算（兼容 ModelSamplingAV 与 dual_clock_euler）
         scale = float((minimax_payload or {}).get("audio_scale", 1.0))
@@ -111,8 +158,15 @@ def install(model_patcher, s_bg=5, beta=None, fg_mask_fn=None, state=None,
         out, plan, _ = splitstream_forward(
             self, x_in, timestep, context, transformer_options, minimax_payload,
             s_bg=s_bg, beta=beta, fg_mask=mask, full_velocity=True,
-            return_plan=True, use_beta=use_beta)
+            return_plan=True, use_beta=use_beta,
+            beta_scale=beta_scale, beta_max=beta_max)
         st.last_plan = plan.to_dict()
+        if st.calls == 1 and mask is not None and s_bg != 1:
+            kept_v = int(plan.fg_local.numel() + plan.bg_local.numel())
+            print("[route3] plan: kept=%d/%d (%.1f%%) anchors=%d n_full=%d beta0=%.4f"
+                  % (kept_v, plan.video_rows, 100.0 * kept_v / max(1, plan.video_rows),
+                     len(plan.anchors or ()), plan.n_full, plan.beta0),
+                  flush=True)
         if mg:
             buf[0].copy_(out[0])
             buf[1].copy_(out[1])

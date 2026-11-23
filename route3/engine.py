@@ -28,6 +28,7 @@ import comfy.ldm.common_dit
 from comfy.ldm.minimax.model import (FRAME_RESCALE, PackedLayout, SEG_TAG,
                                      _tag_runs, pack_audio, patchify_video, pdd_grid,
                                      unpatchify_video, unpack_audio)
+from .assembly import reconstruct_moving
 from .splitstream_attn import beta_for_sequence, route3_plan, splitstream_attention
 from .route3_block import rms_rope_split_half_ref
 
@@ -48,43 +49,144 @@ def _seg_of(layout, kind):
     return next(s for s in layout.segments if s[2] == kind)
 
 
-def fill_dropped(v_full, keep_mask_2d):
-    """把被删掉的帧的速度，用同位置相邻两个保留帧线性插值补上。
+def _fill_dropped_linear(v, src_keep, t_coords=None, return_dist=False):
+    """在单一时间子序列 v:[K,P,...], src_keep:[K,P] 内按真实时间坐标 t_coords 线性插值。
 
-    为什么必须补：ComfyUI 的采样器每一步都对**整个 latent 体**做积分，被删掉的行
-    如果没有速度，就会原地不动 → 冻结成噪声。所以引擎不能只返回紧凑序列的输出，
-    必须散回全尺寸并把空缺填好，才能当 `forward` 的 drop-in。
-
-    v_full      : [T*P, ...] 已按 t*P+p 排好，保留行已填
-    keep_mask_2d: [T, P] bool
+    注意首尾外推：
+      * prev < 0（左侧无保留源，如 P 池首帧 t=1 被删、t=2 保留）：pv 取右侧 nxt，绝不读 0 号空行！
+      * nxt >= K（右侧无保留源）：nx 取左侧 pv。
     """
-    T, P = keep_mask_2d.shape
-    shape = v_full.shape[1:]
-    v = v_full.view(T, P, *shape)
-    keep = keep_mask_2d.to(v.device)
-    tt = torch.arange(T, device=v.device)[:, None].expand(T, P)
-    prev = torch.where(keep, tt, torch.full_like(tt, -1)).cummax(0).values
-    nxt = torch.where(keep, tt, torch.full_like(tt, T)).flip(0).cummin(0).values.flip(0)
+    K, P = src_keep.shape
+    shape = v.shape[2:]
+    tt = torch.arange(K, device=v.device)[:, None].expand(K, P)
+    prev = torch.where(src_keep, tt, torch.full_like(tt, -1)).cummax(0).values
+    nxt = torch.where(src_keep, tt, torch.full_like(tt, K)).flip(0).cummin(0).values.flip(0)
 
-    pv = prev.clamp(min=0)
-    # 没有后继保留帧时，退化成「沿用前一个保留帧」，不能去读被删掉的行
-    nx = torch.where(nxt >= T, pv, nxt.clamp(max=T - 1))
-    denom = (nx - pv).clamp(min=1).to(v.dtype)
-    frac = ((tt - pv).to(v.dtype) / denom).clamp(0.0, 1.0)
-    frac = torch.where((prev < 0) | (nxt >= T), torch.zeros_like(frac), frac)
+    pv = torch.where(prev < 0, nxt.clamp(max=K - 1), prev.clamp(min=0))
+    nx = torch.where(nxt >= K, pv, nxt.clamp(max=K - 1))
+    if t_coords is not None:
+        tc = t_coords.to(device=v.device, dtype=v.dtype)
+        t_cur = tc[:, None].expand(K, P)
+        t_pv = tc[pv]
+        t_nx = tc[nx]
+        denom = (t_nx - t_pv).clamp(min=1.0)
+        frac = ((t_cur - t_pv) / denom).clamp(0.0, 1.0)
+    else:
+        t_cur = tt.to(v.dtype)
+        t_pv = pv.to(v.dtype)
+        t_nx = nx.to(v.dtype)
+        denom = (nx - pv).clamp(min=1).to(v.dtype)
+        frac = ((tt - pv).to(v.dtype) / denom).clamp(0.0, 1.0)
+    frac = torch.where((prev < 0) | (nxt >= K), torch.zeros_like(frac), frac)
 
     def gather_t(i):
         return v.gather(0, i.unsqueeze(-1).expand(-1, -1, *shape))
 
-    filled = gather_t(pv) * (1 - frac).view(T, P, *([1] * len(shape))) +         gather_t(nx) * frac.view(T, P, *([1] * len(shape)))
-    out = torch.where(keep.view(T, P, *([1] * len(shape))), v, filled)
-    return out.reshape(T * P, *shape)
+    filled = (gather_t(pv) * (1 - frac).view(K, P, *([1] * len(shape)))
+              + gather_t(nx) * frac.view(K, P, *([1] * len(shape))))
+    out = torch.where(src_keep.view(K, P, *([1] * len(shape))), v, filled)
+    if not return_dist:
+        return out
+    inf = torch.full_like(t_cur, 1e9)
+    d_l = torch.where(prev >= 0, (t_cur - t_pv).abs(), inf)
+    d_r = torch.where(nxt < K, (t_nx - t_cur).abs(), inf)
+    return out, torch.minimum(d_l, d_r)
+
+
+def _detect_anchor_cuts(v, keep_2d, cut_ratio=3.5, cut_floor=0.25):
+    """在没有外部 route3_cuts 时，从全保留锚点帧上自动检测镜头硬切起始下标。"""
+    T = int(v.shape[0])
+    if T < 4:
+        return []
+    full_t = [t for t in range(T) if bool(keep_2d[t].all().item())]
+    if len(full_t) < 3:
+        return []
+    vs = v[full_t].float()
+    diffs = (vs[1:] - vs[:-1]).abs().mean(dim=tuple(range(1, vs.ndim)))
+    med = float(diffs.median().item()) if diffs.numel() else 0.0
+    thr = max(float(cut_ratio) * max(med, 1e-6), float(cut_floor))
+    cuts = []
+    for k in range(len(full_t) - 1):
+        if float(diffs[k].item()) > thr:
+            # 切点落在 full_t[k] 与 full_t[k+1] 之间；保守取中间后半段起点 full_t[k+1]
+            cuts.append(int(full_t[k + 1]))
+    return cuts
+
+
+def fill_dropped(v_full, keep_mask_2d, phase_split=True, source_mask_2d=None,
+                 cuts=None, max_src_gap=8):
+    """把被删掉的 BG 帧的预测，用同镜头内、同池相邻的**纯 BG 保留帧**线性插值补上。
+
+    关键修复（2026-11-23 实片 00003/00004/00007 实证）：
+      1. phase_split=True：严格分离 1 帧 I-token (t%5==0) 与 4 帧 P-token (t%5!=0) 两池插值；
+      2. prev < 0 首帧外推修复：t=1 被删时取右侧 t=2，绝不读全 0 空行（消灭 f001..f004 紫边环）；
+      3. source_mask_2d（纯 BG 锚点）+ max_src_gap 跨度封顶：被删 BG 格只从近邻纯 BG 锚点插值，
+         不混入运动手臂 x0_hat；若该格深处人物内部（附近无纯 BG 源，如偶发掩码空洞）则回落近邻 keep；
+      4. cuts 硬切自动断链：绝不跨镜头硬切插值（彻底消灭 00007 镜头 1 亮窗跨镜传送到镜头 2 头发的白色方块！）。
+    """
+    T, P = keep_mask_2d.shape
+    shape = v_full.shape[1:]
+    v_all = v_full.view(T, P, *shape)
+    keep_all = keep_mask_2d.to(v_all.device)
+    src_all = keep_all if source_mask_2d is None else source_mask_2d.to(v_all.device)
+
+    cut_list = sorted(set(int(c) for c in cuts if 0 < int(c) < T)) if cuts is not None else _detect_anchor_cuts(v_all, keep_all)
+    bounds = [0] + cut_list + [T]
+
+    def _interp_with_src(v_in, s_mask, k_mask, t_coords=None):
+        """优先用近邻 s_mask（纯 BG 源，距离 <= max_src_gap）插值；否则回落同池 k_mask。"""
+        has_s = s_mask.any(dim=0)
+        f_k = _fill_dropped_linear(v_in, k_mask, t_coords=t_coords)
+        if s_mask is k_mask or not bool(has_s.any()):
+            return f_k
+        f_s, d_s = _fill_dropped_linear(v_in, s_mask, t_coords=t_coords, return_dist=True)
+        use_s = has_s.unsqueeze(0).expand_as(s_mask)
+        if max_src_gap is not None and float(max_src_gap) > 0:
+            use_s = use_s & (d_s <= float(max_src_gap))
+        return torch.where(use_s.view(v_in.shape[0], P, *([1] * len(shape))), f_s, f_k)
+
+    def _fill_segment(v, keep, src, seg_lo):
+        Ts = v.shape[0]
+        t_glob = torch.arange(seg_lo, seg_lo + Ts, device=v.device)
+        if (not phase_split) or Ts < 2:
+            filled = _interp_with_src(v, src, keep, t_coords=t_glob)
+            return torch.where(keep.view(Ts, P, *([1] * len(shape))), v, filled)
+
+        fallback = _interp_with_src(v, src, keep, t_coords=t_glob)
+        out = fallback.clone()
+        i_rel = torch.tensor([r for r in range(Ts) if (seg_lo + r) % 5 == 0], dtype=torch.long, device=v.device)
+        p_rel = torch.tensor([r for r in range(Ts) if (seg_lo + r) % 5 != 0], dtype=torch.long, device=v.device)
+
+        for sub_rel in (i_rel, p_rel):
+            if sub_rel.numel() == 0:
+                continue
+            k_sub = keep.index_select(0, sub_rel)
+            s_sub = src.index_select(0, sub_rel)
+            has_s = s_sub.any(dim=0)
+            has_k = k_sub.any(dim=0)
+            if not bool(has_k.any()):
+                continue
+            sub_t = t_glob.index_select(0, sub_rel)
+            f_sub = _interp_with_src(v.index_select(0, sub_rel), s_sub, k_sub, t_coords=sub_t)
+            fb_sub = fallback.index_select(0, sub_rel)
+            use_pool = has_s | has_k
+            merged = torch.where(use_pool.view(1, P, *([1] * len(shape))), f_sub, fb_sub)
+            out.index_copy_(0, sub_rel, merged)
+        return torch.where(keep.view(Ts, P, *([1] * len(shape))), v, out)
+
+    out_all = v_all.clone()
+    for si in range(len(bounds) - 1):
+        lo, hi = bounds[si], bounds[si + 1]
+        if hi <= lo:
+            continue
+        out_all[lo:hi] = _fill_segment(v_all[lo:hi], keep_all[lo:hi], src_all[lo:hi], lo)
+    return out_all.reshape(T * P, *shape)
 
 
 def splitstream_forward(model, x, timestep, context, transformer_options=None,
-                        minimax_payload=None, s_bg=5, beta=None, fg_mask=None,
+                        minimax_payload=None, s_bg=3, beta=None, fg_mask=None,
                         keep_audio=True, return_plan=False, full_velocity=False,
-                        use_beta=True):
+                        use_beta=True, beta_scale=1.0, beta_max=0.0):
     """返回 `[-video_out, -audio_out]`，与 `model.forward` 同签名同语义。"""
     transformer_options = dict(transformer_options or {})
     payload = dict(minimax_payload or {})
@@ -109,8 +211,9 @@ def splitstream_forward(model, x, timestep, context, transformer_options=None,
     aa, ab, _ = _seg_of(layout, "audio")
     n_video = vb - va
 
+    r3_pins = transformer_options.get("route3_pin_tokens")
     plan = route3_plan(prefix_end=va, latent_t=latent_t, lat_h=lat_h, lat_w=lat_w,
-                       s_bg=s_bg, fg_mask=fg_mask)
+                       s_bg=s_bg, fg_mask=fg_mask, pin_tokens=r3_pins)
 
     # keep = [0..va) + FG + BG，行号是完整布局的下标
     fg_global = va + plan.fg_local
@@ -153,13 +256,21 @@ def splitstream_forward(model, x, timestep, context, transformer_options=None,
     shim = LayoutShim(pos, [(0, s_kept, "kept")])
     t_emb = model._time_embedding(unique_t, device, dtype)
 
-    n_full = int(va + plan.fg_local.numel())          # branch1 键数（切点）
+    n_full = int(plan.n_full)                         # branch1 键数（含 Prefix + FG + 未压缩 I-BG）
 
     # 当 beta 未显式传入且开启质量补偿、确实发生了压缩（plan.beta0 > 0）时，
-    # 自动启用理论初值 beta0 = log(T / n_keep)，防止静默退化成无补偿压缩。
+    # 自动启用理论初值 beta0 = log(N_P_dense / N_P_kept)，仅加在 branch2（压缩 P-BG）上！
     eff_beta = beta
-    if eff_beta is None and use_beta and plan.beta0 > 0.0 and plan.bg_local.numel() > 0:
+    if eff_beta is None and use_beta and plan.beta0 > 0.0 and n_full < s_kept:
         eff_beta = float(plan.beta0)
+    if eff_beta is not None:
+        if float(beta_scale) != 1.0:
+            eff_beta = eff_beta * float(beta_scale)
+        if float(beta_max) > 0.0:
+            if torch.is_tensor(eff_beta):
+                eff_beta = eff_beta.clamp(max=float(beta_max))
+            else:
+                eff_beta = min(float(eff_beta), float(beta_max))
 
     phase_full = plan.full_phase()
     with (beta_attention(model, n_full, eff_beta, phase_full) if eff_beta is not None else _nullctx()):
@@ -175,34 +286,94 @@ def splitstream_forward(model, x, timestep, context, transformer_options=None,
         (pdd_grid(model.final_layer.pdd_steps, shift_v),
          pdd_grid(model.final_layer.pdd_steps, shift_a)))
 
-    v_full = torch.zeros(n_video, *v_kept.shape[1:], dtype=v_kept.dtype, device=v_kept.device)
-    v_full[keep_video] = v_kept
-    if full_velocity:
-        gh, gw = lat_h // 2, lat_w // 2
-        km = torch.zeros(latent_t * gh * gw, dtype=torch.bool, device=v_kept.device)
-        km[keep_video] = True
-        if not bool(km.all()):
-            # Flow Matching 关键修正（本机真机冒烟实证）：
-            # 不可直接插值速度 v = ε - x0 —— 各帧输入噪声 ε(t) 独立，插值 v 会残余 √2·σ 的纯噪声！
-            # 正确做法：先由保留行算干净去噪预测 x0_hat = x_t + σ·v_kept（因外部 CONST 返回 -v_kept），
-            # 对干净 x0_hat 跨帧线性插值，再反算被删帧的速度 v_drop = (x0_interp - x_t) / σ，
-            # 使 Euler 步恰好消去被删帧自身的独立噪声 ε(j)！
-            sig = float(sigma_v)
-            if sig > 1e-5:
-                x_rows = patchify_video(video_x.to(torch.float32), model.patch_size)
-                x0_full = torch.zeros_like(x_rows)
-                x0_full[keep_video] = x_rows[keep_video] + sig * v_kept.to(torch.float32)
-                x0_interp = fill_dropped(x0_full, km.view(latent_t, gh * gw))
-                drop = ~km
-                v_full[drop] = ((x0_interp[drop] - x_rows[drop]) / sig).to(v_kept.dtype)
-            else:
-                v_full = fill_dropped(v_full, km.view(latent_t, gh * gw))
-    video_out = unpatchify_video(v_full, latent_t, lat_h // 2, lat_w // 2,
-                                 model.latents_dim, model.patch_size)
-    video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
-    audio_out = unpack_audio(a_out)
+    # 暂停 comfy_aimdo MallocGraph 录制包裹整个后处理段：避免光流估计与张量重排撑爆 C 递归析构栈
+    try:
+        import comfy.model_prefetch as _mp
+        _mg_post = _mp.pause_malloc_graph()
+    except Exception:
+        _mg_post = _nullctx()
 
-    out = [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
+    with _mg_post:
+        v_full = torch.zeros(n_video, *v_kept.shape[1:], dtype=v_kept.dtype, device=v_kept.device)
+        v_full[keep_video] = v_kept
+        if full_velocity:
+            gh, gw = lat_h // 2, lat_w // 2
+            km = torch.zeros(latent_t * gh * gw, dtype=torch.bool, device=v_kept.device)
+            km[keep_video] = True
+            if not bool(km.all()):
+                # 纯 BG 锚点掩码：被删的 BG 格只能从纯 BG 锚点插值，绝不混入运动前景手臂/发丝的 x0_hat！
+                bg_src = torch.zeros(latent_t * gh * gw, dtype=torch.bool, device=v_kept.device)
+                if plan.bg_local.numel() > 0:
+                    bg_src[plan.bg_local.to(v_kept.device)] = True
+                else:
+                    bg_src = km
+                sig = float(sigma_v)
+                r3_cuts = transformer_options.get("route3_cuts")
+                r3_p1_up = transformer_options.get("route3_p1_up")
+                r3_flow_cache = transformer_options.get("route3_flow_cache")
+                if sig > 1e-5:
+                    x_rows = patchify_video(video_x.to(torch.float32), model.patch_size)
+                    x0_full = torch.zeros_like(x_rows)
+                    x0_full[keep_video] = x_rows[keep_video] + sig * v_kept.to(torch.float32)
+
+                    use_p1_guided = (
+                        torch.is_tensor(r3_p1_up)
+                        and r3_p1_up.ndim == 5
+                        and r3_p1_up.shape[2] == orig_t
+                        and r3_p1_up.shape[3] == orig_h
+                        and r3_p1_up.shape[4] == orig_w
+                        and bool(plan.anchors)
+                    )
+                    if use_p1_guided:
+                        # Pass-1 引导的流场残差轨迹（根治推镜重影与沙发角/毛巾体积跳变）：
+                        # 被删 BG 帧保持 z_p1_up[j] 精确运镜底图 + 短基线双向光流配准与高频偶极能量守恒后的残差 δ = x0_hat - z_p1_up
+                        p1_pad = comfy.ldm.common_dit.pad_to_patch_size(
+                            r3_p1_up.to(device=v_kept.device, dtype=torch.float32), model.patch_size
+                        )
+                        p1_rows = patchify_video(p1_pad, model.patch_size)
+                        delta_rows = torch.zeros_like(x_rows)
+                        delta_rows[keep_video] = x0_full[keep_video] - p1_rows[keep_video]
+                        delta_5d = unpatchify_video(
+                            delta_rows, latent_t, gh, gw, model.latents_dim, model.patch_size
+                        )
+                        p1_tchw = p1_pad[0].permute(1, 0, 2, 3).contiguous()
+                        delta_tchw = delta_5d[0].permute(1, 0, 2, 3).contiguous()
+                        delta_keys = {int(t): delta_tchw[int(t)] for t in plan.anchors}
+                        fg_lat = (
+                            (km & (~bg_src)).view(latent_t, gh, gw)
+                            .repeat_interleave(2, dim=1)
+                            .repeat_interleave(2, dim=2)
+                        )
+                        x0_rec_tchw = reconstruct_moving(
+                            p1_tchw, delta_keys, plan.anchors,
+                            method="flow", cut_protect=True, phase_split=True,
+                            fg_mask=fg_lat, cuts=r3_cuts, flow_cache=r3_flow_cache,
+                        )
+                        x0_interp = patchify_video(
+                            x0_rec_tchw.permute(1, 0, 2, 3).unsqueeze(0).contiguous(),
+                            model.patch_size,
+                        )
+                        del p1_pad, p1_rows, delta_rows, delta_5d, p1_tchw, delta_tchw, delta_keys, fg_lat, x0_rec_tchw
+                    else:
+                        x0_interp = fill_dropped(
+                            x0_full, km.view(latent_t, gh * gw),
+                            source_mask_2d=bg_src.view(latent_t, gh * gw),
+                            cuts=r3_cuts,
+                        )
+                    drop = ~km
+                    v_full[drop] = ((x0_interp[drop] - x_rows[drop]) / sig).to(v_kept.dtype)
+                else:
+                    v_full = fill_dropped(
+                        v_full, km.view(latent_t, gh * gw),
+                        source_mask_2d=bg_src.view(latent_t, gh * gw),
+                        cuts=r3_cuts,
+                    )
+        video_out = unpatchify_video(v_full, latent_t, lat_h // 2, lat_w // 2,
+                                     model.latents_dim, model.patch_size)
+        video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
+        audio_out = unpack_audio(a_out)
+
+        out = [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
     if return_plan:
         return out, plan, keep_video
     return out

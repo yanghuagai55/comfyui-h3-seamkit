@@ -9,8 +9,9 @@ WORK_ROOT="${WORK_ROOT:-/content/h3_route3}"
 API_JSON="${API_JSON:-${REPO_ROOT}/route3/workflows/local_dualclock_api.json}"
 SERVER="${SERVER:-http://127.0.0.1:8188}"
 PY="${PY:-python3}"
-COMBOS="${COMBOS:-5:1:flow,5:1:lerp,5:0:flow,3:1:flow}"
+COMBOS="${COMBOS:-3:1:flow,3:1:lerp,3:0:flow,4:1:flow}"
 CANARY_CASE="${CANARY_CASE:-case2_dolly}"
+CANARY_COMBO="${CANARY_COMBO:-3:1:flow}"
 SEED="${SEED:-20261122}"
 DURATION="${DURATION:-5.0}"
 MEGAPIXELS="${MEGAPIXELS:-1.3}"   # 二采最终画质；720p 不够看，1080p 本地跑不到
@@ -54,7 +55,7 @@ if [ -f "${WORK_ROOT}/STOP_REQUESTED" ]; then
     exit 0
 fi
 
-echo "=== [2a] Stage 1a: 1-Clip Canary Gate (${CANARY_CASE} x 5:1:flow, timeout 15m) ==="
+echo "=== [2a] Stage 1a: 1-Clip Canary Gate (${CANARY_CASE} x ${CANARY_COMBO}, timeout 15m) ==="
 CANARY_DIR="${WORK_ROOT}/artifacts/stage1_canary"
 mkdir -p "${CANARY_DIR}"
 timeout --signal=TERM --kill-after=60 900 \
@@ -64,19 +65,21 @@ timeout --signal=TERM --kill-after=60 900 \
     --out "${CANARY_DIR}" \
     --server "${SERVER}" \
     --only "${CANARY_CASE}" \
-    --combos "5:1:flow" \
+    --combos "${CANARY_COMBO}" \
     --seed "${SEED}" \
     ${EXTRA_FLAGS} \
     --resume
 
-# 用真实端到端成片指标判止损（fg_psnr >= 22 dB 且 bg_hf_sharpness >= 0.80 且 seam_grad_ratio <= 2.2）
+# 用真实端到端成片指标判止损（fg_ssim>=0.82 或 fg_psnr>=22，且 bg_hf 在 [0.80,1.05] 双向防重影，seam<=1.8）
 CANARY_OK=$("${PY}" -c "
 import csv, sys
 rows = list(csv.DictReader(open(sys.argv[1], encoding='utf-8'))) if sys.argv[1] else []
 if not rows:
     print('NO_ROWS'); sys.exit(0)
 r = rows[0]
-ok = (float(r.get('fg_psnr') or 0) >= 22.0 and float(r.get('bg_hf_sharpness') or 0) >= 0.80 and float(r.get('seam_grad_ratio') or 9) <= 2.2)
+hf = float(r.get('bg_hf_sharpness') or 0)
+ok = ((float(r.get('fg_ssim') or 0) >= 0.82 or float(r.get('fg_psnr') or 0) >= 22.0)
+      and (0.80 <= hf <= 1.05) and float(r.get('seam_grad_ratio') or 9) <= 1.8)
 print('PASS' if ok else 'FAIL', r)
 " "${CANARY_DIR}/stage1_ablation.csv" 2>/dev/null || echo "FAIL")
 echo "[gate] Stage 1a Canary result: ${CANARY_OK}"

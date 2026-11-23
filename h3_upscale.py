@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import torch
 import comfy.model_management
@@ -1044,6 +1045,23 @@ def _hunt_log_line(entry) -> str:
     return "[HardCut]   " + " | ".join(_parts)
 
 
+_TE_HINTS = ("clip", "temodel", "qwen", "t5", "llama", "bert")
+
+
+def _looks_like_text_encoder(patched) -> bool:
+    inner = getattr(patched, "model", None)
+    if inner is None:
+        return False
+    try:
+        import comfy.sd1_clip as sd1
+        if isinstance(inner, sd1.SD1ClipModel):
+            return True
+    except Exception:
+        pass
+    name = type(inner).__name__.lower()
+    return any(h in name for h in _TE_HINTS)
+
+
 def release_text_encoders() -> list:
     """Unload CLIP / text-encoder models, keep the diffusion model loaded.
 
@@ -1060,10 +1078,6 @@ def release_text_encoders() -> list:
     except Exception:
         return freed
     for entry in loaded:
-        try:
-            from .nodes_unload import _looks_like_text_encoder
-        except Exception:
-            break
         if not _looks_like_text_encoder(entry):
             continue
         inner = getattr(entry, "model", None)
@@ -1562,6 +1576,19 @@ def execute(
             f"ComfyUI 官方只按 min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
             flush=True,
         )
+        _r3_info = (
+            model.model_options.get("route3_info")
+            if isinstance(getattr(model, "model_options", None), dict)
+            else None
+        )
+        if _r3_info:
+            print(
+                f"[HardCut]   Route 3 双流已挂载 (s_bg={_r3_info.get('s_bg')}, "
+                f"beta_scale={_r3_info.get('beta_scale', 1.0):.2f}, "
+                f"beta_max={_r3_info.get('beta_max', 0.0):.2f})："
+                f"上方负载代理为稠密上限，实际每步视频 token 约降至 50%~65%（依前景占比）。",
+                flush=True,
+            )
         # ── 运行期实测余量：**这才是能预测的**（2026-09-29 实证）───────────
         # 用成片反查发现：同一画布/同一窗长/同样稠密注意力，00072~00076 全部出片，
         # 而 09-29 那次崩 —— 静态几何量**分不开过与崩**。真约束在 host 侧：
@@ -1708,21 +1735,98 @@ def execute(
             else None
         )
 
-        sampled = _sample_fullframe(
-            core,
-            sampling,
-            chunk_video,
-            chunk_audio,
-            chunk_conditioning,
-            model,
-            noise,
-            sampler,
-            sigmas,
-            negative,
-            cfg,
-            chunk_noise_video,
-            chunk_noise_audio,
+        _t_win0 = time.perf_counter()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+
+        # 把当前窗口起点 start_token、相位感知硬切点 route3_cuts、硬切钉住锚点 route3_pin_tokens、
+        # Pass-1 上采样底图 route3_p1_up（供引擎内 Pass-1 引导流场残差轨迹）及光流缓存透传进 transformer_options：
+        _mopts = getattr(model, "model_options", None)
+        _topts = _mopts.setdefault("transformer_options", {}) if isinstance(_mopts, dict) else None
+        _r3_keys = (
+            "route3_start_token", "route3_cuts", "route3_pin_tokens",
+            "route3_p1_up", "route3_flow_cache", "route3_last_sigma",
         )
+        _prev_r3 = {k: (True, _topts[k]) if (isinstance(_topts, dict) and k in _topts) else (False, None)
+                    for k in _r3_keys}
+        if isinstance(_topts, dict):
+            _topts["route3_start_token"] = int(start_token)
+            try:
+                from .route3.assembly import (
+                    cut_pin_tokens as _r3_cut_pins,
+                    detect_latent_cuts as _detect_r3_cuts,
+                    motion_pin_tokens as _r3_motion_pins,
+                )
+                _p1_tchw = chunk_video[0].detach().float().permute(1, 0, 2, 3).contiguous()
+                _r3_cuts = _detect_r3_cuts(_p1_tchw)
+                _r3_s_bg = int((_mopts.get("route3_info") or {}).get("s_bg", 3)) if isinstance(_mopts, dict) else 3
+                _r3_fg_lat = None
+                _r3_fg_fn = _mopts.get("route3_fg_mask_fn") if isinstance(_mopts, dict) else None
+                if callable(_r3_fg_fn):
+                    try:
+                        _lt, _lh, _lw = int(chunk_video.shape[2]), int(chunk_video.shape[3]), int(chunk_video.shape[4])
+                        _gh, _gw = max(1, (_lh + 1) // 2), max(1, (_lw + 1) // 2)
+                        _m_patch = _r3_fg_fn(_lt, _gh * 2, _gw * 2, int(start_token))
+                        if _m_patch is not None:
+                            _r3_fg_lat = _m_patch.view(_lt, _gh, _gw).repeat_interleave(2, dim=1).repeat_interleave(2, dim=2)[:, :_lh, :_lw]
+                    except Exception:
+                        _r3_fg_lat = None
+                _c_pins = _r3_cut_pins(_r3_cuts, int(chunk_video.shape[2]), radius=1)
+                _m_pins = _r3_motion_pins(_p1_tchw, s_bg=_r3_s_bg, cuts=_r3_cuts, fg_mask=_r3_fg_lat)
+                _r3_pins = sorted(set(_c_pins) | set(_m_pins))
+                _topts["route3_cuts"] = _r3_cuts
+                _topts["route3_pin_tokens"] = _r3_pins
+                if _mopts.get("route3_info"):
+                    print(f"[HardCut]   Route 3 window: cuts={_r3_cuts}, cut_pins={_c_pins}, motion_pins={_m_pins} -> pin_tokens={_r3_pins}", flush=True)
+                del _p1_tchw
+            except Exception:
+                _topts["route3_cuts"] = []
+                _topts["route3_pin_tokens"] = []
+            try:
+                _p1_ref = chunk_video.detach()
+                _lf = getattr(getattr(model, "model", None), "latent_format", None)
+                if _lf is not None and hasattr(_lf, "process_in"):
+                    _p1_ref = _lf.process_in(_p1_ref)
+                _topts["route3_p1_up"] = _p1_ref.cpu()
+                _topts["route3_flow_cache"] = {}
+            except Exception:
+                _topts.pop("route3_p1_up", None)
+                _topts.pop("route3_flow_cache", None)
+            try:
+                _pos_s = sigmas.flatten().float()
+                _pos_s = _pos_s[_pos_s > 1e-6]
+                if _pos_s.numel() >= 2:
+                    _topts["route3_last_sigma"] = float(_pos_s[-1].item())
+                else:
+                    _topts.pop("route3_last_sigma", None)
+            except Exception:
+                _topts.pop("route3_last_sigma", None)
+        try:
+            sampled = _sample_fullframe(
+                core,
+                sampling,
+                chunk_video,
+                chunk_audio,
+                chunk_conditioning,
+                model,
+                noise,
+                sampler,
+                sigmas,
+                negative,
+                cfg,
+                chunk_noise_video,
+                chunk_noise_audio,
+            )
+        finally:
+            if isinstance(_topts, dict):
+                for _k, (_had, _val) in _prev_r3.items():
+                    if _had:
+                        _topts[_k] = _val
+                    else:
+                        _topts.pop(_k, None)
         if dump_latents:
             _w = len(segment_reports)
             _dump_av_latent(
@@ -1787,16 +1891,23 @@ def execute(
         # 为什么要量：8GB 卡上「显存峰值」恒等于卡容量（一直是满的，报它没意义），
         # 真正决定崩不崩的是 **host/pinned 峰值**（权重驻留是主要项）。有了这个数
         # 才能把"预计最高占用 XX GB"从猜变成标定。
+        _win_sec = round(time.perf_counter() - _t_win0, 2)
+        _win_alloc_peak_gb = None
+        _win_rsv_peak_gb = None
         try:
             import comfy.model_management as _mm2
             _pu = float(getattr(_mm2, "TOTAL_PINNED_MEMORY", 0)) / 2**30
             _pm = float(getattr(_mm2, "MAX_PINNED_MEMORY", 0)) / 2**30
-            _rsv = torch.cuda.memory_reserved() / 2**30
-            _maxa = torch.cuda.max_memory_allocated() / 2**30
+            _rsv = torch.cuda.memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
+            _maxa = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+            _maxr = torch.cuda.max_memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
+            _win_alloc_peak_gb = round(_maxa, 3)
+            _win_rsv_peak_gb = round(_maxr, 3)
             print(
                 f"[HardCut]   peak/mem: pinned {_pu:.1f}"
                 + (f"/{_pm:.1f} GiB (余 {_pm - _pu:.1f})" if _pm > 0 else " GiB")
-                + f" ｜ 显存 reserved {_rsv:.2f} / alloc-peak {_maxa:.2f} GiB",
+                + f" ｜ 本窗真峰值 alloc-peak {_maxa:.2f} / reserved-peak {_maxr:.2f} GiB"
+                + f" (现 reserved {_rsv:.2f}) ｜ sample {_win_sec:.1f}s",
                 flush=True,
             )
         except Exception:
@@ -1812,10 +1923,10 @@ def execute(
             try:
                 _free, _total = torch.cuda.mem_get_info()
                 print(
-                    f"[HardCut]   seg {len(segment_reports)} done: "
-                    f"alloc {torch.cuda.memory_allocated()/2**30:.2f}GB  "
-                    f"reserved {torch.cuda.memory_reserved()/2**30:.2f}GB  "
-                    f"device-free {_free/2**30:.2f}GB",
+                    f"[HardCut]   seg {len(segment_reports)} done ({_win_sec:.1f}s): "
+                    f"window-peak alloc {(_win_alloc_peak_gb or 0.0):.2f}GB / rsv {(_win_rsv_peak_gb or 0.0):.2f}GB  "
+                    f"now-alloc {torch.cuda.memory_allocated()/2**30:.2f}GB  "
+                    f"device-free(含缓存/他模) {_free/2**30:.2f}GB",
                     flush=True,
                 )
                 if _empty_between:
@@ -1832,6 +1943,9 @@ def execute(
                 "frames": [start_frame, end_frame],
                 "tokens": [start_token, end_token],
                 "length_frames": end_frame - start_frame,
+                "sample_sec": _win_sec,
+                "peak_alloc_gb": _win_alloc_peak_gb,
+                "peak_reserved_gb": _win_rsv_peak_gb,
             }
         )
 
@@ -1852,6 +1966,9 @@ def execute(
             },
         )
     output = {"samples": comfy.nested_tensor.NestedTensor((accumulated, audio))}
+    _r3_info_out = (getattr(model, "model_options", None) or {}).get("route3_info") if hasattr(model, "model_options") else None
+    if isinstance(_r3_info_out, dict) and _r3_info_out.get("last_step_dense"):
+        output["route3_last_step_dense"] = True
     upscaled_output = {
         "samples": comfy.nested_tensor.NestedTensor(
             (accumulated_up if accumulated_up is not None else accumulated.detach().cpu(),

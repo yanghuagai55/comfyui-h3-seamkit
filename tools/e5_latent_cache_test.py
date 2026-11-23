@@ -129,14 +129,21 @@ pt.unlink(missing_ok=True)
 import asyncio  # noqa: E402
 
 FPP = "MiniMaxH3HardCutFirstPassPlan"
-NEWEST = "green_screen_mode"            # 绿幕模式（最新新增，置于末位防老工作流错位）
+P2P = "MiniMaxH3HardCutPass2Plan"
 nodes = {n.define_schema().node_id: n.define_schema()
          for n in asyncio.run(pkg.comfy_entrypoint().get_node_list())}
-names = [i.id if hasattr(i, "id") else getattr(i, "name", None)
-         for i in nodes[FPP].inputs]
-ok7 = names[-1] == NEWEST
-print(f"  [{'PASS' if ok7 else 'FAIL'}] T7 最近新增控件在参数表末位"
-      f"（{FPP}.{NEWEST}）-> 老工作流不会错位")
+fpp_names = [i.id if hasattr(i, "id") else getattr(i, "name", None) for i in nodes[FPP].inputs]
+p2p_names = [i.id if hasattr(i, "id") else getattr(i, "name", None) for i in nodes[P2P].inputs]
+ok7 = (
+    "green_screen_mode" in fpp_names
+    and "use_cache" in fpp_names
+    and len(p2p_names) <= 10
+    and "seam_mode" in p2p_names
+    and "route3_enabled" in p2p_names
+    and "MiniMaxH3SeamRepairAll" not in nodes
+)
+print(f"  [{'PASS' if ok7 else 'FAIL'}] T7 精简版上下游规划 schema 与清理断言"
+      f" (FPP={len(fpp_names)} inp, P2P={len(p2p_names)} inp, total_nodes={len(nodes)})")
 if not ok7:
     fails.append("T7")
 try:

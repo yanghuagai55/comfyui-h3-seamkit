@@ -181,7 +181,7 @@ def _traces_to_node(wf, link, target_id, depth=0):
     return False
 
 
-def splice_pass2_assemble(wf, sampler_id, mask_path="", s_bg=5, method="flow", only_bg=True):
+def splice_pass2_assemble(wf, sampler_id, mask_path="", s_bg=3, method="lerp", only_bg=True):
     """把「一采 3D 上采样输出 (latent_p1_up)」和「二采输出 (latent_p2)」接入 MiniMaxH3Route3Assemble，
     并把所有下游对二采输出 [sampler_id, 0]（或下游 AVDecode.av_latent）的引用改指向 Assemble 节点。
 
@@ -256,8 +256,14 @@ def _bypass_model_node(wf, sid):
     return True
 
 
-def disable_tiling_and_sparse(wf, *, disable_tiling=True, disable_sol_attn=True, strip_lowvram=False):
-    """在 A100 Oracle/消融时按需关闭空间 tiling、SolAttn 稀疏近似，以及（可选）本地 8GB 低显存补丁。"""
+def disable_tiling_and_sparse(wf, *, disable_tiling=True, disable_sol_attn=True,
+                              strip_lowvram=False, keep_lowvram=False):
+    """在 A100 Oracle/消融时按需关闭空间 tiling、SolAttn 稀疏近似，以及（可选）本地 8GB 低显存补丁。
+
+    keep_lowvram=True：**保留** MiniMaxLowVRAMAttention / MiniMaxChunkFeedForward（8GB 真正在用的
+    分头/分块补丁），但仍然摘掉 MiniMaxH3MemoryEfficientSageAttentionPatch —— 后者需要本机装
+    sageattention，A100 环境没有，不摘会直接 execution_error。用于 8GB 同源回归（Step D）。
+    """
     notes = []
     if disable_tiling:
         for nid in find(wf, "GoohaiMinimaxH3TiledSampler"):
@@ -268,12 +274,18 @@ def disable_tiling_and_sparse(wf, *, disable_tiling=True, disable_sol_attn=True,
         for sid in list(find(wf, "SolAttnMiniMax")):
             if _bypass_model_node(wf, sid):
                 notes.append("sol_attn_bypassed:%s" % sid)
-    if strip_lowvram:
-        for cls in ("MiniMaxLowVRAMAttention", "MiniMaxChunkFeedForward",
-                    "MiniMaxH3MemoryEfficientSageAttentionPatch"):
+    if strip_lowvram or keep_lowvram:
+        classes = ("MiniMaxH3MemoryEfficientSageAttentionPatch",)
+        if strip_lowvram:
+            classes = ("MiniMaxLowVRAMAttention", "MiniMaxChunkFeedForward") + classes
+        for cls in classes:
             for sid in list(find(wf, cls)):
                 if _bypass_model_node(wf, sid):
-                    notes.append("lowvram_bypassed:%s(%s)" % (sid, cls))
+                    notes.append("bypassed:%s(%s)" % (sid, cls))
+        if keep_lowvram:
+            for cls in ("MiniMaxLowVRAMAttention", "MiniMaxChunkFeedForward"):
+                for sid in find(wf, cls):
+                    notes.append("kept:%s(%s)" % (sid, cls))
     return notes
 
 
@@ -292,6 +304,82 @@ def _write_prompt_node(wf, nid, text, depth=0):
             inp[key] = text
             return "%s.%s" % (nid, key)
     return None
+
+
+def bypass_node(wf, nid):
+    """把节点从图里摘掉：所有下游对它的引用改接它的 `model` 上游。"""
+    node = wf.get(nid)
+    if node is None:
+        return None
+    up = upstream(wf, node["inputs"].get("model"))
+    if up is None:
+        raise KeyError("node %s 没有 model 上游，不能旁路" % nid)
+    for other in wf.values():
+        for k, v in list(other.get("inputs", {}).items()):
+            if isinstance(v, list) and v and v[0] == nid:
+                other["inputs"][k] = list(up)
+    del wf[nid]
+    return up
+
+
+def prune_missing_loras(wf, available):
+    """把 lora_name 不在当前 ComfyUI 列表里的 LoraLoader* 节点旁路掉。
+
+    为什么要有这一步：工作流里常有已归档/未下载的 LoRA，提交时会在
+    `value_not_in_list` 上被整单拒绝，而这类 LoRA 多半只是画质微调。
+    旁路 = 摘掉节点并把下游接回上游，等价于 strength=0，但不会占显存。
+    """
+    avail = set(available or ())
+    dropped = []
+    for nid in [n for n in list(wf) if str(wf[n].get("class_type", "")).startswith("LoraLoader")]:
+        name = wf[nid].get("inputs", {}).get("lora_name")
+        if name and name not in avail:
+            try:
+                bypass_node(wf, nid)
+                dropped.append("%s:%s" % (nid, name))
+            except Exception as e:
+                dropped.append("%s:%s(FAIL %s)" % (nid, name, e))
+    return dropped
+
+
+def autofix_combos(wf, cli):
+    """把「值不在下拉选项里、且该下拉只有一个选项」的输入自动改过去。
+
+    为什么只改唯一选项：`unet_name`/`vae_name` 这类有多个候选，盲改会把底模换掉。
+    只有「唯一选项」才等价于「本来就没得选」，改它一定安全。
+    """
+    cache, fixed = {}, []
+    for nid, node in wf.items():
+        ct = node.get("class_type")
+        if ct not in cache:
+            try:
+                cache[ct] = cli._get("/object_info/" + urllib.parse.quote(ct), timeout=15).get(ct, {})
+            except Exception:
+                cache[ct] = {}
+        req = cache[ct].get("input", {}).get("required", {})
+        for k, v in list(node.get("inputs", {}).items()):
+            if not isinstance(v, str) or k not in req:
+                continue
+            spec = req[k]
+            opts = None
+            if isinstance(spec, list) and spec:
+                if isinstance(spec[0], list):
+                    opts = spec[0]
+                elif spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+                    opts = spec[1].get("options")
+            if not opts or v in opts or len(opts) != 1:
+                continue
+            node["inputs"][k] = opts[0]
+            fixed.append("%s.%s: %s -> %s" % (nid, k, v, opts[0]))
+    return fixed
+
+
+def lora_names(cli):
+    try:
+        info = cli._get("/object_info/LoraLoaderModelOnly", timeout=20)
+        return info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0]
+    except Exception:
+        return []
 
 
 def patch_prompt(wf, text, nodes=None):
@@ -432,6 +520,22 @@ def set_pass_megapixels(wf, first=None, second=None):
             wf[nid]["inputs"]["megapixels"] = float(second)
             touched.append("%s.rs=%.2f" % (nid, second))
     return touched
+
+
+def patch_segment_seconds(wf, seconds):
+    """设每段最长秒数（`target_segment_seconds`）—— 这是**硬红线**，不是参照。
+
+    规划器按 `cap = floor(target*24/17)*17 - overlap(17)` 反推段数 n = ceil(total/cap)，
+    红线内放不下就**报错**而不是偷偷多切。所以：
+      * 想让 15s 变成 1 窗：target ≥ 16.29s（362 帧 + 17 overlap 需 23 格网格）
+      * 2 窗：target ≈ 9.0s（cap 187 ≥ 181）
+      * 4 窗：target = 5.0s（cap 102 → n=4）
+    """
+    hit = []
+    for nid in find(wf, "MiniMaxH3HardCutFirstPassPlan"):
+        wf[nid]["inputs"]["target_segment_seconds"] = float(seconds)
+        hit.append("%s.seg=%.2fs" % (nid, float(seconds)))
+    return hit
 
 
 def patch_megapixels(wf, mp):

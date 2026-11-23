@@ -145,9 +145,10 @@ def t_split_geometry():
           "fg=%d bg=%d" % (fg.fg_local.numel(), fg.bg_local.numel()))
 
     # 人物占 24% 画面（14/23 行 x 16/40 列）
+    from route3.splitstream_attn import bg_anchor_indices
     m = torch.zeros(T, gh, gw, dtype=torch.bool)
     m[:, 4:18, 12:28] = True
-    p = route3_plan(1000, T, 46, 80, S, fg_mask=m.reshape(T, -1))
+    p = route3_plan(1000, T, 46, 80, S, fg_mask=m.reshape(T, -1), phase_aware=False)
     n_fg, n_bg = int(p.fg_local.numel()), int(p.bg_local.numel())
     kept = n_fg + n_bg
     n_anchor = len(range(0, T, S))
@@ -155,11 +156,68 @@ def t_split_geometry():
     ok = (n_fg == T * per_frame_fg
           and n_bg == n_anchor * (gh * gw - per_frame_fg)
           and kept == 13856)
-    check("24%% 前景 / S_bg=5 → 保持 13856/34040（降 59%%）", ok,
+    check("24%% 前景 / S_bg=5 (纯等距) → 保持 13856/34040（降 59%%）", ok,
           "fg=%d bg=%d kept=%d" % (n_fg, n_bg, kept))
     check("route3_plan 的 n_full / beta0",
           p.n_full == 1000 + n_fg and abs(p.beta0 - math.log(T / n_anchor)) < 1e-6,
           "n_full=%d beta0=%.3f" % (p.n_full, p.beta0))
+
+    # I/P 相位感知锚点 + 严格分池质量守恒（2026-11-23 绿幕 6Hz 锯齿根治回归）：
+    # s_bg=3 必须：
+    #   1. 100% 保留全部 p=0 I-token（放入 branch1，β_I=0，绝不 2.31× 过权！）
+    #   2. P 池跨全部 4 个 P 相位 {1,2,3,4} 均匀抽样（含首尾 t=1,36），β_P = ln(29/11) = 0.969
+    #   3. 注意力 I:P 有效质量比严格等于原生稠密 8:29 (21.6%:78.4%)！
+    anc3 = bg_anchor_indices(37, s_bg=3, phase_aware=True)
+    all_i = list(range(0, 37, 5))
+    p_anc3 = [t for t in anc3 if t % 5 != 0]
+    p_phases = {t % 5 for t in p_anc3}
+    check("s_bg=3 相位感知：100%% 保留 I-token 且 P 锚覆盖全部 4 个 P 相位 {1,2,3,4}",
+          all(i in anc3 for i in all_i) and p_phases == {1, 2, 3, 4} and 1 in p_anc3 and 36 in p_anc3,
+          "n=%d p_anc=%s" % (len(anc3), p_anc3))
+    p3 = route3_plan(1000, T, 46, 80, 3, fg_mask=m.reshape(T, -1), phase_aware=True)
+    bg_per_frame = gh * gw - per_frame_fg
+    n_p_total = T - len(all_i)
+    # 局部质量守恒：t=36 紧邻 t=34（中间 t=35 为 I-token），左右均无被删 P-token，归入 branch1 (1.0×)
+    n_b1_p3 = 1  # {36}
+    n_b2_p3 = len(p_anc3) - n_b1_p3  # 10
+    expect_beta_p = math.log((n_p_total - n_b1_p3) / n_b2_p3)
+    expect_n_full_p3 = 1000 + int(p3.fg_local.numel()) + (len(all_i) + n_b1_p3) * bg_per_frame
+    check("s_bg=3 局部质量守恒：未压缩 I-BG 与无被删邻近的尾帧 P(36) 归入 branch1，仅真压缩 P-BG 乘 β_P",
+          p3.n_full == expect_n_full_p3
+          and abs(p3.beta0 - expect_beta_p) < 1e-6,
+          "n_full=%d (expect %d) beta_P=%.4f" % (p3.n_full, expect_n_full_p3, p3.beta0))
+
+    # 硬切钉住 pin_tokens=[16,17,18,19]：{17,18,36} 均无被删 P 邻近，归入 branch1 (β=0)，总 P 质量严格等于 29！
+    p3_pin = route3_plan(1000, T, 46, 80, 3, fg_mask=m.reshape(T, -1), phase_aware=True,
+                         pin_tokens=[16, 17, 18, 19])
+    n_b1_pin = 3  # 17, 18, 36
+    n_b2_pin = 10
+    expect_n_full_pin = 1000 + int(p3_pin.fg_local.numel()) + (len(all_i) + n_b1_pin) * bg_per_frame
+    total_p_mass = n_b1_pin * 1.0 + n_b2_pin * math.exp(p3_pin.beta0)
+    check("pin_tokens=[16..19] 硬切钉住：无被删邻近 P-锚进 branch1 且总 P 注意力质量严格守恒 (==29.0)",
+          p3_pin.n_full == expect_n_full_pin
+          and abs(total_p_mass - float(n_p_total)) < 1e-5
+          and 17 in p3_pin.anchors and 18 in p3_pin.anchors,
+          "n_full=%d mass=%.4f beta_P=%.4f" % (p3_pin.n_full, total_p_mass, p3_pin.beta0))
+
+    # 高速运镜全量钉住 Shot 1 (t=0..18) + 静止压缩 Shot 2 (t=19..36)：
+    # Shot 1 全部 14 个 P-token 必须同在 branch1 (精确 1.0×，零 1.8x/1.0x 锯齿！)，
+    # Shot 2 仅 {19,23,27,31,34} 留在 branch2 (β=ln(13/5)=0.9555)，Shot 1 与 Shot 2 总质量双双守恒！
+    shot1_dense_pins = [2, 3, 6, 7, 9, 11, 13, 14, 16, 17, 18, 19]
+    p3_dense_s1 = route3_plan(1000, T, 46, 80, 3, fg_mask=m.reshape(T, -1), phase_aware=True,
+                              pin_tokens=shot1_dense_pins)
+    n_b1_s1 = 16  # 1..18 全部 14 个 P + 36（15 个？等：1,2,3,4,6,7,8,9,11,12,13,14,16,17,18 共 15 个 + 36 = 16）
+    n_b2_s2 = 5   # 19, 23, 27, 31, 34
+    expect_n_full_s1 = 1000 + int(p3_dense_s1.fg_local.numel()) + (len(all_i) + n_b1_s1) * bg_per_frame
+    expect_beta_s2 = math.log(13.0 / 5.0)
+    s1_p_mass = 15 * 1.0  # t=1..18 全部在 branch1
+    s2_p_mass = 1 * 1.0 + n_b2_s2 * math.exp(p3_dense_s1.beta0)  # t=36 + 5 个 branch2
+    check("Shot1全稠密+Shot2压缩：Shot1全员1.0×零邻近权重振荡，Shot2质量严格守恒 (14/14)",
+          p3_dense_s1.n_full == expect_n_full_s1
+          and abs(p3_dense_s1.beta0 - expect_beta_s2) < 1e-6
+          and abs(s1_p_mass - 15.0) < 1e-5
+          and abs(s2_p_mass - 14.0) < 1e-5,
+          "n_full=%d beta=%.4f s1=%.2f s2=%.2f" % (p3_dense_s1.n_full, p3_dense_s1.beta0, s1_p_mass, s2_p_mass))
 
 
 def t_phase():

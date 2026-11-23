@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 __all__ = [
     "attn_lse", "merge_lse", "splitstream_attention",
-    "video_split", "route3_plan", "provider_report",
+    "bg_anchor_indices", "video_split", "route3_plan", "provider_report",
     "PHASES", "phase_of_rows", "beta_for_sequence", "warmup",
     "reset_provider", "MAX_PHASE_DT",
 ]
@@ -247,7 +247,66 @@ def beta_for_sequence(beta_lhp, layer: int, phase_full: torch.Tensor):
 
 
 
-def video_split(latent_t: int, gh: int, gw: int, s_bg: int = 5, fg_mask=None):
+def bg_anchor_indices(latent_t: int, s_bg: int = 3, phase_aware: bool = True,
+                      pin_tokens=None) -> list[int]:
+    """返回背景锚点的 latent token 下标（升序，唯一真相源：引擎与重装共用）。
+
+    为什么必须做 I/P 相位感知对齐（2026-11-23 绿幕实片 exp_4v10a_00003 实证）：
+      H3 3D Video VAE 按每 5 token = 17 帧分组，FRAME_PER_TOKEN = (1, 4, 4, 4, 4)：
+      * p = 0 (t % 5 == 0) 是 1 帧独立 I-token（重置因果状态，通道均值/方差与 P-token 迥异）；
+      * p ∈ {1,2,3,4}      是 4 帧因果 P-token。
+      实测丢弃 p=0 并用邻近 P-token 插值（P→I）会在 f17/34/68/85/119 整圈人物边缘爆出亮绿白光晕，
+      而把 I-token 混进邻近 P-token（I→P）会在 f50/52/101/103 产生暗边缘污影。
+
+    对齐策略（latent_t >= 5 且 phase_aware=True）：
+      * s_bg <= 0 或 >= latent_t ：[0]（静机位单帧档）
+      * s_bg == 1                ：全部帧（0% 压缩等价自检）
+      * s_bg >= 2                ：100% 保留全部 p=0 I-token（放入 branch1 零压缩、β_I=0，彻底保住原生 20%:80% I/P 质量守恒，
+                                    杜绝 I-key 过权导致 4 帧锯齿明度频闪与 17k 边缘光晕）；
+                                    P-pool (p∈{1,2,3,4}) 内部跨相位均匀抽样（如 s_bg=3 走 p_all[::3] 覆盖全部 4 个 P 相位，
+                                    最大 P 间距 3~4、含首尾 P 锚零外推，β_P = ln(N_P_dense/N_P_kept) ≈ 0.969）。
+      * pin_tokens（可选）        ：硬切边界及其跨镜过渡 token（如 {c-1, c, c+1}）强制钉为全速率锚点，
+                                    避免跨镜头 token 被删后在因果 3D VAE 组内引发 17 帧跨镜叠影！
+    """
+    T = int(latent_t)
+    if T <= 0:
+        return []
+    pins = {int(t) for t in (pin_tokens or ()) if 0 <= int(t) < T}
+    if s_bg <= 0 or s_bg >= T:
+        return sorted({0} | pins)
+    if s_bg == 1:
+        return list(range(T))
+    if (not phase_aware) or T < PHASES:
+        return sorted(set(range(0, T, int(s_bg))) | pins)
+
+    i_all = list(range(0, T, PHASES))
+    p_all = [t for t in range(T) if t % PHASES != 0]
+    if not p_all:
+        return sorted(set(i_all) | pins)
+
+    if s_bg == 2:
+        p_keep = p_all[::2]
+    elif s_bg == 3:
+        # gcd(3, 4) == 1：跨全部 4 个 P 相位 (1,4,3,2) 均匀轮转，T=37 共 11 个 P 锚 (β_P=0.969)，最大间距 3~4！
+        p_keep = p_all[::3]
+    else:
+        # s_bg >= 4：按目标数量在 P 池均匀取点（避免 s_bg=4 与 4 相位整除只命中 p=1）
+        n_p = max(2, int(round(len(p_all) / float(s_bg))) + (1 if s_bg == 4 else 0))
+        n_p = min(len(p_all), n_p)
+        if n_p >= len(p_all):
+            p_keep = list(p_all)
+        else:
+            p_keep = sorted(set(
+                p_all[int(round(k * (len(p_all) - 1) / float(max(1, n_p - 1))))]
+                for k in range(n_p)
+            ))
+    if p_keep[-1] != p_all[-1]:
+        p_keep = list(p_keep) + [p_all[-1]]
+    return sorted(set(i_all) | set(p_keep) | pins)
+
+
+def video_split(latent_t: int, gh: int, gw: int, s_bg: int = 3, fg_mask=None,
+                phase_aware: bool = True, pin_tokens=None):
     """视频段内部的行划分：**必须给前景掩码，否则不会有任何压缩**。
 
     参数
@@ -255,15 +314,8 @@ def video_split(latent_t: int, gh: int, gw: int, s_bg: int = 5, fg_mask=None):
     fg_mask : [latent_t, gh*gw] 或 [latent_t*gh*gw] 的 bool。True = 前景，全速率保留。
               **None 等价于「整帧都是前景」→ 一行都删不掉**（这是有意的诚实默认值，
               不做「假装压缩了」的事）。
-    s_bg    : 每隔几个 latent token 留一个 BG 锚点帧（H3 里 5 token = 17 像素帧）。
-
-    规则
-    ----
-    前景行：全部帧保留；
-    背景行：
-      * s_bg == 1：每帧都保留（0% 压缩，用于与原生 forward 做逐位等价自检）；
-      * s_bg <= 0 或 s_bg >= latent_t：静机位单帧档（T_bg = 1），仅保留第 0 帧背景；
-      * 1 < s_bg < latent_t：多速率关键帧档，仅在锚点帧（t % s_bg == 0）保留。
+    s_bg    : 背景锚点压缩档位（3 = 默认推荐：全留 p=0 I-token + 跨 4 个 P 相位均匀抽样）。
+    pin_tokens : 强制全速率保留的额外 token 下标（如硬切边界 {c-1, c, c+1}）。
 
     返回 (fg_local, bg_local)：视频段内的行下标（0 = 第一帧第一行）。
     """
@@ -279,10 +331,11 @@ def video_split(latent_t: int, gh: int, gw: int, s_bg: int = 5, fg_mask=None):
             raise ValueError("fg_mask 大小 %d != %d" % (m.numel(), rows))
         is_fg = m.to(torch.bool).cpu()   # 行号/掩码一律留 CPU，省显存也省同步
 
-    if s_bg <= 0 or s_bg >= latent_t:
-        is_anchor = (t_of_row == 0)
-    else:
-        is_anchor = (t_of_row % s_bg == 0)
+    anchors = bg_anchor_indices(latent_t, s_bg, phase_aware=phase_aware, pin_tokens=pin_tokens)
+    anc_mask_t = torch.zeros(latent_t, dtype=torch.bool)
+    if anchors:
+        anc_mask_t[anchors] = True
+    is_anchor = anc_mask_t[t_of_row]
     keep = is_fg | is_anchor
     fg = (keep & is_fg).nonzero(as_tuple=True)[0]
     bg = (keep & ~is_fg).nonzero(as_tuple=True)[0]
@@ -297,20 +350,22 @@ class Route3Plan:
     fg_local: torch.Tensor
     bg_local: torch.Tensor
     s_bg: int
-    n_full: int            # branch1 键数 = prefix_end + len(fg)  —— 前提是布局按 [Prefix|FG|BG]
+    n_full: int            # branch1 键数 = prefix_end + len(fg) + 未压缩 I-BG/钉住硬切 P-BG
     beta0: float
     phase: Optional[torch.Tensor] = None   # 每个视频行的组内相位 0..4
+    anchors: Optional[list[int]] = None    # 全部完整保留的锚点 token 下标（含硬切钉住点）
 
     def to_dict(self):
         return {"prefix_end": self.prefix_end, "video_start": self.video_start,
                 "video_rows": self.video_rows, "fg": int(self.fg_local.numel()),
                 "bg": int(self.bg_local.numel()), "s_bg": self.s_bg,
                 "n_full": self.n_full, "beta0": round(self.beta0, 4),
-                "phases": PHASES, "max_phase_dt": round(MAX_PHASE_DT, 3)}
+                "phases": PHASES, "max_phase_dt": round(MAX_PHASE_DT, 3),
+                "n_anchors": len(self.anchors) if self.anchors is not None else 0}
 
     def full_phase(self):
         """整条序列的相位（prefix 段记 0）。顺序与 [Prefix|FG|BG] 一致，供 beta_for_sequence 用。"""
-        s = self.n_full + int(self.bg_local.numel())
+        s = self.prefix_end + int(self.fg_local.numel()) + int(self.bg_local.numel())
         out = torch.zeros(s, dtype=torch.long)
         kept = torch.cat([self.phase[self.fg_local], self.phase[self.bg_local]])
         out[self.prefix_end:self.prefix_end + kept.numel()] = kept
@@ -318,26 +373,64 @@ class Route3Plan:
 
 
 def route3_plan(prefix_end: int, latent_t: int, lat_h: int, lat_w: int,
-                s_bg: int = 5, ring: int = 0, fg_mask=None):
-    """构造一个 plan。
+                s_bg: int = 3, ring: int = 0, fg_mask=None, phase_aware: bool = True,
+                pin_tokens=None):
+    """构造一个 plan（严格分池质量守恒 + 硬切边界 token 全速率钉住）。
 
-    注意：本函数只给「几何划分 + 建议的键切点」，真正重排序列由上层完成 ——
-    上层必须把视频行重排成 [FG_full | BG_strided]，n_full 才成立。
-    ring: FG 掩码外扩格数（在 mask→plan 那一层用，这里只记 beta 初值）。
+    关键修正（2026-11-23）：
+      * 未压缩的 p=0 I-token 与硬切边界额外钉住的 P-token（extra_p_pins）归入 branch1 (β=0)；
+      * 仅被抽帧压缩的常规 P-token 留在 branch2，且 β_P = ln((N_P_dense - N_P_pin) / N_P_b2)，
+        精确保持原生 I : P = 20% : 80% 与总 P 质量守恒，零过权！
     """
     gh, gw = lat_h // 2, lat_w // 2
-    fg, bg = video_split(latent_t, gh, gw, s_bg, fg_mask=fg_mask)
-    # BG 被压缩多少倍，就补回多少质量（Stage 2 再按 layer/head/相位 校准）
+    p_per_frame = gh * gw
+    fg, bg = video_split(latent_t, gh, gw, s_bg, fg_mask=fg_mask,
+                         phase_aware=phase_aware, pin_tokens=pin_tokens)
+    base_anchors = bg_anchor_indices(latent_t, s_bg, phase_aware=phase_aware, pin_tokens=None)
+    anchors = bg_anchor_indices(latent_t, s_bg, phase_aware=phase_aware, pin_tokens=pin_tokens)
+    i_all = list(range(0, latent_t, PHASES))
+    p_all = [t for t in range(latent_t) if t % PHASES != 0]
+    all_i_kept = (phase_aware and latent_t >= PHASES and s_bg > 1 and s_bg < latent_t
+                  and all(i in anchors for i in i_all) and len(p_all) > 0)
+
     if s_bg == 1 or fg_mask is None:
-        n_keep = latent_t
         beta0 = 0.0
-    elif s_bg <= 0 or s_bg >= latent_t:
-        n_keep = 1
-        beta0 = math.log(max(1.0, float(latent_t)))
+        n_full = prefix_end + int(fg.numel())
+    elif all_i_kept:
+        p_kept = [t for t in anchors if t % PHASES != 0]
+        p_kept_set = set(p_kept)
+        # 局部 Voronoi 质量守恒：只有紧邻至少一个「被丢弃 P-token」的 P-锚点才真正代表多帧压缩区间，
+        # 放入 branch2 乘 β_P；而在局部全稠密区（左右相邻 P-token 均被保留，如高速运镜钉住段 Shot 1、
+        # 硬切钉住点以及紧贴 p_all[-2]=34 的尾帧 36）的 P-token 真实权重就是 1.0，必须归入 branch1 (β=0)，
+        # 彻底消灭同镜头内相邻 token 间 1.8x vs 1.0x 权重锯齿振荡以及跨镜头总质量偏斜！
+        b2_p_set = set()
+        for idx, t in enumerate(p_all):
+            if t not in p_kept_set:
+                continue
+            left_drop = (idx > 0) and (p_all[idx - 1] not in p_kept_set)
+            right_drop = (idx + 1 < len(p_all)) and (p_all[idx + 1] not in p_kept_set)
+            if left_drop or right_drop:
+                b2_p_set.add(t)
+        b1_p_set = p_kept_set - b2_p_set
+        bg_t = bg // p_per_frame
+        is_full_bg = (bg_t % PHASES) == 0
+        if b1_p_set:
+            b1_mask_t = torch.zeros(latent_t, dtype=torch.bool)
+            for pt in b1_p_set:
+                b1_mask_t[pt] = True
+            is_full_bg = is_full_bg | b1_mask_t[bg_t]
+        bg_full = bg[is_full_bg]
+        bg_comp = bg[~is_full_bg]
+        bg = torch.cat([bg_full, bg_comp])
+        n_p_b2 = max(1, len(b2_p_set))
+        n_p_rem = max(n_p_b2, len(p_all) - len(b1_p_set))
+        beta0 = math.log(max(1.0, float(n_p_rem) / float(n_p_b2))) if bg_comp.numel() > 0 else 0.0
+        n_full = prefix_end + int(fg.numel()) + int(bg_full.numel())
     else:
-        n_keep = math.ceil(latent_t / s_bg)
-        beta0 = math.log(max(1.0, latent_t / n_keep))
+        n_keep = max(1, len(anchors))
+        beta0 = math.log(max(1.0, float(latent_t) / float(n_keep)))
+        n_full = prefix_end + int(fg.numel())
     return Route3Plan(prefix_end=prefix_end, video_start=prefix_end,
-                      video_rows=latent_t * gh * gw, fg_local=fg, bg_local=bg,
-                      s_bg=s_bg, n_full=prefix_end + int(fg.numel()), beta0=beta0,
-                      phase=phase_of_rows(latent_t, gh, gw))
+                      video_rows=latent_t * p_per_frame, fg_local=fg, bg_local=bg,
+                      s_bg=s_bg, n_full=n_full, beta0=beta0,
+                      phase=phase_of_rows(latent_t, gh, gw), anchors=anchors)

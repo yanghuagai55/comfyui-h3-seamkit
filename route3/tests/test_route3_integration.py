@@ -245,6 +245,60 @@ def main():
                   and loc1[loc_asm[0]]["inputs"]["latent_p2"] == ["40", 0]
                   and loc1["16"]["inputs"]["av_latent"] == [loc_asm[0], 0])
 
+        # 9. MiniMaxH3Route3Assemble 默认 method="lerp" 且 Route3Apply 加载 0D/3D beta_path 不抛格式错
+        from route3.nodes import MiniMaxH3Route3Apply, MiniMaxH3Route3Assemble
+        asm_schema = MiniMaxH3Route3Assemble.define_schema()
+        method_inp = next(i for i in asm_schema.inputs if i.id == "method")
+        check("MiniMaxH3Route3Assemble 默认 method 已切为 lerp",
+              method_inp.default == "lerp" and "flow" in method_inp.options,
+              "default=%r options=%r" % (method_inp.default, method_inp.options))
+
+        class _DummyMP:
+            def __init__(self):
+                self.model_options = {}
+                self._dm = type("_DM", (), {"forward": lambda self, *a, **k: a})()
+            def clone(self):
+                c = _DummyMP()
+                c.model_options = dict(self.model_options)
+                return c
+            def get_model_object(self, name):
+                return self._dm
+            def add_object_patch(self, name, fn):
+                self._patched = fn
+
+        b0_path = os.path.join(td, "beta0d.pt")
+        b3_path = os.path.join(td, "beta3d.pt")
+        torch.save({"beta": torch.tensor(1.046)}, b0_path)
+        torch.save({"beta": torch.full((50, 56, 5), 1.046)}, b3_path)
+        mp_res0 = MiniMaxH3Route3Apply.execute(_DummyMP(), s_bg=4, beta_path=b0_path, beta_scale=0.8, beta_max=1.05)[0]
+        mp_res3 = MiniMaxH3Route3Apply.execute(_DummyMP(), s_bg=4, beta_path=b3_path, beta_scale=1.0, beta_max=1.05)[0]
+        check("MiniMaxH3Route3Apply 加载 0D/3D 张量 beta_path 无格式错且写入 route3_info",
+              mp_res0.model_options.get("route3_info", {}).get("beta_max") == 1.05
+              and mp_res0.model_options.get("route3_info", {}).get("beta_scale") == 0.8
+              and mp_res3.model_options.get("route3_info", {}).get("s_bg") == 4)
+
+        # 10. 多窗 start_token 切片回归：10s (243f / 72 tok) 第2窗必须读到 Shot2 掩码而非 Shot1！
+        from route3.mask_provider import MaskProvider
+        m_2shot = torch.zeros(243, 16, 16, dtype=torch.bool)
+        m_2shot[:122, :8, :8] = True      # Shot 1: 左上角前景
+        m_2shot[122:, 8:, 8:] = True      # Shot 2: 右下角前景
+        prov2 = MaskProvider(m_2shot)
+        g_win0 = prov2.for_grid(37, 16, 16, start_token=0).view(37, 8, 8)
+        g_win1 = prov2.for_grid(37, 16, 16, start_token=35).view(37, 8, 8)
+        check("多窗 start_token=35 精确切到 Shot2 右下角掩码（不复读 Shot1）",
+              bool(g_win0[10, 1, 1].item()) is True and bool(g_win0[10, 6, 6].item()) is False
+              and bool(g_win1[10, 6, 6].item()) is True and bool(g_win1[10, 1, 1].item()) is False)
+
+        # 11. last_step_dense 回归：Route3Apply 写入标记 + Assemble 自动直通不覆盖末步精修
+        mp_lsd = MiniMaxH3Route3Apply.execute(_DummyMP(), s_bg=3, last_step_dense=True)[0]
+        lat_lsd = dict(lat_b)
+        lat_lsd["route3_last_step_dense"] = True
+        asm_lsd = MiniMaxH3Route3Assemble.execute(lat_a, lat_lsd, s_bg=3, method="lerp", only_bg=True, mask_path=mp)[0]
+        ov_lsd, _ = asm_lsd["samples"].unbind()
+        check("last_step_dense 写入 route3_info 且 Assemble 检测到后自动直通原 latent_p2",
+              mp_lsd.model_options.get("route3_info", {}).get("last_step_dense") is True
+              and (ov_lsd - vid_b).abs().max().item() < 1e-6)
+
     print("\n%d 项失败%s" % (len(FAIL), (": " + ", ".join(FAIL)) if FAIL else ""))
     return 1 if FAIL else 0
 

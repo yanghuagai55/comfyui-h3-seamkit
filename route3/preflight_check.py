@@ -50,7 +50,8 @@ def check_env():
     name = torch.cuda.get_device_name(0)
     total = torch.cuda.get_device_properties(0).total_memory / 1e9
     add("GPU 是 A100", "A100" in name, "%s / %.1f GB" % (name, total), fatal=False)
-    add("显存 >= 75GB", total >= 75, "%.1f GB" % total)
+    add("显存 >= 36GB（40G 档可用，二采 1.3MP 需实测）", total >= 36,
+        "%.1f GB" % total, fatal=False)
     add("主机内存 >= 64GB", os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9 >= 64,
         "%.0f GB" % (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9), fatal=False)
 
@@ -203,7 +204,8 @@ def check_models(allow_mismatch=False):
                 from safetensors import safe_open
                 with safe_open(dm, framework="pt", device="cpu") as f:
                     sh = f.get_slice(k).get_shape()
-                info["inner"], info["hidden"] = int(sh[0]), int(sh[1])
+                # Linear(inner -> hidden) 的 weight 是 [out=hidden, in=inner]
+                info["hidden"], info["inner"] = int(sh[0]), int(sh[1])
             except Exception:
                 pass
             break
@@ -272,7 +274,7 @@ def check_disk(work_root):
 def check_comfy():
     print("=== 6. ComfyUI ===")
     comfy = "/content/ComfyUI"
-    add("ComfyUI 目录", os.path.isdir(os.path.join(comfy, "main.py")), comfy)
+    add("ComfyUI 目录", os.path.isfile(os.path.join(comfy, "main.py")), comfy)
     try:
         out = subprocess.run("git -C %s log -1 --format=%%h" % comfy, shell=True,
                              capture_output=True, text=True, timeout=20).stdout.strip()
@@ -307,9 +309,9 @@ def check_net():
     print("=== 7. 云端自取直链 ===")
     for name, url in NET_ITEMS.items():
         try:
-            out = subprocess.run(
-                "curl -sIL --max-time 20 -o /dev/null -w '%{http_code} %{size_download} %{url_effective}' '%s'"
-                % url, shell=True, capture_output=True, text=True, timeout=30).stdout.split()
+            fmt = "curl -sIL --max-time 20 -o /dev/null -w '%{http_code}' '" + url + "'"
+            out = subprocess.run(fmt, shell=True, capture_output=True, text=True,
+                                 timeout=30).stdout.split()
             code = out[0] if out else "000"
             add(name, code in ("200", "302"), "HTTP %s" % code, fatal=False,
                 extra={"url": url})

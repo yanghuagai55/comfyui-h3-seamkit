@@ -87,18 +87,20 @@ except Exception as e:
     check("绿幕模式直接放行提示词", False, f"异常: {e}")
 
 
-print("\n=== E-6.2 校验器节点免检测试 ===")
+print("\n=== E-6.2 精简版 Pass2Plan seam_mode 适配测试 ===")
 
 try:
-    # 构造绿幕 plan 传给 MiniMaxH3HardCutValidate
-    validate_res = nodes.MiniMaxH3HardCutValidate.execute(
-        prompt=prompt_free,
-        plan=plan,
-    )
-    val_prompt = validate_res[0]
-    check("校验器节点直接通过绿幕提示词", val_prompt == prompt_free)
+    p2_auto = nodes.MiniMaxH3HardCutPass2Plan.execute(seam_mode="auto")[0]
+    p2_hc = nodes.MiniMaxH3HardCutPass2Plan.execute(seam_mode="hard_cut")[0]
+    p2_ov = nodes.MiniMaxH3HardCutPass2Plan.execute(seam_mode="smooth_overlap")[0]
+    check("Pass2Plan seam_mode=auto 默认关闭 seam_blend 且开启 route3_enabled",
+          p2_auto["calm_policy"] == "auto" and p2_auto["seam_blend"] is False and p2_auto["route3_enabled"] is True)
+    check("Pass2Plan seam_mode=hard_cut 强制 overlap=0 且 jerk_hardcut",
+          p2_hc["overlap_frames"] == 0 and p2_hc["calm_policy"] == "jerk_hardcut")
+    check("Pass2Plan seam_mode=smooth_overlap 强制 overlap>=17 且 calm_overlap",
+          p2_ov["overlap_frames"] >= 17 and p2_ov["calm_policy"] == "calm_overlap")
 except Exception as e:
-    check("校验器节点直接通过绿幕提示词", False, f"异常: {e}")
+    check("Pass2Plan seam_mode 映射测试", False, f"异常: {e}")
 
 
 print("\n=== E-6.3 find_calm_boundaries 绿幕模式测试 ===")

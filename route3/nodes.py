@@ -20,10 +20,11 @@ import torch
 
 from comfy_api.latest import io
 
-from .assembly import reconstruct_moving, reconstruct_static
+from .assembly import cut_pin_tokens, detect_latent_cuts, motion_pin_tokens, reconstruct_moving, reconstruct_static
 from .mask_provider import load_mask, save_mask
 from .masks import active_mask, auto_fg_mask
 from .patch import Route3State, install
+from .splitstream_attn import bg_anchor_indices
 
 CATEGORY = "MiniMaxH3/route3"
 
@@ -58,16 +59,23 @@ class MiniMaxH3Route3Apply(io.ComfyNode):
             inputs=[
                 io.Model.Input("model"),
                 io.String.Input("mask_path", default="", tooltip="mask .npz 路径；留空 = 直通（等价性 smoke）"),
-                io.Int.Input("s_bg", default=5, min=0, max=64, step=1,
-                             tooltip="0 = 静机位单帧 BG (T_bg=1)；1 = 0% 压缩对照；5 = 每 17 帧 1 锚点"),
+                io.Int.Input("s_bg", default=3, min=0, max=64, step=1,
+                             tooltip="0 = 静机位单帧 BG (T_bg=1)；1 = 0% 压缩对照；3 = 推荐甜点(A100 3/3全过)；≥4易出锚点色斑"),
                 io.String.Input("beta_path", default="", tooltip="splitstream_gates.pt；留空自动用 beta0=log(T/n_keep)"),
                 io.Boolean.Input("enabled", default=True),
+                io.Float.Input("beta_scale", default=1.0, min=0.0, max=2.0, step=0.05, optional=True,
+                               tooltip="对有效 beta 乘以缩放系数（默认 1.0；可压低过大 beta0，如 0.75）"),
+                io.Float.Input("beta_max", default=0.0, min=0.0, max=5.0, step=0.05, optional=True,
+                               tooltip="有效 beta 上限钳位；0.0 = 不钳位；>0 时按 min(beta, beta_max) 截断（例 1.05）"),
+                io.Boolean.Input("last_step_dense", default=True, optional=True,
+                                 tooltip="末步全稠密收尾（默认开启）：前 N-1 步 Route 3 压缩提速，最后 1 步自动回切全稠密（+SageAttention）联合细化全帧背景，彻底消除复杂实景背景呼吸跳变"),
             ],
             outputs=[io.Model.Output(display_name="model")],
         )
 
     @classmethod
-    def execute(cls, model, mask_path="", s_bg=5, beta_path="", enabled=True):
+    def execute(cls, model, mask_path="", s_bg=3, beta_path="", enabled=True,
+                beta_scale=1.0, beta_max=0.0, last_step_dense=True):
         if not enabled:
             print("[route3] disabled - pass through", flush=True)
             return io.NodeOutput(model)
@@ -80,14 +88,18 @@ class MiniMaxH3Route3Apply(io.ComfyNode):
         if beta_path and os.path.exists(beta_path):
             blob = torch.load(beta_path, map_location="cpu", weights_only=True)
             beta = blob.get("beta", blob) if isinstance(blob, dict) else blob
-            print("[route3] beta loaded %s" % (tuple(beta.shape) if torch.is_tensor(beta) else beta), flush=True)
+            print("[route3] beta loaded %s" % (tuple(beta.shape) if torch.is_tensor(beta) else beta,), flush=True)
 
-        fn = (lambda lt, lh, lw: provider.for_grid(lt, lh, lw)) if provider else None
+        fn = (lambda lt, lh, lw, st=0: provider.for_grid(lt, lh, lw, start_token=st)) if provider else None
         st = Route3State()
         m = install(model, s_bg=s_bg, beta=beta, fg_mask_fn=fn, state=st,
-                    strict_malloc=False, use_beta=True)
-        print("[route3] attached: s_bg=%d mask=%s beta=%s"
-              % (s_bg, "yes" if provider else "no", "custom" if beta is not None else "auto-beta0"),
+                    strict_malloc=False, use_beta=True,
+                    beta_scale=float(beta_scale), beta_max=float(beta_max),
+                    last_step_dense=bool(last_step_dense))
+        print("[route3] attached: s_bg=%d mask=%s beta=%s scale=%.2f max=%.2f last_step_dense=%s"
+              % (s_bg, "yes" if provider else "no",
+                 "custom" if beta is not None else "auto-beta0",
+                 float(beta_scale), float(beta_max), bool(last_step_dense)),
               flush=True)
         return io.NodeOutput(m)
 
@@ -163,17 +175,17 @@ class MiniMaxH3Route3Assemble(io.ComfyNode):
             description=(
                 "衔接「一采 3D 上采样 latent (latent_p1_up)」与「二采压缩采样输出 (latent_p2)」。"
                 "利用二采在关键帧上真正重绘出的高清残差 δ = z_p2 - z_p1_up 还原中间帧背景：\n"
-                "  flow = latent 空间分块位移场双向 warp（主推）\n"
-                "  lerp = 固定坐标线性插值（对照组）\n"
+                "  lerp = 固定坐标线性插值（默认主推：A100 实测 <1ms 且 bg_hf 三场景全面胜过 flow）\n"
+                "  flow = latent 空间分块位移场双向 warp（可选对照，耗时较长）\n"
                 "  none = 不重装，直接透传 latent_p2（用于对照引擎内置 fill_dropped）\n"
                 "当 only_bg=True 且提供 mask_path 时，前景区 100% 保留二采全速率结果，只替换背景区。"
             ),
             inputs=[
                 io.Latent.Input("latent_p1_up", tooltip="一采 3D 上采样（或 Reconcile）后的全帧 AV latent"),
                 io.Latent.Input("latent_p2", tooltip="二采采样器输出的 AV latent"),
-                io.Int.Input("s_bg", default=5, min=0, max=64,
-                             tooltip="0 = 静机位单帧复用 z_p2[0]；>1 = 关键帧步长"),
-                io.Combo.Input("method", options=["flow", "lerp", "none"], default="flow"),
+                io.Int.Input("s_bg", default=3, min=0, max=64,
+                             tooltip="0 = 静机位单帧复用 z_p2[0]；3 = 推荐甜点"),
+                io.Combo.Input("method", options=["lerp", "flow", "none"], default="lerp"),
                 io.Boolean.Input("only_bg", default=True,
                                  tooltip="True = 前景区保留 latent_p2 全速率动作，只对背景区做残差还原"),
                 io.String.Input("mask_path", default="",
@@ -183,8 +195,10 @@ class MiniMaxH3Route3Assemble(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent_p1_up, latent_p2, s_bg=5, method="flow", only_bg=True, mask_path=""):
-        if method == "none":
+    def execute(cls, latent_p1_up, latent_p2, s_bg=3, method="lerp", only_bg=True, mask_path=""):
+        if method == "none" or latent_p2.get("route3_last_step_dense"):
+            if latent_p2.get("route3_last_step_dense"):
+                print("[route3] Assemble: detected last_step_dense=True -> direct passthrough (full-frame refined)", flush=True)
             return io.NodeOutput(latent_p2)
 
         vid_a, _aud_a, is_nested_a = _unpack_av(latent_p1_up["samples"])
@@ -218,11 +232,19 @@ class MiniMaxH3Route3Assemble(io.ComfyNode):
             # 静机位档：把二采画好的第 0 帧高清背景铺满所有背景区，前景留二采全速率
             rec_tchw = reconstruct_static(b_tchw, b_tchw[0], fg_mask=fg_lat)
         else:
-            anchors = list(range(0, T, s_bg))
+            cuts = detect_latent_cuts(a_tchw)
+            pins = sorted(set(cut_pin_tokens(cuts, T, radius=1)) | set(motion_pin_tokens(a_tchw, s_bg=s_bg, cuts=cuts, fg_mask=fg_lat)))
+            anchors = bg_anchor_indices(T, s_bg, pin_tokens=pins)
             delta = {t: (b_tchw[t] - a_tchw[t]) for t in anchors}
-            bg_tchw = reconstruct_moving(a_tchw, delta, anchors, method=method)
+            bg_tchw = reconstruct_moving(a_tchw, delta, anchors, method=method, fg_mask=fg_lat, cuts=cuts)
             if fg_lat is not None:
-                rec_tchw = torch.where(fg_lat.unsqueeze(1), b_tchw, bg_tchw)
+                # 前景核心 100% 保留 b_tchw（fg_err == 0），外缘 1-2 latent 格做空间软羽化，
+                # 彻底消除 2×2 DiT patch（32×32 像素）硬二值切边导致的方框马赛克！
+                fg_f = fg_lat.float().unsqueeze(1)
+                fg_dil = torch.nn.functional.max_pool2d(fg_f, kernel_size=3, stride=1, padding=1)
+                fg_soft = torch.nn.functional.avg_pool2d(fg_dil, kernel_size=3, stride=1, padding=1)
+                alpha = torch.maximum(fg_f, fg_soft).clamp(0.0, 1.0)
+                rec_tchw = alpha * b_tchw + (1.0 - alpha) * bg_tchw
             else:
                 rec_tchw = bg_tchw
 
@@ -256,7 +278,7 @@ class MiniMaxH3Route3AutoMask(io.ComfyNode):
                     default="auto",
                     tooltip="auto: 绿幕走色键，普通视频自动选语义前景分割 + 运动补偿；latent_motion: 纯 latent 零下载",
                 ),
-                io.String.Input("out_dir", default="", tooltip="掩码落盘目录（留空写到 ComfyUI temp/route3_masks）"),
+                io.String.Input("out_dir", default="", tooltip="掩码落盘目录（留空写到 ComfyUI/temp/route3_masks，不占 C 盘；可填任意自定义路径）"),
                 io.Vae.Input("video_vae", optional=True, tooltip="可选：接 Video VAE 可解码一采低清帧跑语义前景抠图"),
             ],
             outputs=[
@@ -267,9 +289,22 @@ class MiniMaxH3Route3AutoMask(io.ComfyNode):
         )
 
     @classmethod
+    def _default_mask_dir(cls):
+        try:
+            import folder_paths
+            d = os.path.join(folder_paths.get_temp_directory(), "route3_masks")
+            os.makedirs(d, exist_ok=True)
+            return d
+        except Exception:
+            pass
+        # 回落到插件目录内，绝不写入 C 盘系统 Temp
+        d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "route3_masks")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
     def execute(cls, latent, ring=1, backend="auto", out_dir="", video_vae=None):
         import hashlib
-        import tempfile
 
         vid_5d, _aud, _ = _unpack_av(latent["samples"])
         if vid_5d.ndim != 5 or vid_5d.shape[0] != 1:
@@ -277,7 +312,7 @@ class MiniMaxH3Route3AutoMask(io.ComfyNode):
 
         # 稳定内容指纹，方便缓存与复用
         h_hex = hashlib.sha1(vid_5d[:, :, :1].detach().float().cpu().numpy().tobytes()).hexdigest()[:12]
-        base_dir = out_dir.strip() if out_dir and out_dir.strip() else os.path.join(tempfile.gettempdir(), "route3_masks")
+        base_dir = out_dir.strip() if out_dir and out_dir.strip() else cls._default_mask_dir()
         os.makedirs(base_dir, exist_ok=True)
         mpath = os.path.join(base_dir, "r3_mask_%s_r%d_%s.npz" % (h_hex, int(ring), backend))
 
