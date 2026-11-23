@@ -30,6 +30,28 @@ from comfy_api.latest import io
 from .bridge import PASS2_TYPE_STRING, PLAN_TYPE_STRING, find_upstream_module
 from .hardcut_math import FPS, FRAME_GRID, LOAD_FAIL, LOAD_PASS
 
+# 8GB verified thresholds when MiniMaxH3ChunkedSageAttentionPatch is active:
+# - exact mode: 10s (243f x 1.355MP = 329.2) activation peak = 3.26 GiB (< stock 5s 3.35 GiB)
+# - auto / streaming mode: 10s (329.2) real ComfyUI Pass-2 peak_alloc = 1.02 GiB (7309/8188 MiB);
+#   15s (362f x 1.355MP = 490.5) single-block activation peak = 2.97 GiB (< stock 5s 3.35 GiB)
+LOAD_PASS_CHUNKED_EXACT = 335.0
+LOAD_FAIL_CHUNKED_EXACT = 380.0
+LOAD_PASS_CHUNKED_STREAMING = 360.0
+LOAD_FAIL_CHUNKED_STREAMING = 520.0
+
+
+def effective_load_thresholds(model) -> tuple[float, float, dict | None]:
+    """Return `(load_pass, load_fail, chunked_sage_info)` adjusted for Chunked QKV SageAttention."""
+    mopts = getattr(model, "model_options", None)
+    topts = mopts.get("transformer_options") if isinstance(mopts, dict) else None
+    cs_info = topts.get("minimax_chunked_sage") if isinstance(topts, dict) else None
+    if isinstance(cs_info, dict):
+        mode = str(cs_info.get("out_proj_mode", "auto"))
+        if mode == "exact":
+            return LOAD_PASS_CHUNKED_EXACT, LOAD_FAIL_CHUNKED_EXACT, cs_info
+        return LOAD_PASS_CHUNKED_STREAMING, LOAD_FAIL_CHUNKED_STREAMING, cs_info
+    return float(LOAD_PASS), float(LOAD_FAIL), None
+
 CATEGORY = "MiniMax H3 Hard Cut"
 PLAN_TYPE = io.Custom(PLAN_TYPE_STRING)
 PASS2_TYPE = io.Custom(PASS2_TYPE_STRING)
@@ -1381,6 +1403,7 @@ def execute(
             # (load = longest_frames x canvas_mp), so recheck and undo any move
             # that breaks the anchor.  Otherwise the calm search can quietly
             # create the oversized window that produces tail artefacts.
+            _eff_load_pass, _eff_load_fail, _cs_info = effective_load_thresholds(model)
             _mp = float(_hc.get("canvas_mp") or 0.0) or 1.5
             _total = int(frame_count)
             for _i in range(len(calm_boundaries)):
@@ -1388,7 +1411,7 @@ def execute(
                     calm_overlaps[_i] if _i < len(calm_overlaps) else 0))
                 _hi = int(calm_boundaries[_i + 1]) if _i + 1 < len(calm_boundaries) else _total
                 _frames = max(0, _hi - _lo)
-                if _frames * _mp < float(LOAD_FAIL):
+                if _frames * _mp < _eff_load_fail:
                     continue
                 _plan_cut = int(planned[_i]) if _i < len(planned) else int(calm_boundaries[_i])
                 if _plan_cut == int(calm_boundaries[_i]):
@@ -1397,7 +1420,7 @@ def execute(
                     f"[HardCut]   calm: cut {_plan_cut}: move to "
                     f"{int(calm_boundaries[_i])} would make segment {_i} "
                     f"{_frames}f x {_mp:.2f}MP = {_frames * _mp:.0f} >= "
-                    f"{float(LOAD_FAIL):.0f} -> reverted to the planned frame"
+                    f"{_eff_load_fail:.0f} -> reverted to the planned frame"
                 )
                 calm_boundaries[_i] = _plan_cut
                 if _i < len(calm_overlaps):
@@ -1559,6 +1582,7 @@ def execute(
         _lt = max(1, (_frames - 5) // 17 * 5 + 2) if _frames > 5 else 1
         return _lt * max(1, _h // 16) * max(1, _w // 16)
 
+    _eff_load_pass, _eff_load_fail, _cs_info = effective_load_thresholds(model)
     _cv_mp = float((plan.get("hardcut") or {}).get("canvas_mp") or 0.0)
     _cv_w = int(plan.get("target_width") or 0)
     _cv_h = int(plan.get("target_height") or 0)
@@ -1570,12 +1594,23 @@ def execute(
             f"最长 {_fmax}f ⇒ token {_tokens_of(_fmax, _cv_h, _cv_w):,}",
             flush=True,
         )
-        print(
-            f"[HardCut]   负载口径：代理值 = 最长窗×MP = {_fmax * _cv_mp:.1f}"
-            f"（实测阈值 (183.8, 191.0]，与 LOAD_FAIL 吻合）｜ 解码阶段另算："
-            f"ComfyUI 官方只按 min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
-            flush=True,
-        )
+        if _cs_info is not None:
+            print(
+                f"[HardCut]   Chunked QKV SageAttention 已挂载 "
+                f"(head_chunks={_cs_info.get('head_chunks')}, "
+                f"out_proj_mode={_cs_info.get('out_proj_mode')}, "
+                f"arch={_cs_info.get('arch')})："
+                f"负载代理 = {_fmax * _cv_mp:.1f}（8GB 稳妥线 {_eff_load_pass:.0f} / 警戒线 {_eff_load_fail:.0f}，"
+                f"已替代旧版 191.0 锚）",
+                flush=True,
+            )
+        else:
+            print(
+                f"[HardCut]   负载口径：代理值 = 最长窗×MP = {_fmax * _cv_mp:.1f}"
+                f"（实测阈值 (183.8, 191.0]，与 LOAD_FAIL 吻合）｜ 解码阶段另算："
+                f"ComfyUI 官方只按 min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
+                flush=True,
+            )
         _r3_info = (
             model.model_options.get("route3_info")
             if isinstance(getattr(model, "model_options", None), dict)
@@ -1641,19 +1676,19 @@ def execute(
         if _win_mp > 0.0:
             _win_frames = int(end_frame) - int(start_frame)
             _win_load = _win_frames * _win_mp
-            if _win_load >= float(LOAD_FAIL):
+            if _win_load >= _eff_load_fail:
                 print(
                     f"[HardCut] ⚠⚠ window {len(segment_reports)} 负载 {_win_load:.0f} "
-                    f"= {_win_frames}f × {_win_mp:.3f}MP ≥ 实测 OOM 锚 {float(LOAD_FAIL):.0f}"
-                    f" —— 8GB 卡大概率在装模型时**硬崩（无 traceback、日志直接断）**。\n"
+                    f"= {_win_frames}f × {_win_mp:.3f}MP ≥ 警戒锚 {_eff_load_fail:.0f}"
+                    f" —— 8GB 卡存在 OOM 风险。\n"
                     f"         压窗的办法：降 second_megapixels / 调小 "
                     f"target_segment_seconds（每段更短）/ 调小 overlap_frames。",
                     flush=True,
                 )
-            elif _win_load >= float(LOAD_PASS):
+            elif _win_load >= _eff_load_pass:
                 print(
                     f"[HardCut]   window {len(segment_reports)} 负载 {_win_load:.0f} "
-                    f"= {_win_frames}f × {_win_mp:.3f}MP 已过稳妥线 {float(LOAD_PASS):.0f}"
+                    f"= {_win_frames}f × {_win_mp:.3f}MP 已过稳妥线 {_eff_load_pass:.0f}"
                     f"（BORDERLINE，8GB 上留意）",
                     flush=True,
                 )
