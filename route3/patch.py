@@ -49,7 +49,7 @@ class Route3State:
     def note(self, kind, msg):
         if kind not in self.warned:
             self.warned.add(kind)
-            logging.warning("[route3] " + msg)
+            logging.warning("[SeamKit] Route3: " + msg)
 
     def summary(self):
         return {"calls": self.calls, "compressed": self.compressed,
@@ -77,8 +77,7 @@ def install(model_patcher, s_bg=3, beta=None, fg_mask_fn=None, state=None,
         m.model_options["route3_fg_mask_fn"] = fg_mask_fn
 
     if strict_malloc and malloc_graph_active(torch.device("cuda")):
-        logging.info("[route3] malloc graph 已开启 —— 由本模块按原生 forward 的方式包裹，"
-                     "不需要加 --disable-comfy-compiler")
+        logging.info("[SeamKit] Route3: malloc graph active (native forward wrap)")
 
     def fwd(self, x, timestep, context, transformer_options={}, minimax_payload=None,
             denoise_mask=None, audio_denoise_mask=None, **kw):
@@ -120,7 +119,7 @@ def install(model_patcher, s_bg=3, beta=None, fg_mask_fn=None, state=None,
                         _mp_clean.cleanup_malloc_graph()
                     except Exception:
                         pass
-                    print("[route3] last_step_dense -> full dense native forward (sigma=%.4f <= %.4f)"
+                    print("[SeamKit] Route3: last_step_dense -> full dense forward (sigma=%.4f <= %.4f)"
                           % (sigma_cur, float(last_sig)), flush=True)
                     return orig(x, timestep, context, transformer_options,
                                 minimax_payload=minimax_payload,
@@ -163,7 +162,7 @@ def install(model_patcher, s_bg=3, beta=None, fg_mask_fn=None, state=None,
         st.last_plan = plan.to_dict()
         if st.calls == 1 and mask is not None and s_bg != 1:
             kept_v = int(plan.fg_local.numel() + plan.bg_local.numel())
-            print("[route3] plan: kept=%d/%d (%.1f%%) anchors=%d n_full=%d beta0=%.4f"
+            print("[SeamKit] Route3: plan kept=%d/%d (%.1f%%) anchors=%d n_full=%d beta0=%.4f"
                   % (kept_v, plan.video_rows, 100.0 * kept_v / max(1, plan.video_rows),
                      len(plan.anchors or ()), plan.n_full, plan.beta0),
                   flush=True)

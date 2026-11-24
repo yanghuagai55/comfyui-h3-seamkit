@@ -43,6 +43,7 @@ import importlib
 import logging
 import re
 import types
+import uuid
 
 import torch
 import torch.nn.functional as F
@@ -262,13 +263,17 @@ def _build_sol_context(layout, seq_len: int, sol_cfg: dict, transformer_options:
     if not _sol_attn_available or seq_len < int(sol_cfg.get("sol_min_tokens", 12288)):
         return None, None
 
+    use_tight_low_sigma = False
     sigmas = transformer_options.get("sigmas") if isinstance(transformer_options, dict) else None
     if sigmas is not None and torch.is_tensor(sigmas) and sigmas.numel() > 0:
         sigma = float(sigmas.flatten()[0].item())
         if sigma > float(sol_cfg.get("sol_max_sigma", 0.95)) + 1e-6:
             return None, None
         if sigma < float(sol_cfg.get("sol_min_sigma", 0.0)) - 1e-6:
-            return None, None
+            if float(sol_cfg.get("sol_low_sigma_tau", 0.0)) > 0.0:
+                use_tight_low_sigma = True
+            else:
+                return None, None
 
     segs = getattr(layout, "segments", None) or []
     vid_span = next(((a, b) for a, b, kind in segs if kind == "video"), None)
@@ -302,15 +307,39 @@ def _build_sol_context(layout, seq_len: int, sol_cfg: dict, transformer_options:
         if grid[0] * grid[1] * grid[2] == (vb - va) and (vb - va) > 0:
             morton_info = (va, vb, grid)
 
+    if use_tight_low_sigma:
+        eff_tau = float(sol_cfg.get("sol_low_sigma_tau", 0.90))
+        eff_aug = max(128, int(sol_cfg.get("sol_token_aug", 64)))
+        eff_dense = sol_cfg.get("sol_low_sigma_dense_blocks_set", frozenset())
+    else:
+        eff_tau = float(sol_cfg.get("sol_tau", 1.3))
+        eff_aug = int(sol_cfg.get("sol_token_aug", 64))
+        eff_dense = sol_cfg.get("sol_dense_blocks_set", frozenset())
+
     sol_ctx = {
-        "tau": float(sol_cfg.get("sol_tau", 1.3)),
+        "tau": eff_tau,
         "topk_ratio": float(sol_cfg.get("sol_topk_ratio", 0.0)),
-        "token_aug": int(sol_cfg.get("sol_token_aug", 64)),
+        "token_aug": eff_aug,
         "sink_blocks": sink_blocks,
         "sink_q": sink_q,
-        "dense_blocks": sol_cfg.get("sol_dense_blocks_set", frozenset()),
+        "dense_blocks": eff_dense,
     }
     return sol_ctx, morton_info
+
+
+def _build_split_band_rope_scale(rope_hf_scale: float, n_freq: int, device: torch.device) -> torch.Tensor:
+    """Build smooth split-band scale `[n_freq]` for spatial RoPE: high bands scaled, low bands 1.0."""
+    g = torch.ones((n_freq,), dtype=torch.float32, device=device)
+    if rope_hf_scale == 1.0 or n_freq <= 0:
+        return g
+    s = float(rope_hf_scale)
+    hi_end = min(6, n_freq)
+    g[:hi_end] = s
+    if n_freq > 6:
+        g[6] = 1.0 + (s - 1.0) * 0.75
+    if n_freq > 7:
+        g[7] = 1.0 + (s - 1.0) * 0.25
+    return g
 
 
 def _attend_group(
@@ -320,6 +349,7 @@ def _attend_group(
     dtype: torch.dtype,
     sol_ctx: dict | None = None,
     block_idx: int | None = None,
+    attn_temp_scale: float = 1.0,
 ) -> torch.Tensor:
     """Dispatch one head group `[1, S, g, 128]` to either `ck.sol_attn` sparse Sage or dense KJ Sage."""
     if (
@@ -331,11 +361,13 @@ def _attend_group(
         and _sol_attn_available
     ):
         v_g = make_v_fn()
+        sol_scale = (q_g.shape[-1] ** -0.5) * float(attn_temp_scale) if attn_temp_scale != 1.0 else None
         o_g = _ck.sol_attn(
             q_g,
             k_g,
             v_g,
             tau=sol_ctx["tau"],
+            scale=sol_scale,
             topk_ratio=sol_ctx["topk_ratio"],
             sink_blocks=list(sol_ctx["sink_blocks"]),
             sink_q=list(sol_ctx["sink_q"]),
@@ -344,43 +376,424 @@ def _attend_group(
         )
         del q_g, k_g, v_g
         return o_g
-    return _staged_sageattn_nhd(q_g, k_g, make_v_fn, dtype)
+    return _staged_sageattn_nhd(q_g, k_g, make_v_fn, dtype, attn_temp_scale=attn_temp_scale)
 
 
-def _make_sol_run_blocks(orig_run_blocks_fn, sol_cfg: dict):
-    """Wrap `MiniMaxH3Model._run_blocks` to manage zero-spike Morton reordering & Sol-Attn context."""
-    def chunked_sage_sol_run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
+def _extract_lora_entries_from_patches(
+    patches_list,
+    weight_shape: tuple[int, ...],
+) -> list[tuple[torch.Tensor, torch.Tensor, float]] | None:
+    """Extract standard 2D linear LoRA `(B [N,r], A [r,K], eff_scale)` tuples from ComfyUI `patches`.
+
+    Returns `None` if ANY patch is non-standard (DoRA, LoHa/LoKr, Tucker `mid`, `reshape`,
+    `offset`, custom `function`, `strength_model != 1.0`, or non-LoRA `diff`/`set`), so the
+    caller cleanly falls back to ComfyUI's stock weight-patching path with zero accuracy risk.
+    """
+    if not patches_list or len(weight_shape) != 2:
+        return None
+    out_dim, in_dim = int(weight_shape[0]), int(weight_shape[1])
+    extracted: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+    for p in patches_list:
+        if not isinstance(p, (tuple, list)) or len(p) < 5:
+            return None
+        strength, adapter, strength_model, offset, fn = p[0], p[1], p[2], p[3], p[4]
+        if float(strength_model) != 1.0 or offset is not None or fn is not None:
+            return None
+        if getattr(adapter, "name", None) != "lora" or not hasattr(adapter, "weights"):
+            return None
+        weights = adapter.weights
+        if not isinstance(weights, (tuple, list)) or len(weights) < 6:
+            return None
+        mat1, mat2, alpha, mid, dora_scale, reshape = weights[:6]
+        if mid is not None or dora_scale is not None or reshape is not None:
+            return None
+        if not (torch.is_tensor(mat1) and torch.is_tensor(mat2)):
+            return None
+        if mat1.ndim != 2 or mat2.ndim != 2:
+            return None
+        if mat1.shape[0] != out_dim or mat2.shape[1] != in_dim or mat1.shape[1] != mat2.shape[0]:
+            return None
+        rank = int(mat2.shape[0])
+        if rank <= 0:
+            return None
+        alpha_scale = (float(alpha) / float(rank)) if alpha is not None else 1.0
+        eff_scale = float(strength) * alpha_scale
+        if eff_scale != 0.0:
+            extracted.append((mat1, mat2, eff_scale))
+    return extracted
+
+
+def _extract_bypass_lora_entries(
+    linear,
+    weight_shape: tuple[int, ...],
+) -> list[tuple[torch.Tensor, torch.Tensor, float]]:
+    """Extract LoRA adapters attached via `LoraLoaderBypassModelOnly` (`BypassForwardHook`)."""
+    if len(weight_shape) != 2:
+        return []
+    out_dim, in_dim = int(weight_shape[0]), int(weight_shape[1])
+    out: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+    fwd = getattr(linear, "forward", None)
+    seen: set[int] = set()
+    while fwd is not None:
+        hook = getattr(fwd, "__self__", None)
+        if hook is None or id(hook) in seen or not hasattr(hook, "adapter") or not hasattr(hook, "original_forward"):
+            break
+        seen.add(id(hook))
+        adapter = hook.adapter
+        mult = float(getattr(adapter, "multiplier", 1.0))
+        if getattr(adapter, "name", None) == "lora" and hasattr(adapter, "weights"):
+            weights = adapter.weights
+            if isinstance(weights, (tuple, list)) and len(weights) >= 6:
+                mat1, mat2, alpha, mid, dora_scale, reshape = weights[:6]
+                if (
+                    mid is None
+                    and dora_scale is None
+                    and reshape is None
+                    and torch.is_tensor(mat1)
+                    and torch.is_tensor(mat2)
+                    and mat1.ndim == 2
+                    and mat2.ndim == 2
+                    and mat1.shape[0] == out_dim
+                    and mat2.shape[1] == in_dim
+                    and mat1.shape[1] == mat2.shape[0]
+                    and mat2.shape[0] > 0
+                ):
+                    alpha_scale = (float(alpha) / float(mat2.shape[0])) if alpha is not None else 1.0
+                    eff_scale = mult * alpha_scale
+                    if eff_scale != 0.0:
+                        out.append((mat1, mat2, eff_scale))
+        elif hasattr(adapter, "lora_up") and hasattr(adapter, "lora_down") and getattr(adapter, "lora_mid", None) is None:
+            mat1 = getattr(adapter.lora_up, "weight", None)
+            mat2 = getattr(adapter.lora_down, "weight", None)
+            if (
+                torch.is_tensor(mat1)
+                and torch.is_tensor(mat2)
+                and mat1.ndim == 2
+                and mat2.ndim == 2
+                and mat1.shape[0] == out_dim
+                and mat2.shape[1] == in_dim
+                and mat1.shape[1] == mat2.shape[0]
+                and mat2.shape[0] > 0
+            ):
+                alpha_val = float(adapter.alpha.item()) if torch.is_tensor(adapter.alpha) else float(adapter.alpha)
+                eff_scale = mult * alpha_val / float(mat2.shape[0])
+                if eff_scale != 0.0:
+                    out.append((mat1, mat2, eff_scale))
+        fwd = getattr(hook, "original_forward", None)
+    return out
+
+
+def _prepare_lora_packed(
+    entries: list[tuple[torch.Tensor, torch.Tensor, float]] | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Pack one or more low-rank `(B [N,r], A [r,K], scale)` tuples into a single `(B_cat [N,R], A_cat [R,K])`.
+
+    Moves tensors to GPU before dtype casting (avoids slow CPU fp16->bf16) and folds per-adapter
+    `scale` into the small `A` matrix so stacked LoRAs execute in ONE cuBLAS `addmm` with zero
+    intermediate `[M, N]` allocations.
+    """
+    if not entries:
+        return None
+    b_list: list[torch.Tensor] = []
+    a_list: list[torch.Tensor] = []
+    for mat1, mat2, scale in entries:
+        if mat1.device != device:
+            b_dev = mat1.to(device=device, non_blocking=True)
+        else:
+            b_dev = mat1
+        if b_dev.dtype != dtype:
+            b_dev = b_dev.to(dtype=dtype)
+        if not b_dev.is_contiguous():
+            b_dev = b_dev.contiguous()
+
+        if mat2.device != device:
+            a_dev = mat2.to(device=device, non_blocking=True)
+        else:
+            a_dev = mat2
+        if a_dev.dtype != dtype:
+            a_dev = a_dev.to(dtype=dtype)
+        if scale != 1.0:
+            a_dev = (a_dev.float() * float(scale)).to(dtype=dtype)
+        if not a_dev.is_contiguous():
+            a_dev = a_dev.contiguous()
+
+        b_list.append(b_dev)
+        a_list.append(a_dev)
+
+    if len(b_list) == 1:
+        return b_list[0], a_list[0]
+    return torch.cat(b_list, dim=1).contiguous(), torch.cat(a_list, dim=0).contiguous()
+
+
+def _add_lora_inplace(
+    out_2d: torch.Tensor,
+    x_2d: torch.Tensor,
+    packed: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    """In-place `out_2d += (x_2d @ A_cat^T) @ B_cat^T` via cuBLAS `addmm` (zero `[M, N]` temp)."""
+    b_cat, a_cat = packed
+    mid = F.linear(x_2d, a_cat)
+    torch.addmm(out_2d, mid, b_cat.t(), beta=1.0, alpha=1.0, out=out_2d)
+    del mid
+
+
+def _add_gated_lora_mid_residual_inplace(
+    x_resid: torch.Tensor,
+    mid: torch.Tensor,
+    b_cat: torch.Tensor,
+    gate: torch.Tensor,
+    gate_cast: torch.Tensor,
+    sub_segs: list,
+    gated_b_cache: dict[int, torch.Tensor],
+) -> None:
+    """In-place `x_resid += gate * (mid @ B_cat^T)` via gated `addmm` (zero `[M, N]` temp)."""
+    dtype = x_resid.dtype
+    for a, b, row in sub_segs:
+        if b <= a:
+            continue
+        r_slice = x_resid[a:b]
+        if isinstance(row, int) and r_slice.is_contiguous():
+            b_gt = gated_b_cache.get(row)
+            if b_gt is None:
+                b_gt = (b_cat * gate_cast[row].unsqueeze(1)).contiguous().t()
+                gated_b_cache[row] = b_gt
+            torch.addmm(r_slice, mid[a:b], b_gt, beta=1.0, alpha=1.0, out=r_slice)
+        else:
+            lora_seg = F.linear(mid[a:b], b_cat)
+            r_slice.addcmul_(lora_seg, _mod_row(gate, row, dtype))
+            del lora_seg
+
+
+def _eval_lora_delta(
+    x_c: torch.Tensor,
+    loras_dev: list[tuple[torch.Tensor, torch.Tensor, float]],
+) -> torch.Tensor:
+    """Compute exact BF16 low-rank side-branch `sum_i scale_i * ((x_c @ A_i^T) @ B_i^T)`."""
+    b0, a0, s0 = loras_dev[0]
+    out = F.linear(F.linear(x_c, a0), b0)
+    if s0 != 1.0:
+        out.mul_(s0)
+    for b_i, a_i, s_i in loras_dev[1:]:
+        out.add_(F.linear(F.linear(x_c, a_i), b_i), alpha=s_i)
+    return out
+
+
+if _HAS_TRITON:
+    @triton.jit
+    def _swiglu_fused_kernel(
+        InPtr, OutPtr,
+        M, FFN,
+        stride_im, stride_om,
+        BLOCK_K: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        col_blk = tl.program_id(1)
+        offs_k = col_blk * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = offs_k < FFN
+        base_in = InPtr + row.to(tl.int64) * stride_im
+        g = tl.load(base_in + offs_k, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(base_in + FFN + offs_k, mask=mask, other=0.0).to(tl.float32)
+        out = (g * tl.sigmoid(g)) * u
+        base_out = OutPtr + row.to(tl.int64) * stride_om
+        tl.store(base_out + offs_k, out.to(OutPtr.dtype.element_ty), mask=mask)
+
+
+def _swiglu_chunk(fc1_c: torch.Tensor) -> torch.Tensor:
+    """Compute `silu(gate) * up` from `[M, 2*FFN]` in a single coalesced pass."""
+    m, two_ffn = fc1_c.shape
+    ffn = two_ffn // 2
+    if _HAS_TRITON and fc1_c.is_cuda and fc1_c.is_contiguous():
+        out = torch.empty((m, ffn), dtype=fc1_c.dtype, device=fc1_c.device)
+        BLOCK_K = 1024
+        grid = (m, (ffn + BLOCK_K - 1) // BLOCK_K)
+        _swiglu_fused_kernel[grid](
+            fc1_c, out, m, ffn, fc1_c.stride(0), out.stride(0), BLOCK_K=BLOCK_K, num_warps=4,
+        )
+        return out
+    gate_part, up_part = fc1_c.chunk(2, dim=-1)
+    return F.silu(gate_part).mul_(up_part)
+
+
+def _get_linear_loras(
+    linear,
+    transformer_options: dict | None,
+) -> list[tuple[torch.Tensor, torch.Tensor, float]]:
+    """Resolve active BF16 low-rank LoRA entries for a linear module."""
+    active = transformer_options.get("_chunked_sage_active_loras") if isinstance(transformer_options, dict) else None
+    if isinstance(active, dict):
+        hit = active.get(id(linear))
+        if hit is not None:
+            return hit
+    raw_w = getattr(linear, "weight", None)
+    if raw_w is not None and hasattr(raw_w, "shape"):
+        return _extract_bypass_lora_entries(linear, tuple(raw_w.shape))
+    return []
+
+
+def _make_chunked_run_blocks(
+    orig_run_blocks_fn,
+    sol_cfg: dict | None,
+    static_loras: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] | None = None,
+    rope_hf_scale: float = 1.0,
+    attn_temp_scale: float = 1.0,
+):
+    """Wrap `MiniMaxH3Model._run_blocks` to manage BF16 LoRA side-branches, Split-Band RoPE, & Sol-Attn Morton reordering."""
+    static_loras = static_loras or {}
+    rope_hf_scale = float(rope_hf_scale)
+    attn_temp_scale = float(attn_temp_scale)
+
+    def chunked_sage_run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
+        # 1. Intercept any remaining INT8 LoRA LowVramPatch / BypassForwardHook BEFORE
+        #    `make_prefetch_queue` runs, so `pin_modules` never triggers 200-layer VBAR
+        #    dequantize + B@A + Hadamard requantize on every step.
+        active_loras: dict[int, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        stashed_lowvram: list[tuple[object, object]] = []
+        stashed_wfn: list[tuple[object, list]] = []
+        blocks = getattr(self, "blocks", None) or ()
+        for idx, blk in enumerate(blocks):
+            for suffix, lin in (
+                ("attn.qkv_proj", blk.attn.qkv_proj),
+                ("attn.out_proj", blk.attn.out_proj),
+                ("mlp.fc1", blk.mlp.fc1),
+                ("mlp.fc2", blk.mlp.fc2),
+            ):
+                key = f"diffusion_model.blocks.{idx}.{suffix}.weight"
+                entries: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+                if key in static_loras:
+                    entries.extend(static_loras[key])
+                raw_w = getattr(lin, "weight", None)
+                is_int8_q = isinstance(raw_w, qops.QuantizedTensor) and getattr(lin, "layout_type", None) is not None
+                lowvram_fn = getattr(lin, "weight_lowvram_function", None)
+                w_funcs = getattr(lin, "weight_function", ()) or ()
+                if (
+                    is_int8_q
+                    and lowvram_fn is not None
+                    and getattr(lowvram_fn, "is_lowvram_patch", False)
+                    and len(w_funcs) == 0
+                ):
+                    lv_key = getattr(lowvram_fn, "key", None)
+                    lv_patches = (getattr(lowvram_fn, "patches", None) or {}).get(lv_key)
+                    lv_entries = _extract_lora_entries_from_patches(lv_patches, tuple(raw_w.shape))
+                    if lv_entries is not None:
+                        stashed_lowvram.append((lin, lowvram_fn))
+                        lin.weight_lowvram_function = None
+                        entries.extend(lv_entries)
+                elif (
+                    is_int8_q
+                    and lowvram_fn is None
+                    and len(w_funcs) == 1
+                    and getattr(w_funcs[0], "is_lowvram_patch", False)
+                ):
+                    lv_fn = w_funcs[0]
+                    lv_key = getattr(lv_fn, "key", None)
+                    lv_patches = (getattr(lv_fn, "patches", None) or {}).get(lv_key)
+                    lv_entries = _extract_lora_entries_from_patches(lv_patches, tuple(raw_w.shape))
+                    if lv_entries is not None:
+                        stashed_wfn.append((lin, list(w_funcs)))
+                        lin.weight_function = []
+                        entries.extend(lv_entries)
+                if raw_w is not None and hasattr(raw_w, "shape"):
+                    bypass_entries = _extract_bypass_lora_entries(lin, tuple(raw_w.shape))
+                    if bypass_entries:
+                        entries.extend(bypass_entries)
+                if entries:
+                    active_loras[id(lin)] = entries
+
+        prev_loras = transformer_options.get("_chunked_sage_active_loras")
+        if active_loras:
+            transformer_options["_chunked_sage_active_loras"] = active_loras
+        else:
+            transformer_options.pop("_chunked_sage_active_loras", None)
+
+        prev_temp = transformer_options.get("_chunked_sage_attn_temp")
+        if attn_temp_scale != 1.0:
+            transformer_options["_chunked_sage_attn_temp"] = attn_temp_scale
+        else:
+            transformer_options.pop("_chunked_sage_attn_temp", None)
+
+        # Optional Split-Band Spatial RoPE un-squishing for >1.35MP (e.g. native 1080p):
+        # Scales ONLY high spatial frequencies (k=0..5, cosine taper k=6..7 -> 1.0) on video rows
+        # va:vb, keeping low spatial bands (k=8..15), time axis, ref_img, and stereo audio 100% untouched.
+        orig_rope_freqs_attr = None
+        had_instance_rope = False
+        if rope_hf_scale != 1.0 and hasattr(self, "rope_freqs"):
+            segs = getattr(layout, "segments", None) or []
+            vid_span_rope = next(((int(a), int(b)) for a, b, kind in segs if kind == "video"), None)
+            if vid_span_rope is not None and vid_span_rope[1] > vid_span_rope[0]:
+                r_va, r_vb = vid_span_rope
+                had_instance_rope = "rope_freqs" in getattr(self, "__dict__", {})
+                orig_rope_freqs_attr = self.__dict__.get("rope_freqs") if had_instance_rope else None
+                base_rope_fn = self.rope_freqs
+
+                def _split_band_rope_freqs(position_ids, dev):
+                    angles = base_rope_fn(position_ids, dev)
+                    if angles.ndim == 2 and angles.shape[0] >= r_vb and angles.shape[1] % 6 == 0:
+                        nf = angles.shape[1] // 6  # 16 per axis for H3 (96 / 6)
+                        half = nf * 3              # 48
+                        g = _build_split_band_rope_scale(rope_hf_scale, nf, angles.device)
+                        angles = angles.clone()
+                        angles[r_va:r_vb, nf : 2 * nf].mul_(g)
+                        angles[r_va:r_vb, 2 * nf : 3 * nf].mul_(g)
+                        angles[r_va:r_vb, half + nf : half + 2 * nf].mul_(g)
+                        angles[r_va:r_vb, half + 2 * nf : half + 3 * nf].mul_(g)
+                    return angles
+
+                self.rope_freqs = _split_band_rope_freqs
+
         s = h.shape[0]
-        sol_ctx, morton_info = _build_sol_context(layout, s, sol_cfg, transformer_options)
-        if sol_ctx is None:
-            return orig_run_blocks_fn(self, h, t_emb, mod_segments, layout, transformer_options)
-
+        sol_ctx, morton_info = (
+            _build_sol_context(layout, s, sol_cfg, transformer_options)
+            if sol_cfg
+            else (None, None)
+        )
         prev_ctx = transformer_options.get("_chunked_sage_sol_ctx")
-        transformer_options["_chunked_sage_sol_ctx"] = sol_ctx
-
         active_morton = None
         run_layout = layout
         run_mod_segments = mod_segments
-        if morton_info is not None:
-            va, vb, grid = morton_info
-            perm_dev, inv_dev, perm_cpu = _morton_perm_aligned(grid, va, h.device, curve="2d_frame")
-            _permute_span_inplace(h, va, vb, perm_dev)
-            pos_perm = layout.position_ids.clone()
-            pos_perm[va:vb] = pos_perm[va:vb].index_select(0, perm_cpu.to(pos_perm.device))
-            run_layout = _PermutedLayoutProxy(layout, pos_perm)
-            # Permute per-token mod_row tensor if video segment uses non-uniform denoise_mask
-            new_segs = []
-            for a, b, row in mod_segments:
-                if a == va and b == vb and isinstance(row, torch.Tensor):
-                    new_segs.append((a, b, row.index_select(0, perm_dev.to(row.device))))
-                else:
-                    new_segs.append((a, b, row))
-            run_mod_segments = new_segs
-            active_morton = (va, vb, inv_dev)
+
+        if sol_ctx is not None:
+            transformer_options["_chunked_sage_sol_ctx"] = sol_ctx
+            if morton_info is not None:
+                va, vb, grid = morton_info
+                perm_dev, inv_dev, perm_cpu = _morton_perm_aligned(grid, va, h.device, curve="2d_frame")
+                _permute_span_inplace(h, va, vb, perm_dev)
+                pos_perm = layout.position_ids.clone()
+                pos_perm[va:vb] = pos_perm[va:vb].index_select(0, perm_cpu.to(pos_perm.device))
+                run_layout = _PermutedLayoutProxy(layout, pos_perm)
+                # Permute per-token mod_row tensor if video segment uses non-uniform denoise_mask
+                new_segs = []
+                for a, b, row in mod_segments:
+                    if a == va and b == vb and isinstance(row, torch.Tensor):
+                        new_segs.append((a, b, row.index_select(0, perm_dev.to(row.device))))
+                    else:
+                        new_segs.append((a, b, row))
+                run_mod_segments = new_segs
+                active_morton = (va, vb, inv_dev)
+        else:
+            transformer_options.pop("_chunked_sage_sol_ctx", None)
 
         try:
             h = orig_run_blocks_fn(self, h, t_emb, run_mod_segments, run_layout, transformer_options)
         finally:
+            if rope_hf_scale != 1.0 and hasattr(self, "rope_freqs"):
+                if had_instance_rope:
+                    self.rope_freqs = orig_rope_freqs_attr
+                elif "rope_freqs" in getattr(self, "__dict__", {}):
+                    del self.__dict__["rope_freqs"]
+            for lin, lowvram_fn in stashed_lowvram:
+                lin.weight_lowvram_function = lowvram_fn
+            for lin, orig_wfn in stashed_wfn:
+                lin.weight_function = orig_wfn
+            if prev_temp is None:
+                transformer_options.pop("_chunked_sage_attn_temp", None)
+            else:
+                transformer_options["_chunked_sage_attn_temp"] = prev_temp
+            if prev_loras is None:
+                transformer_options.pop("_chunked_sage_active_loras", None)
+            else:
+                transformer_options["_chunked_sage_active_loras"] = prev_loras
             if prev_ctx is None:
                 transformer_options.pop("_chunked_sage_sol_ctx", None)
             else:
@@ -391,7 +804,14 @@ def _make_sol_run_blocks(orig_run_blocks_fn, sol_cfg: dict):
                     _permute_span_inplace(h, va, vb, inv_dev)
         return h
 
-    return chunked_sage_sol_run_blocks
+    chunked_sage_run_blocks._is_chunked_sage_run_blocks = True
+    chunked_sage_run_blocks._orig_run_blocks_fn = orig_run_blocks_fn
+    chunked_sage_run_blocks._chunked_sage_static_loras = static_loras
+    return chunked_sage_run_blocks
+
+
+# Backwards-compatible alias for unit tests importing `_make_sol_run_blocks`
+_make_sol_run_blocks = _make_chunked_run_blocks
 
 
 # ---------------------------------------------------------------------------
@@ -536,10 +956,16 @@ def _per_thread_int8_i64(
     return q_int8, q_scale, k_int8, k_scale
 
 
-def _staged_sageattn_nhd(q: torch.Tensor, k: torch.Tensor, get_v_fn, dtype: torch.dtype) -> torch.Tensor:
+def _staged_sageattn_nhd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    get_v_fn,
+    dtype: torch.dtype,
+    attn_temp_scale: float = 1.0,
+) -> torch.Tensor:
     """KJ-identical SageAttention2++ on NHD [1, S, g, D], deferring V projection until BF16 Q/K are freed."""
     head_dim = q.shape[-1]
-    sm_scale = head_dim ** -0.5
+    sm_scale = (head_dim ** -0.5) * float(attn_temp_scale)
     arch = _cuda_archs[0] if _cuda_archs else None
 
     if arch in {"sm80", "sm86"}:
@@ -658,7 +1084,7 @@ def _staged_sageattn_nhd(q: torch.Tensor, k: torch.Tensor, get_v_fn, dtype: torc
     k_hnd = k.transpose(1, 2)
     v_hnd = v.transpose(1, 2)
     del q, k, v
-    o_hnd = F.scaled_dot_product_attention(q_hnd, k_hnd, v_hnd)
+    o_hnd = F.scaled_dot_product_attention(q_hnd, k_hnd, v_hnd, scale=sm_scale)
     return o_hnd.transpose(1, 2).contiguous().to(dtype)
 
 
@@ -949,6 +1375,178 @@ def _apply_qk_norm_rope(attn, q_g: torch.Tensor, k_g: torch.Tensor, rope_freqs, 
 # Core chunked attention & fused block forwards
 # ---------------------------------------------------------------------------
 
+def _prepare_rms_adaln_tables(
+    norm_w: torch.Tensor | None,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold RMSNorm weight `norm_w` into AdaLN `scale` once per block (`[M_rows, D]`)."""
+    if norm_w is not None:
+        eff_scale = (norm_w.float() * (1.0 + scale.float()) - 1.0).to(dtype).contiguous()
+    else:
+        eff_scale = scale.to(dtype).contiguous()
+    shift_cast = shift.to(dtype).contiguous()
+    return eff_scale, shift_cast
+
+
+def _rms_adaln_chunk(
+    x_c: torch.Tensor,
+    norm_shape,
+    norm_w: torch.Tensor | None,
+    eps: float,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    eff_scale: torch.Tensor,
+    shift_cast: torch.Tensor,
+    sub_segs: list,
+    use_fused_rms: bool = True,
+) -> torch.Tensor:
+    """Fused `_ck.rms_adaln` per uniform mod segment, falling back to `F.rms_norm + _mod_scale_shift`."""
+    can_fused = (
+        use_fused_rms
+        and _ck is not None
+        and hasattr(_ck, "rms_adaln")
+        and x_c.is_cuda
+        and x_c.dtype in (torch.bfloat16, torch.float16)
+    )
+    if can_fused:
+        if len(sub_segs) == 1:
+            a, b, row = sub_segs[0]
+            if a == 0 and b == x_c.shape[0] and isinstance(row, int):
+                return _ck.rms_adaln(x_c, eff_scale[row], shift_cast[row], eps)
+        h_c = torch.empty_like(x_c)
+        for a, b, row in sub_segs:
+            if b <= a:
+                continue
+            if isinstance(row, int):
+                h_c[a:b] = _ck.rms_adaln(x_c[a:b], eff_scale[row], shift_cast[row], eps)
+            else:
+                seg_h = F.rms_norm(x_c[a:b], norm_shape, norm_w, eps)
+                seg_h.mul_(1.0 + _mod_row(scale, row, x_c.dtype)).add_(_mod_row(shift, row, x_c.dtype))
+                h_c[a:b] = seg_h
+        return h_c
+
+    h_c = F.rms_norm(x_c, norm_shape, norm_w, eps)
+    _mod_scale_shift(h_c, shift, scale, sub_segs)
+    return h_c
+
+
+def _int8_linear_residual_inplace(
+    x_in: torch.Tensor,
+    w_qdata: torch.Tensor,
+    w_scale: torch.Tensor,
+    ws_cutlass: torch.Tensor | None,
+    bias_arg: torch.Tensor | None,
+    bias_orig: torch.Tensor | None,
+    convrot: bool,
+    convrot_gs: int,
+    x_resid: torch.Tensor,
+    gate: torch.Tensor,
+    gate_cast: torch.Tensor,
+    sub_segs: list,
+    input_act: str | None = None,
+) -> None:
+    """In-place gated residual `x_resid += gate * int8_linear(x_in, w)` fused into CUTLASS epilogue.
+
+    Eliminates intermediate `[M, N]` projection buffers and `_mod_gate` HBM read-modify-writes
+    for every contiguous uniform mod segment (100% bit-exact verified on SM89).
+    """
+    dtype = x_resid.dtype
+    device = x_resid.device
+    n_out, k_w = w_qdata.shape
+    can_cutlass_base = (
+        x_in.is_cuda
+        and _ck_cuda is not None
+        and ws_cutlass is not None
+        and bias_arg is not None
+        and hasattr(_ck_cuda._C, "cutlass_int8_dequant_residual")
+        and not _ck_cuda._DISABLE_CUTLASS_INT8
+        and _ck_cuda._cuda_device_supports_cutlass_int8_dequant(x_in)
+        and x_in.dtype == dtype
+        and dtype in (torch.bfloat16, torch.float16)
+    )
+    if can_cutlass_base:
+        out_dtype_code = _ck_cuda.DTYPE_TO_CODE[dtype]
+        stream_ptr = torch.cuda.current_stream(device).cuda_stream
+        fused_convrot_ok = (
+            convrot
+            and convrot_gs == 256
+            and k_w % 256 == 0
+            and 256 <= k_w <= _ck_cuda._CONVROT_FUSED_MAX_K
+            and _ck_cuda._convrot_fused_shared_memory_fits(x_in, k_w, convrot_gs)
+        )
+        act_code = _ck_cuda._input_act_code(input_act)
+        empty_act = _ck_cuda._empty_cuda_tensor(device, x_in.dtype)
+
+        for a, b, row in sub_segs:
+            m_seg = b - a
+            if m_seg <= 0:
+                continue
+            r_slice = x_resid[a:b]
+            use_epilogue = (
+                isinstance(row, int)
+                and m_seg > 2
+                and (input_act in (None, "none") or fused_convrot_ok)
+                and not _ck_cuda._prefer_cublas_int8_fallback(m_seg, n_out, k_w, x_in.get_device())
+                and r_slice.is_contiguous()
+                and (r_slice.data_ptr() % 16 == 0)
+            )
+            if use_epilogue:
+                x_seg = x_in[a:b]
+                if not x_seg.is_contiguous():
+                    x_seg = x_seg.contiguous()
+                q_seg = torch.empty((m_seg, k_w), dtype=torch.int8, device=device)
+                s_seg = torch.empty((m_seg, 1), dtype=torch.float32, device=device)
+                if convrot and fused_convrot_ok:
+                    _ck_cuda._C.quantize_int8_rowwise_convrot64(
+                        _ck_cuda._wrap_for_dlpack(x_seg),
+                        _ck_cuda._wrap_for_dlpack(q_seg),
+                        _ck_cuda._wrap_for_dlpack(s_seg),
+                        convrot_gs,
+                        False,
+                        act_code,
+                        0,
+                        _ck_cuda._wrap_for_dlpack(empty_act),
+                        0.0,
+                        stream_ptr,
+                    )
+                else:
+                    _quantize_int8_convrot_into(x_seg, q_seg, s_seg, convrot, convrot_gs)
+                gate_vec = _ck_cuda._gemm_vector_arg(gate_cast[row], device, dtype)
+                used = _ck_cuda._C.cutlass_int8_dequant_residual(
+                    _ck_cuda._wrap_for_dlpack(q_seg),
+                    _ck_cuda._wrap_for_dlpack(w_qdata),
+                    _ck_cuda._wrap_for_dlpack(s_seg),
+                    _ck_cuda._wrap_for_dlpack(ws_cutlass),
+                    _ck_cuda._wrap_for_dlpack(bias_arg),
+                    _ck_cuda._wrap_for_dlpack(gate_vec),
+                    _ck_cuda._wrap_for_dlpack(r_slice),
+                    _ck_cuda._wrap_for_dlpack(r_slice),
+                    out_dtype_code,
+                    stream_ptr,
+                )
+                del q_seg, s_seg
+                if used:
+                    continue
+
+            # Fallback for tiny / non-uniform / non-CUTLASS segments
+            proj_seg = _ck.int8_linear(
+                x_in[a:b], w_qdata, w_scale, bias_orig, dtype,
+                convrot=convrot, convrot_groupsize=convrot_gs, input_act=input_act,
+            )
+            r_slice.addcmul_(proj_seg, _mod_row(gate, row, dtype))
+            del proj_seg
+        return
+
+    proj_c = _ck.int8_linear(
+        x_in, w_qdata, w_scale, bias_orig, dtype,
+        convrot=convrot, convrot_groupsize=convrot_gs, input_act=input_act,
+    )
+    _mod_gate(x_resid, gate, proj_c, sub_segs)
+    del proj_c
+
+
 def _run_chunked_attention_int8(
     block,
     attn,
@@ -965,8 +1563,11 @@ def _run_chunked_attention_int8(
     eff_mode: str,
     sol_ctx: dict | None = None,
     block_idx: int | None = None,
+    qkv_loras=None,
+    out_loras=None,
+    attn_temp_scale: float = 1.0,
 ) -> None:
-    """INT8 TensorWise ConvRot fast path: pre-quantize once, head-group Q/K/V, accumulate into `x`."""
+    """INT8 TensorWise ConvRot fast path: fused RMS-AdaLN + BF16 LoRA side-branch + CUTLASS residual epilogue."""
     s, hidden = x.shape
     dtype = x.dtype
     device = x.device
@@ -982,18 +1583,43 @@ def _run_chunked_attention_int8(
     x_qdata = torch.empty((s, hidden), dtype=torch.int8, device=device)
     x_scale = torch.empty((s, 1), dtype=torch.float32, device=device)
 
+    qkv_packed = _prepare_lora_packed(qkv_loras, device, dtype)
+    qkv_b_cat = qkv_packed[0] if qkv_packed is not None else None
+    qkv_a_cat = qkv_packed[1] if qkv_packed is not None else None
+    qkv_mid = (
+        torch.empty((s, qkv_a_cat.shape[0]), dtype=dtype, device=device)
+        if qkv_a_cat is not None
+        else None
+    )
+
+    use_fused_rms = eff_mode == "streaming"
     with _cast_rmsnorm_once(block.norm1, x) as nw1:
+        eff_scale1, shift1_cast = _prepare_rms_adaln_tables(nw1, scale_msa, shift_msa, dtype)
         for t0 in range(0, s, token_chunk):
             t1 = min(t0 + token_chunk, s)
             sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-            h_c = F.rms_norm(x[t0:t1], block.norm1.normalized_shape, nw1, block.norm1.eps)
-            _mod_scale_shift(h_c, shift_msa, scale_msa, sub_segs)
+            h_c = _rms_adaln_chunk(
+                x[t0:t1], block.norm1.normalized_shape, nw1, block.norm1.eps,
+                shift_msa, scale_msa, eff_scale1, shift1_cast, sub_segs,
+                use_fused_rms=use_fused_rms,
+            )
+            if qkv_mid is not None:
+                qkv_mid[t0:t1] = F.linear(h_c, qkv_a_cat)
             _quantize_int8_convrot_into(h_c, x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
             del h_c
+
+    # Release qkv `A` matrix immediately; only `(qkv_mid [S,R], qkv_b_cat [21504,R])` needed below
+    del qkv_a_cat, qkv_packed
+
+    def _add_qkv_lora_inplace(buf_2d: torch.Tensor, r0: int, r1: int) -> None:
+        if qkv_mid is None:
+            return
+        torch.addmm(buf_2d, qkv_mid, qkv_b_cat[r0:r1].t(), beta=1.0, alpha=1.0, out=buf_2d)
 
     qw = mm.cast_to(attn.q_norm.weight, device=device) if rope_freqs is not None else None
     kw = mm.cast_to(attn.k_norm.weight, device=device) if rope_freqs is not None else None
     rot_dim = rope_freqs.shape[-3] * 2 if rope_freqs is not None else 0
+    gate_msa_cast = gate_msa.to(dtype).contiguous()
 
     def _slice_scale(scale_t, r0, r1):
         if scale_t.ndim > 0 and scale_t.numel() > 1:
@@ -1013,45 +1639,74 @@ def _run_chunked_attention_int8(
                 or (not isinstance(w_out, qops.QuantizedTensor))
             )
             if can_stream_out:
+                out_packed = _prepare_lora_packed(out_loras, device, dtype)
+                out_b_cat = out_packed[0] if out_packed is not None else None
+                out_a_cat = out_packed[1] if out_packed is not None else None
+                out_mid = (
+                    torch.zeros((s, out_a_cat.shape[0]), dtype=dtype, device=device)
+                    if out_a_cat is not None
+                    else None
+                )
+                ws_out_cutlass = None
+                bias_out_arg = None
+                bias_empty_arg = None
+                if out_is_int8 and _ck_cuda is not None:
+                    ws_tmp = _ck_cuda._int8_weight_scale_arg(w_out._params.scale, device)
+                    ws_out_cutlass = ws_tmp if ws_tmp.numel() == hidden else ws_tmp.expand(hidden).contiguous()
+                    bias_empty_arg = _ck_cuda._empty_cuda_tensor(device, dtype)
+                    bias_out_arg = (
+                        _ck_cuda._gemm_vector_arg(b_out, device, dtype)
+                        if b_out is not None
+                        else bias_empty_arg
+                    )
+
                 group_sizes = _split_heads_even(heads, head_chunks, out_gs if out_convrot else 0, head_dim)
                 hs = 0
                 for g_idx, g in enumerate(group_sizes):
                     he = hs + g
                     c0, c1 = hs * head_dim, he * head_dim
-                    q_g = _int8_gemm_prequant(
+                    q_g_2d = _int8_gemm_prequant(
                         x_qdata, x_scale, qkv_qdata[c0:c1], _slice_scale(qkv_scale, c0, c1),
                         dtype, _slice_bias(b_qkv, c0, c1),
-                    ).view(1, s, g, head_dim)
-                    k_g = _int8_gemm_prequant(
+                    )
+                    _add_qkv_lora_inplace(q_g_2d, c0, c1)
+                    k_g_2d = _int8_gemm_prequant(
                         x_qdata, x_scale, qkv_qdata[inner + c0 : inner + c1],
                         _slice_scale(qkv_scale, inner + c0, inner + c1),
                         dtype, _slice_bias(b_qkv, inner + c0, inner + c1),
-                    ).view(1, s, g, head_dim)
-                    q_g, k_g = _apply_qk_norm_rope(attn, q_g, k_g, rope_freqs, qw, kw, rot_dim)
+                    )
+                    _add_qkv_lora_inplace(k_g_2d, inner + c0, inner + c1)
+                    q_g, k_g = _apply_qk_norm_rope(
+                        attn, q_g_2d.view(1, s, g, head_dim), k_g_2d.view(1, s, g, head_dim),
+                        rope_freqs, qw, kw, rot_dim,
+                    )
 
                     def _make_v(_c0=c0, _c1=c1, _g=g):
-                        return _int8_gemm_prequant(
+                        v_2d = _int8_gemm_prequant(
                             x_qdata, x_scale, qkv_qdata[2 * inner + _c0 : 2 * inner + _c1],
                             _slice_scale(qkv_scale, 2 * inner + _c0, 2 * inner + _c1),
                             dtype, _slice_bias(b_qkv, 2 * inner + _c0, 2 * inner + _c1),
-                        ).view(1, s, _g, head_dim)
+                        )
+                        _add_qkv_lora_inplace(v_2d, 2 * inner + _c0, 2 * inner + _c1)
+                        return v_2d.view(1, s, _g, head_dim)
 
-                    o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
-                    del q_g, k_g
+                    o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
+                    del q_g, k_g, q_g_2d, k_g_2d
                     o_g_2d = o_g.view(s, g * head_dim)
+                    if out_mid is not None:
+                        torch.addmm(out_mid, o_g_2d, out_a_cat[:, c0:c1].t(), beta=1.0, alpha=1.0, out=out_mid)
                     b_group = b_out if g_idx == 0 else None
+                    b_group_arg = bias_out_arg if g_idx == 0 else bias_empty_arg
                     if out_is_int8:
                         w_out_g = w_out._qdata[:, c0:c1].contiguous()
                         out_scale = w_out._params.scale
                         for t0 in range(0, s, token_chunk):
                             t1 = min(t0 + token_chunk, s)
                             sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-                            proj_c = _ck.int8_linear(
-                                o_g_2d[t0:t1], w_out_g, out_scale, b_group, dtype,
-                                convrot=out_convrot, convrot_groupsize=out_gs,
+                            _int8_linear_residual_inplace(
+                                o_g_2d[t0:t1], w_out_g, out_scale, ws_out_cutlass, b_group_arg, b_group,
+                                out_convrot, out_gs, x[t0:t1], gate_msa, gate_msa_cast, sub_segs,
                             )
-                            _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
-                            del proj_c
                         del w_out_g
                     else:
                         w_out_g = w_out[:, c0:c1]
@@ -1064,7 +1719,15 @@ def _run_chunked_attention_int8(
                         del w_out_g
                     del o_g, o_g_2d
                     hs = he
-                del x_qdata, x_scale
+
+                del x_qdata, x_scale, qkv_mid, qkv_b_cat, out_a_cat, out_packed
+                # Apply out_proj LoRA up-projection ONCE via gated addmm directly into residual x
+                if out_mid is not None:
+                    gated_b_cache: dict[int, torch.Tensor] = {}
+                    _add_gated_lora_mid_residual_inplace(
+                        x, out_mid, out_b_cat, gate_msa, gate_msa_cast, mod_segments, gated_b_cache
+                    )
+                    del out_mid, out_b_cat, gated_b_cache
                 return
 
     # Exact mode (Option 1): 100.00% bit-identical to stock KJ SageAttention2++
@@ -1075,37 +1738,73 @@ def _run_chunked_attention_int8(
     for g in group_sizes:
         he = hs + g
         c0, c1 = hs * head_dim, he * head_dim
-        q_g = _int8_gemm_prequant(
+        q_g_2d = _int8_gemm_prequant(
             x_qdata, x_scale, qkv_qdata[c0:c1], _slice_scale(qkv_scale, c0, c1),
             dtype, _slice_bias(b_qkv, c0, c1),
-        ).view(1, s, g, head_dim)
-        k_g = _int8_gemm_prequant(
+        )
+        _add_qkv_lora_inplace(q_g_2d, c0, c1)
+        k_g_2d = _int8_gemm_prequant(
             x_qdata, x_scale, qkv_qdata[inner + c0 : inner + c1],
             _slice_scale(qkv_scale, inner + c0, inner + c1),
             dtype, _slice_bias(b_qkv, inner + c0, inner + c1),
-        ).view(1, s, g, head_dim)
-        q_g, k_g = _apply_qk_norm_rope(attn, q_g, k_g, rope_freqs, qw, kw, rot_dim)
+        )
+        _add_qkv_lora_inplace(k_g_2d, inner + c0, inner + c1)
+        q_g, k_g = _apply_qk_norm_rope(
+            attn, q_g_2d.view(1, s, g, head_dim), k_g_2d.view(1, s, g, head_dim),
+            rope_freqs, qw, kw, rot_dim,
+        )
 
         def _make_v(_c0=c0, _c1=c1, _g=g):
-            return _int8_gemm_prequant(
+            v_2d = _int8_gemm_prequant(
                 x_qdata, x_scale, qkv_qdata[2 * inner + _c0 : 2 * inner + _c1],
                 _slice_scale(qkv_scale, 2 * inner + _c0, 2 * inner + _c1),
                 dtype, _slice_bias(b_qkv, 2 * inner + _c0, 2 * inner + _c1),
-            ).view(1, s, _g, head_dim)
+            )
+            _add_qkv_lora_inplace(v_2d, 2 * inner + _c0, 2 * inner + _c1)
+            return v_2d.view(1, s, _g, head_dim)
 
-        out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
-        del q_g, k_g
+        out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
+        del q_g, k_g, q_g_2d, k_g_2d
         hs = he
 
-    del x_qdata, x_scale
+    del x_qdata, x_scale, qkv_mid, qkv_b_cat
 
     with _cast_linear_once(attn.out_proj, device, dtype) as (w_out, b_out):
+        out_is_int8 = _is_int8_tensorwise(w_out)
+        out_packed = _prepare_lora_packed(out_loras, device, dtype)
+        gated_out_cache: dict[int, torch.Tensor] = {}
+        ws_out_cutlass = None
+        bias_out_arg = None
+        out_convrot = bool(getattr(w_out._params, "convrot", False)) if out_is_int8 else False
+        out_gs = int(getattr(w_out._params, "convrot_groupsize", 256)) if out_is_int8 else 256
+        if out_is_int8 and _ck_cuda is not None:
+            ws_tmp = _ck_cuda._int8_weight_scale_arg(w_out._params.scale, device)
+            ws_out_cutlass = ws_tmp if ws_tmp.numel() == hidden else ws_tmp.expand(hidden).contiguous()
+            bias_out_arg = (
+                _ck_cuda._gemm_vector_arg(b_out, device, dtype)
+                if b_out is not None
+                else _ck_cuda._empty_cuda_tensor(device, dtype)
+            )
         for t0 in range(0, s, token_chunk):
             t1 = min(t0 + token_chunk, s)
             sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-            proj_c = _linear_with_cast_weight(out[t0:t1], w_out, b_out)
-            _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
-            del proj_c
+            o_chunk = out[t0:t1]
+            if out_is_int8:
+                _int8_linear_residual_inplace(
+                    o_chunk, w_out._qdata, w_out._params.scale, ws_out_cutlass, bias_out_arg, b_out,
+                    out_convrot, out_gs, x[t0:t1], gate_msa, gate_msa_cast, sub_segs,
+                )
+            else:
+                proj_c = _linear_with_cast_weight(o_chunk, w_out, b_out)
+                _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
+                del proj_c
+            if out_packed is not None:
+                o_mid = F.linear(o_chunk, out_packed[1])
+                _add_gated_lora_mid_residual_inplace(
+                    x[t0:t1], o_mid, out_packed[0], gate_msa, gate_msa_cast, sub_segs, gated_out_cache
+                )
+                del o_mid
+        del out_packed, gated_out_cache
     del out, out_nhd
 
 
@@ -1125,6 +1824,9 @@ def _run_chunked_attention_dense(
     eff_mode: str,
     sol_ctx: dict | None = None,
     block_idx: int | None = None,
+    qkv_loras=None,
+    out_loras=None,
+    attn_temp_scale: float = 1.0,
 ) -> None:
     """Dense BF16/FP16/LoRA path: zero full `[S, 21504]` QKV buffer, 100% algebraically exact in both modes."""
     s = x.shape[0]
@@ -1139,36 +1841,49 @@ def _run_chunked_attention_dense(
     rot_dim = rope_freqs.shape[-3] * 2 if rope_freqs is not None else 0
 
     group_sizes = _split_heads_even(heads, head_chunks, 0, head_dim)
+    qkv_packed = _prepare_lora_packed(qkv_loras, device, dtype)
 
-    def _project_rows(nw1, r0: int, r1: int) -> torch.Tensor:
-        w_slice = w_qkv[r0:r1]
-        b_slice = b_qkv[r0:r1] if b_qkv is not None else None
-        buf = torch.empty((s, r1 - r0), dtype=dtype, device=device)
-        for t0 in range(0, s, token_chunk):
-            t1 = min(t0 + token_chunk, s)
-            sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-            h_c = F.rms_norm(x[t0:t1], block.norm1.normalized_shape, nw1, block.norm1.eps)
-            _mod_scale_shift(h_c, shift_msa, scale_msa, sub_segs)
-            buf[t0:t1] = F.linear(h_c, w_slice, b_slice)
-            del h_c
-        return buf
-
+    use_fused_rms = eff_mode == "streaming"
     with _cast_rmsnorm_once(block.norm1, x) as nw1:
+        eff_scale1, shift1_cast = _prepare_rms_adaln_tables(nw1, scale_msa, shift_msa, dtype)
+
+        def _project_rows(r0: int, r1: int) -> torch.Tensor:
+            w_slice = w_qkv[r0:r1]
+            b_slice = b_qkv[r0:r1] if b_qkv is not None else None
+            buf = torch.empty((s, r1 - r0), dtype=dtype, device=device)
+            for t0 in range(0, s, token_chunk):
+                t1 = min(t0 + token_chunk, s)
+                sub_segs = _slice_mod_segments(mod_segments, t0, t1)
+                h_c = _rms_adaln_chunk(
+                    x[t0:t1], block.norm1.normalized_shape, nw1, block.norm1.eps,
+                    shift_msa, scale_msa, eff_scale1, shift1_cast, sub_segs,
+                    use_fused_rms=use_fused_rms,
+                )
+                out_c = F.linear(h_c, w_slice, b_slice)
+                if qkv_packed is not None:
+                    mid_c = F.linear(h_c, qkv_packed[1])
+                    torch.addmm(out_c, mid_c, qkv_packed[0][r0:r1].t(), beta=1.0, alpha=1.0, out=out_c)
+                    del mid_c
+                buf[t0:t1] = out_c
+                del h_c, out_c
+            return buf
+
         if eff_mode == "streaming":
             with _cast_linear_once(attn.out_proj, device, dtype) as (w_out, b_out):
                 if not isinstance(w_out, qops.QuantizedTensor):
+                    out_packed = _prepare_lora_packed(out_loras, device, dtype)
                     hs = 0
                     for g_idx, g in enumerate(group_sizes):
                         he = hs + g
                         c0, c1 = hs * head_dim, he * head_dim
-                        q_g = _project_rows(nw1, c0, c1).view(1, s, g, head_dim)
-                        k_g = _project_rows(nw1, inner + c0, inner + c1).view(1, s, g, head_dim)
+                        q_g = _project_rows(c0, c1).view(1, s, g, head_dim)
+                        k_g = _project_rows(inner + c0, inner + c1).view(1, s, g, head_dim)
                         q_g, k_g = _apply_qk_norm_rope(attn, q_g, k_g, rope_freqs, qw, kw, rot_dim)
 
                         def _make_v(_c0=c0, _c1=c1, _g=g):
-                            return _project_rows(nw1, 2 * inner + _c0, 2 * inner + _c1).view(1, s, _g, head_dim)
+                            return _project_rows(2 * inner + _c0, 2 * inner + _c1).view(1, s, _g, head_dim)
 
-                        o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
+                        o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
                         del q_g, k_g
                         o_g_2d = o_g.view(s, g * head_dim)
                         w_out_g = w_out[:, c0:c1]
@@ -1176,11 +1891,17 @@ def _run_chunked_attention_dense(
                         for t0 in range(0, s, token_chunk):
                             t1 = min(t0 + token_chunk, s)
                             sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-                            proj_c = F.linear(o_g_2d[t0:t1], w_out_g, b_group)
+                            o_chunk = o_g_2d[t0:t1]
+                            proj_c = F.linear(o_chunk, w_out_g, b_group)
+                            if out_packed is not None:
+                                mid_o = F.linear(o_chunk, out_packed[1][:, c0:c1])
+                                torch.addmm(proj_c, mid_o, out_packed[0].t(), beta=1.0, alpha=1.0, out=proj_c)
+                                del mid_o
                             _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
                             del proj_c
                         del o_g, o_g_2d, w_out_g
                         hs = he
+                    del qkv_packed, out_packed
                     return
 
         out = torch.empty((s, inner), dtype=dtype, device=device)
@@ -1189,30 +1910,46 @@ def _run_chunked_attention_dense(
         for g in group_sizes:
             he = hs + g
             c0, c1 = hs * head_dim, he * head_dim
-            q_g = _project_rows(nw1, c0, c1).view(1, s, g, head_dim)
-            k_g = _project_rows(nw1, inner + c0, inner + c1).view(1, s, g, head_dim)
+            q_g = _project_rows(c0, c1).view(1, s, g, head_dim)
+            k_g = _project_rows(inner + c0, inner + c1).view(1, s, g, head_dim)
             q_g, k_g = _apply_qk_norm_rope(attn, q_g, k_g, rope_freqs, qw, kw, rot_dim)
 
             def _make_v(_c0=c0, _c1=c1, _g=g):
-                return _project_rows(nw1, 2 * inner + _c0, 2 * inner + _c1).view(1, s, _g, head_dim)
+                return _project_rows(2 * inner + _c0, 2 * inner + _c1).view(1, s, _g, head_dim)
 
-            out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
+            out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
             del q_g, k_g
             hs = he
+    del qkv_packed
 
     with _cast_linear_once(attn.out_proj, device, dtype) as (w_out, b_out):
+        out_packed = _prepare_lora_packed(out_loras, device, dtype)
         for t0 in range(0, s, token_chunk):
             t1 = min(t0 + token_chunk, s)
             sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-            proj_c = _linear_with_cast_weight(out[t0:t1], w_out, b_out)
+            o_chunk = out[t0:t1]
+            proj_c = _linear_with_cast_weight(o_chunk, w_out, b_out)
+            if out_packed is not None:
+                _add_lora_inplace(proj_c, o_chunk, out_packed)
             _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
             del proj_c
+        del out_packed
     del out, out_nhd
 
 
-def _run_chunked_mlp_inplace(block, x: torch.Tensor, shift_mlp, scale_mlp, gate_mlp, mod_segments, token_chunk: int) -> None:
-    """Fused token-chunked `norm2 + _mod_scale_shift + SwiGLU MLP + _mod_gate` (100% bit-exact)."""
-    s = x.shape[0]
+def _run_chunked_mlp_inplace(
+    block,
+    x: torch.Tensor,
+    shift_mlp,
+    scale_mlp,
+    gate_mlp,
+    mod_segments,
+    token_chunk: int,
+    transformer_options: dict | None = None,
+    use_fused_rms: bool = True,
+) -> None:
+    """Fused token-chunked `rms_adaln + SwiGLU MLP + BF16 LoRA side-branch + CUTLASS residual epilogue`."""
+    s, hidden = x.shape
     dtype = x.dtype
     device = x.device
     fc1 = block.mlp.fc1
@@ -1226,13 +1963,22 @@ def _run_chunked_mlp_inplace(block, x: torch.Tensor, shift_mlp, scale_mlp, gate_
         or getattr(fc2, "input_scale", None) is not None
     )
 
+    fc1_packed = _prepare_lora_packed(_get_linear_loras(fc1, transformer_options), device, dtype)
+    fc2_packed = _prepare_lora_packed(_get_linear_loras(fc2, transformer_options), device, dtype)
+    gated_fc2_cache: dict[int, torch.Tensor] = {}
+    gate_mlp_cast = gate_mlp.to(dtype).contiguous()
+
     with _cast_rmsnorm_once(block.norm2, x) as nw2:
+        eff_scale2, shift2_cast = _prepare_rms_adaln_tables(nw2, scale_mlp, shift_mlp, dtype)
         if has_extra_scales:
             for t0 in range(0, s, token_chunk):
                 t1 = min(t0 + token_chunk, s)
                 sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-                h_c = F.rms_norm(x[t0:t1], block.norm2.normalized_shape, nw2, block.norm2.eps)
-                _mod_scale_shift(h_c, shift_mlp, scale_mlp, sub_segs)
+                h_c = _rms_adaln_chunk(
+                    x[t0:t1], block.norm2.normalized_shape, nw2, block.norm2.eps,
+                    shift_mlp, scale_mlp, eff_scale2, shift2_cast, sub_segs,
+                    use_fused_rms=use_fused_rms,
+                )
                 mlp_c = comfy.ops.linear_input_act(fc2, fc1(h_c), "swiglu")
                 del h_c
                 _mod_gate(x[t0:t1], gate_mlp, mlp_c, sub_segs)
@@ -1241,17 +1987,66 @@ def _run_chunked_mlp_inplace(block, x: torch.Tensor, shift_mlp, scale_mlp, gate_
 
         with _cast_linear_once(fc1, device, dtype) as (w_fc1, b_fc1):
             with _cast_linear_once(fc2, device, dtype) as (w_fc2, b_fc2):
+                fc2_is_int8 = _is_int8_tensorwise(w_fc2)
+                fc2_convrot = bool(getattr(w_fc2._params, "convrot", False)) if fc2_is_int8 else False
+                fc2_gs = int(getattr(w_fc2._params, "convrot_groupsize", 256)) if fc2_is_int8 else 256
+                ws_fc2_cutlass = None
+                bias_fc2_arg = None
+                if fc2_is_int8 and _ck_cuda is not None:
+                    ws_tmp = _ck_cuda._int8_weight_scale_arg(w_fc2._params.scale, device)
+                    ws_fc2_cutlass = ws_tmp if ws_tmp.numel() == hidden else ws_tmp.expand(hidden).contiguous()
+                    bias_fc2_arg = (
+                        _ck_cuda._gemm_vector_arg(b_fc2, device, dtype)
+                        if b_fc2 is not None
+                        else _ck_cuda._empty_cuda_tensor(device, dtype)
+                    )
+
                 for t0 in range(0, s, token_chunk):
                     t1 = min(t0 + token_chunk, s)
                     sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-                    h_c = F.rms_norm(x[t0:t1], block.norm2.normalized_shape, nw2, block.norm2.eps)
-                    _mod_scale_shift(h_c, shift_mlp, scale_mlp, sub_segs)
+                    h_c = _rms_adaln_chunk(
+                        x[t0:t1], block.norm2.normalized_shape, nw2, block.norm2.eps,
+                        shift_mlp, scale_mlp, eff_scale2, shift2_cast, sub_segs,
+                        use_fused_rms=use_fused_rms,
+                    )
                     fc1_c = _linear_with_cast_weight(h_c, w_fc1, b_fc1)
+                    if fc1_packed is not None:
+                        _add_lora_inplace(fc1_c, h_c, fc1_packed)
                     del h_c
-                    mlp_c = comfy.ops.linear_input_act_(fc1_c, w_fc2, b_fc2, "swiglu")
-                    del fc1_c
-                    _mod_gate(x[t0:t1], gate_mlp, mlp_c, sub_segs)
-                    del mlp_c
+
+                    if fc2_packed is not None:
+                        # Single-pass fused Triton SwiGLU matching comfy_kitchen FP32 SiLU
+                        act_c = _swiglu_chunk(fc1_c)
+                        del fc1_c
+                        if fc2_is_int8:
+                            _int8_linear_residual_inplace(
+                                act_c, w_fc2._qdata, w_fc2._params.scale, ws_fc2_cutlass,
+                                bias_fc2_arg, b_fc2, fc2_convrot, fc2_gs,
+                                x[t0:t1], gate_mlp, gate_mlp_cast, sub_segs, input_act=None,
+                            )
+                        else:
+                            mlp_c = _linear_with_cast_weight(act_c, w_fc2, b_fc2)
+                            _mod_gate(x[t0:t1], gate_mlp, mlp_c, sub_segs)
+                            del mlp_c
+                        fc2_mid = F.linear(act_c, fc2_packed[1])
+                        del act_c
+                        _add_gated_lora_mid_residual_inplace(
+                            x[t0:t1], fc2_mid, fc2_packed[0], gate_mlp, gate_mlp_cast, sub_segs, gated_fc2_cache
+                        )
+                        del fc2_mid
+                    elif fc2_is_int8:
+                        _int8_linear_residual_inplace(
+                            fc1_c, w_fc2._qdata, w_fc2._params.scale, ws_fc2_cutlass,
+                            bias_fc2_arg, b_fc2, fc2_convrot, fc2_gs,
+                            x[t0:t1], gate_mlp, gate_mlp_cast, sub_segs, input_act="swiglu",
+                        )
+                        del fc1_c
+                    else:
+                        mlp_c = comfy.ops.linear_input_act_(fc1_c, w_fc2, b_fc2, "swiglu")
+                        del fc1_c
+                        _mod_gate(x[t0:t1], gate_mlp, mlp_c, sub_segs)
+                        del mlp_c
+    del fc1_packed, fc2_packed, gated_fc2_cache
 
 
 def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
@@ -1272,10 +2067,13 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
         n_groups = min(n_groups, heads)
         sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
         block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
+        attn_temp_scale = float(transformer_options.get("_chunked_sage_attn_temp", 1.0)) if isinstance(transformer_options, dict) else 1.0
 
         qw = mm.cast_to(self.q_norm.weight, device=device) if rope_freqs is not None else None
         kw = mm.cast_to(self.k_norm.weight, device=device) if rope_freqs is not None else None
         rot_dim = rope_freqs.shape[-3] * 2 if rope_freqs is not None else 0
+        qkv_packed = _prepare_lora_packed(_get_linear_loras(self.qkv_proj, transformer_options), device, dtype)
+        out_packed = _prepare_lora_packed(_get_linear_loras(self.out_proj, transformer_options), device, dtype)
 
         with _cast_linear_once(self.qkv_proj, device, dtype) as (w_qkv, b_qkv):
             if _is_int8_tensorwise(w_qkv) and x.is_cuda and _ck_cuda is not None:
@@ -1285,10 +2083,22 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                 qkv_gs = int(getattr(w_qkv._params, "convrot_groupsize", 256))
                 x_qdata = torch.empty((s, x.shape[1]), dtype=torch.int8, device=device)
                 x_scale = torch.empty((s, 1), dtype=torch.float32, device=device)
+                qkv_mid = (
+                    torch.empty((s, qkv_packed[1].shape[0]), dtype=dtype, device=device)
+                    if qkv_packed is not None
+                    else None
+                )
                 for t0 in range(0, s, token_chunk):
                     t1 = min(t0 + token_chunk, s)
+                    if qkv_mid is not None:
+                        qkv_mid[t0:t1] = F.linear(x[t0:t1], qkv_packed[1])
                     _quantize_int8_convrot_into(x[t0:t1], x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
                 del x
+
+                def _add_sa_qkv_lora(buf_2d: torch.Tensor, r0: int, r1: int) -> None:
+                    if qkv_mid is None:
+                        return
+                    torch.addmm(buf_2d, qkv_mid, qkv_packed[0][r0:r1].t(), beta=1.0, alpha=1.0, out=buf_2d)
 
                 def _sc(r0, r1):
                     return qkv_scale[r0:r1] if (qkv_scale.ndim > 0 and qkv_scale.numel() > 1) else qkv_scale
@@ -1302,35 +2112,46 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                 for g in _split_heads_even(heads, n_groups, 0, head_dim):
                     he = hs + g
                     c0, c1 = hs * head_dim, he * head_dim
-                    q_g = _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[c0:c1], _sc(c0, c1), dtype, _bs(c0, c1)).view(1, s, g, head_dim)
-                    k_g = _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[inner + c0 : inner + c1], _sc(inner + c0, inner + c1), dtype, _bs(inner + c0, inner + c1)).view(1, s, g, head_dim)
-                    q_g, k_g = _apply_qk_norm_rope(self, q_g, k_g, rope_freqs, qw, kw, rot_dim)
+                    q_2d = _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[c0:c1], _sc(c0, c1), dtype, _bs(c0, c1))
+                    _add_sa_qkv_lora(q_2d, c0, c1)
+                    k_2d = _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[inner + c0 : inner + c1], _sc(inner + c0, inner + c1), dtype, _bs(inner + c0, inner + c1))
+                    _add_sa_qkv_lora(k_2d, inner + c0, inner + c1)
+                    q_g, k_g = _apply_qk_norm_rope(self, q_2d.view(1, s, g, head_dim), k_2d.view(1, s, g, head_dim), rope_freqs, qw, kw, rot_dim)
 
                     def _make_v(_c0=c0, _c1=c1, _g=g):
-                        return _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[2 * inner + _c0 : 2 * inner + _c1], _sc(2 * inner + _c0, 2 * inner + _c1), dtype, _bs(2 * inner + _c0, 2 * inner + _c1)).view(1, s, _g, head_dim)
+                        v_2d = _int8_gemm_prequant(x_qdata, x_scale, qkv_qdata[2 * inner + _c0 : 2 * inner + _c1], _sc(2 * inner + _c0, 2 * inner + _c1), dtype, _bs(2 * inner + _c0, 2 * inner + _c1))
+                        _add_sa_qkv_lora(v_2d, 2 * inner + _c0, 2 * inner + _c1)
+                        return v_2d.view(1, s, _g, head_dim)
 
-                    out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
-                    del q_g, k_g
+                    out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
+                    del q_g, k_g, q_2d, k_2d
                     hs = he
-                del x_qdata, x_scale
+                del x_qdata, x_scale, qkv_mid
             elif not isinstance(w_qkv, qops.QuantizedTensor):
                 out = torch.empty((s, inner), dtype=dtype, device=device)
                 out_nhd = out.view(1, s, heads, head_dim)
+                qkv_mid = F.linear(x, qkv_packed[1]) if qkv_packed is not None else None
                 hs = 0
                 for g in _split_heads_even(heads, n_groups, 0, head_dim):
                     he = hs + g
                     c0, c1 = hs * head_dim, he * head_dim
-                    q_g = F.linear(x, w_qkv[c0:c1], b_qkv[c0:c1] if b_qkv is not None else None).view(1, s, g, head_dim)
-                    k_g = F.linear(x, w_qkv[inner + c0 : inner + c1], b_qkv[inner + c0 : inner + c1] if b_qkv is not None else None).view(1, s, g, head_dim)
-                    q_g, k_g = _apply_qk_norm_rope(self, q_g, k_g, rope_freqs, qw, kw, rot_dim)
+                    q_2d = F.linear(x, w_qkv[c0:c1], b_qkv[c0:c1] if b_qkv is not None else None)
+                    k_2d = F.linear(x, w_qkv[inner + c0 : inner + c1], b_qkv[inner + c0 : inner + c1] if b_qkv is not None else None)
+                    if qkv_mid is not None:
+                        torch.addmm(q_2d, qkv_mid, qkv_packed[0][c0:c1].t(), beta=1.0, alpha=1.0, out=q_2d)
+                        torch.addmm(k_2d, qkv_mid, qkv_packed[0][inner + c0 : inner + c1].t(), beta=1.0, alpha=1.0, out=k_2d)
+                    q_g, k_g = _apply_qk_norm_rope(self, q_2d.view(1, s, g, head_dim), k_2d.view(1, s, g, head_dim), rope_freqs, qw, kw, rot_dim)
 
                     def _make_v(_c0=c0, _c1=c1, _g=g):
-                        return F.linear(x, w_qkv[2 * inner + _c0 : 2 * inner + _c1], b_qkv[2 * inner + _c0 : 2 * inner + _c1] if b_qkv is not None else None).view(1, s, _g, head_dim)
+                        v_2d = F.linear(x, w_qkv[2 * inner + _c0 : 2 * inner + _c1], b_qkv[2 * inner + _c0 : 2 * inner + _c1] if b_qkv is not None else None)
+                        if qkv_mid is not None:
+                            torch.addmm(v_2d, qkv_mid, qkv_packed[0][2 * inner + _c0 : 2 * inner + _c1].t(), beta=1.0, alpha=1.0, out=v_2d)
+                        return v_2d.view(1, s, _g, head_dim)
 
-                    out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx)
-                    del q_g, k_g
+                    out_nhd[:, :, hs:he] = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
+                    del q_g, k_g, q_2d, k_2d
                     hs = he
-                del x
+                del x, qkv_mid
             else:
                 # Non-INT8 quantized fallback (e.g. FP8/NVFP4): chunk QKV along tokens
                 q_all = torch.empty((s, inner), dtype=dtype, device=device)
@@ -1361,13 +2182,19 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                     )
                     hs = he
                 del q_all, k_all, v_all
+        del qkv_packed
 
         res = torch.empty((s, self.out_proj.out_features), dtype=dtype, device=device)
         with _cast_linear_once(self.out_proj, device, dtype) as (w_out, b_out):
             for t0 in range(0, s, token_chunk):
                 t1 = min(t0 + token_chunk, s)
-                res[t0:t1] = _linear_with_cast_weight(out[t0:t1], w_out, b_out)
-        del out, out_nhd
+                o_c = out[t0:t1]
+                r_c = _linear_with_cast_weight(o_c, w_out, b_out)
+                if out_packed is not None:
+                    _add_lora_inplace(r_c, o_c, out_packed)
+                res[t0:t1] = r_c
+                del r_c
+        del out, out_nhd, out_packed
         return res
 
     minimax_chunked_sageattn_forward._is_chunked_sage_attn = True
@@ -1393,7 +2220,12 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
             attn_out = attn_fn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
             x = _mod_gate(x, gate_msa, attn_out, mod_segments)
             del attn_out
-            _run_chunked_mlp_inplace(self, x, shift_mlp, scale_mlp, gate_mlp, mod_segments, token_chunk)
+            eff_mode_ext = _resolve_out_proj_mode(out_proj_mode, s, device)
+            _run_chunked_mlp_inplace(
+                self, x, shift_mlp, scale_mlp, gate_mlp, mod_segments, token_chunk,
+                transformer_options=transformer_options,
+                use_fused_rms=(eff_mode_ext == "streaming"),
+            )
             return x
 
         n_groups = head_chunks
@@ -1403,6 +2235,9 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
         eff_mode = _resolve_out_proj_mode(out_proj_mode, s, device)
         sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
         block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
+        attn_temp_scale = float(transformer_options.get("_chunked_sage_attn_temp", 1.0)) if isinstance(transformer_options, dict) else 1.0
+        qkv_loras = _get_linear_loras(self.attn.qkv_proj, transformer_options)
+        out_loras = _get_linear_loras(self.attn.out_proj, transformer_options)
 
         has_qkv_extra_scales = (
             getattr(self.attn.qkv_proj, "pre_quant_scale", None) is not None
@@ -1416,6 +2251,8 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                         self, self.attn, x, shift_msa, scale_msa, gate_msa, mod_segments,
                         rope_freqs, w_qkv, b_qkv, n_groups, token_chunk, eff_mode,
                         sol_ctx=sol_ctx, block_idx=block_idx,
+                        qkv_loras=qkv_loras, out_loras=out_loras,
+                        attn_temp_scale=attn_temp_scale,
                     )
                     handled = True
                 elif not isinstance(w_qkv, qops.QuantizedTensor):
@@ -1423,6 +2260,8 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                         self, self.attn, x, shift_msa, scale_msa, gate_msa, mod_segments,
                         rope_freqs, w_qkv, b_qkv, n_groups, token_chunk, eff_mode,
                         sol_ctx=sol_ctx, block_idx=block_idx,
+                        qkv_loras=qkv_loras, out_loras=out_loras,
+                        attn_temp_scale=attn_temp_scale,
                     )
                     handled = True
                 else:
@@ -1437,7 +2276,11 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
             x = _mod_gate(x, gate_msa, attn_out, mod_segments)
             del attn_out
 
-        _run_chunked_mlp_inplace(self, x, shift_mlp, scale_mlp, gate_mlp, mod_segments, token_chunk)
+        _run_chunked_mlp_inplace(
+            self, x, shift_mlp, scale_mlp, gate_mlp, mod_segments, token_chunk,
+            transformer_options=transformer_options,
+            use_fused_rms=(eff_mode == "streaming"),
+        )
         return x
 
     minimax_chunked_sageattn_block_forward._is_chunked_sage_block = True
@@ -1529,6 +2372,7 @@ def _make_chunked_video_patch_proj_forward(orig_forward, token_chunk: int, targe
                 out[t0:t1] = F.linear(x[t0:t1], w, b).to(out_dtype)
         return out
 
+    chunked_video_patch_proj_forward._orig_vpp_forward = orig_forward
     return chunked_video_patch_proj_forward
 
 
@@ -1557,11 +2401,11 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                 io.Model.Input("model"),
                 io.Int.Input(
                     "head_chunks",
-                    default=14,
+                    default=7,
                     min=1,
                     max=56,
                     step=1,
-                    tooltip="注意力头分组数（56 头推荐 7=每组8头 或 14=每组4头；自动按 2 头=256 ConvRot 块对齐）。",
+                    tooltip="注意力头分组数（56 头默认推荐 7=每组8头，显存带宽折半且吃满 SM89；极限超长序列可改 14=每组4头；自动按 2 头=256 ConvRot 块对齐）。",
                 ),
                 io.Combo.Input(
                     "out_proj_mode",
@@ -1665,6 +2509,36 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                     advanced=True,
                     tooltip="仅对 sigma ≥ 该值的步启用稀疏（设为 0.15 可让末步回落稠密精修）。",
                 ),
+                io.Float.Input(
+                    "rope_hf_scale",
+                    default=1.0,
+                    min=0.5,
+                    max=2.0,
+                    step=0.02,
+                    optional=True,
+                    advanced=True,
+                    tooltip="分频段空间 RoPE 高频解压缩倍数（1.0=原版关闭；1080p 推荐 1.32，仅放大视频高频空间频段 k=0..5 并平滑过渡，不动低频构图与音频对齐）。",
+                ),
+                io.Float.Input(
+                    "attn_temp_scale",
+                    default=1.0,
+                    min=0.8,
+                    max=1.3,
+                    step=0.01,
+                    optional=True,
+                    advanced=True,
+                    tooltip="长序列注意力 softmax 温度补偿倍数（1.0=原版关闭；1080p 154k token 推荐 1.08 抑制注意力熵稀释）。",
+                ),
+                io.Float.Input(
+                    "sol_low_sigma_tau",
+                    default=0.0,
+                    min=0.0,
+                    max=2.0,
+                    step=0.05,
+                    optional=True,
+                    advanced=True,
+                    tooltip="当 sigma < sol_min_sigma 时的末步策略：0.0=退回100%稠密KJ Sage（864p/10s默认）；设为 0.90 则切 Tight-Sol（tau=0.90, aug≥128, 首尾各3层稠密），15s 1080p 末步提速 2.5×！",
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -1675,7 +2549,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
     def execute(
         cls,
         model,
-        head_chunks: int = 14,
+        head_chunks: int = 7,
         out_proj_mode: str = "auto",
         token_chunk_size: int = 8192,
         chunk_io_layers: bool = True,
@@ -1688,6 +2562,9 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
         sol_dense_blocks: str = "",
         sol_max_sigma: float = 0.95,
         sol_min_sigma: float = 0.0,
+        rope_hf_scale: float = 1.0,
+        attn_temp_scale: float = 1.0,
+        sol_low_sigma_tau: float = 0.0,
     ) -> io.NodeOutput:
         if _cuda_archs is None:
             raise RuntimeError(
@@ -1721,6 +2598,10 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             eff_attn_mode = "dense_sage"
 
         sol_dense_set = _parse_dense_blocks(sol_dense_blocks, len(blocks))
+        n_blk = len(blocks)
+        sol_low_sigma_dense_set = sol_dense_set | frozenset(
+            list(range(min(3, n_blk))) + list(range(max(0, n_blk - 3), n_blk))
+        )
         sol_token_aug = max(0, min(256, (int(sol_token_aug) // 64) * 64))
         sol_cfg = {
             "attention_mode": eff_attn_mode,
@@ -1731,9 +2612,54 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             "sol_min_tokens": int(sol_min_tokens),
             "sol_dense_blocks": str(sol_dense_blocks),
             "sol_dense_blocks_set": sol_dense_set,
+            "sol_low_sigma_tau": float(sol_low_sigma_tau),
+            "sol_low_sigma_dense_blocks_set": sol_low_sigma_dense_set,
             "sol_max_sigma": float(sol_max_sigma),
             "sol_min_sigma": float(sol_min_sigma),
         }
+
+        # Offload upstream INT8-linear standard LoRA patches from `m.patches` to exact BF16
+        # low-rank side-branches. Eliminates per-step 200-layer VBAR dequant/B@A/requant
+        # (saves ~10-16 s/step + ~350 MiB AIMDO_CAST_BUFFER) and prevents 8-bit crushing of
+        # low-strength sharpness LoRAs (e.g. minimax_h3_lms_v1.0_r64_r @ 0.15-0.20).
+        static_loras: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        # If chaining ChunkedSage -> LoraLoader -> ChunkedSage on the SAME ModelPatcher lineage,
+        # inherit the upstream ChunkedSage's static_loras (NEVER from a separate loaded branch!).
+        prev_patched_rb = m.object_patches.get("diffusion_model._run_blocks")
+        prev_rb_fn = prev_patched_rb.__func__ if isinstance(prev_patched_rb, types.MethodType) else prev_patched_rb
+        if getattr(prev_rb_fn, "_is_chunked_sage_run_blocks", False):
+            inherited = getattr(prev_rb_fn, "_chunked_sage_static_loras", None) or {}
+            for k, v in inherited.items():
+                static_loras[k] = list(v)
+
+        patches_dict = getattr(m, "patches", None)
+        popped_any = False
+        if isinstance(patches_dict, dict) and patches_dict:
+            for idx, block in enumerate(blocks):
+                for suffix, lin in (
+                    ("attn.qkv_proj", block.attn.qkv_proj),
+                    ("attn.out_proj", block.attn.out_proj),
+                    ("mlp.fc1", block.mlp.fc1),
+                    ("mlp.fc2", block.mlp.fc2),
+                ):
+                    key = f"diffusion_model.blocks.{idx}.{suffix}.weight"
+                    if key not in patches_dict:
+                        continue
+                    raw_w = getattr(lin, "weight", None)
+                    if not (
+                        isinstance(raw_w, qops.QuantizedTensor)
+                        and getattr(lin, "layout_type", None) is not None
+                        and not getattr(lin, "_full_precision_mm", False)
+                    ):
+                        continue
+                    extracted = _extract_lora_entries_from_patches(patches_dict[key], tuple(raw_w.shape))
+                    if extracted is not None:
+                        patches_dict.pop(key, None)
+                        popped_any = True
+                        if extracted:
+                            static_loras.setdefault(key, []).extend(extracted)
+            if popped_any:
+                m.patches_uuid = uuid.uuid4()
 
         attn_fwd = _make_chunked_attn_forward(head_chunks, token_chunk_size)
         block_fwd = _make_chunked_block_forward(head_chunks, str(out_proj_mode), token_chunk_size)
@@ -1748,18 +2674,26 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                 types.MethodType(block_fwd, block),
             )
 
-        if eff_attn_mode == "sol_attn_sparse":
-            orig_rb = diffusion_model._run_blocks
-            orig_rb_fn = (
-                orig_rb.__func__
-                if (isinstance(orig_rb, types.MethodType) and orig_rb.__self__ is diffusion_model)
-                else type(diffusion_model)._run_blocks
-            )
-            rb_wrapped = _make_sol_run_blocks(orig_rb_fn, sol_cfg)
-            m.add_object_patch(
-                "diffusion_model._run_blocks",
-                types.MethodType(rb_wrapped, diffusion_model),
-            )
+        orig_rb = prev_patched_rb if prev_patched_rb is not None else diffusion_model._run_blocks
+        orig_rb_fn = (
+            orig_rb.__func__
+            if (isinstance(orig_rb, types.MethodType) and orig_rb.__self__ is diffusion_model)
+            else type(diffusion_model)._run_blocks
+        )
+        # Never double-wrap our own `_run_blocks` (e.g. when another branch is still patched in VRAM)
+        while getattr(orig_rb_fn, "_is_chunked_sage_run_blocks", False):
+            orig_rb_fn = getattr(orig_rb_fn, "_orig_run_blocks_fn", type(diffusion_model)._run_blocks)
+        rb_wrapped = _make_chunked_run_blocks(
+            orig_rb_fn,
+            sol_cfg if eff_attn_mode == "sol_attn_sparse" else None,
+            static_loras=static_loras,
+            rope_hf_scale=float(rope_hf_scale),
+            attn_temp_scale=float(attn_temp_scale),
+        )
+        m.add_object_patch(
+            "diffusion_model._run_blocks",
+            types.MethodType(rb_wrapped, diffusion_model),
+        )
 
         if chunk_io_layers:
             if hasattr(diffusion_model, "final_layer"):
@@ -1776,8 +2710,11 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                         target_dtype = m.model.get_dtype()
                     except Exception:
                         target_dtype = None
+                orig_vpp_fwd = vpp.forward
+                while hasattr(orig_vpp_fwd, "_orig_vpp_forward"):
+                    orig_vpp_fwd = orig_vpp_fwd._orig_vpp_forward
                 vpp_fwd = _make_chunked_video_patch_proj_forward(
-                    vpp.forward, token_chunk_size, target_dtype
+                    orig_vpp_fwd, token_chunk_size, target_dtype
                 )
                 m.add_object_patch(
                     "diffusion_model.video_patch_proj.forward",
@@ -1794,15 +2731,31 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             "sol_token_aug": sol_token_aug,
             "sol_topk_ratio": float(sol_topk_ratio),
             "sol_sink_mode": str(sol_sink_mode),
+            "lora_side_branch_layers": len(static_loras),
             "arch": _cuda_archs[0] if _cuda_archs else "unknown",
             "sageplus_sm89": _sageplus_sm89_available,
             "sol_attn_available": _sol_attn_available,
         }
 
+        _rope_str = ""
+        if float(rope_hf_scale) != 1.0 or float(attn_temp_scale) != 1.0:
+            _rope_str = f" | rope_hf={float(rope_hf_scale):.2f} temp={float(attn_temp_scale):.2f}"
+        _low_str = f", low_tau={float(sol_low_sigma_tau):.2f}" if float(sol_low_sigma_tau) > 0.0 else ""
+        print(
+            f"[SeamKit] ChunkedSage: {len(blocks)} blocks | hc={head_chunks} "
+            f"out_proj={out_proj_mode} attn={eff_attn_mode}"
+            + (
+                f" (tau={float(sol_tau):.2f}, aug={sol_token_aug}, sigma=[{float(sol_min_sigma):.2f},{float(sol_max_sigma):.2f}]{_low_str})"
+                if eff_attn_mode == "sol_attn_sparse"
+                else ""
+            )
+            + f" | bf16_lora={len(static_loras)}/200{_rope_str}",
+            flush=True,
+        )
         logger.info(
             "Applied MiniMaxH3ChunkedSageAttentionPatch (%d blocks, head_chunks=%d, "
             "out_proj_mode=%s, attn=%s, tau=%.2f, aug=%d, sink=%s, token_chunk=%d, "
-            "chunk_io=%s, arch=%s, sageplus=%s)",
+            "chunk_io=%s, lora_side_branch=%d, arch=%s, sageplus=%s)",
             len(blocks),
             head_chunks,
             out_proj_mode,
@@ -1812,6 +2765,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             sol_sink_mode,
             token_chunk_size,
             chunk_io_layers,
+            len(static_loras),
             _cuda_archs[0] if _cuda_archs else "unknown",
             _sageplus_sm89_available,
         )

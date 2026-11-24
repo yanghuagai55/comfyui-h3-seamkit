@@ -77,18 +77,18 @@ class MiniMaxH3Route3Apply(io.ComfyNode):
     def execute(cls, model, mask_path="", s_bg=3, beta_path="", enabled=True,
                 beta_scale=1.0, beta_max=0.0, last_step_dense=True):
         if not enabled:
-            print("[route3] disabled - pass through", flush=True)
+            print("[SeamKit] Route3: disabled (passthrough)", flush=True)
             return io.NodeOutput(model)
 
         provider = load_mask(mask_path) if mask_path and os.path.exists(mask_path) else None
         if mask_path and provider is None:
-            logging.warning("[route3] mask not found: %s -> 直通（不压缩）", mask_path)
+            logging.warning("[SeamKit] Route3: mask not found: %s -> 直通（不压缩）", mask_path)
 
         beta = None
         if beta_path and os.path.exists(beta_path):
             blob = torch.load(beta_path, map_location="cpu", weights_only=True)
             beta = blob.get("beta", blob) if isinstance(blob, dict) else blob
-            print("[route3] beta loaded %s" % (tuple(beta.shape) if torch.is_tensor(beta) else beta,), flush=True)
+            print("[SeamKit] Route3: beta loaded %s" % (tuple(beta.shape) if torch.is_tensor(beta) else beta,), flush=True)
 
         fn = (lambda lt, lh, lw, st=0: provider.for_grid(lt, lh, lw, start_token=st)) if provider else None
         st = Route3State()
@@ -96,7 +96,7 @@ class MiniMaxH3Route3Apply(io.ComfyNode):
                     strict_malloc=False, use_beta=True,
                     beta_scale=float(beta_scale), beta_max=float(beta_max),
                     last_step_dense=bool(last_step_dense))
-        print("[route3] attached: s_bg=%d mask=%s beta=%s scale=%.2f max=%.2f last_step_dense=%s"
+        print("[SeamKit] Route3: attached (s_bg=%d, mask=%s, beta=%s, scale=%.2f, max=%.2f, last_step_dense=%s)"
               % (s_bg, "yes" if provider else "no",
                  "custom" if beta is not None else "auto-beta0",
                  float(beta_scale), float(beta_max), bool(last_step_dense)),
@@ -147,12 +147,12 @@ class MiniMaxH3Route3Probe(io.ComfyNode):
                 s = summarize(p)
                 os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
                 dump(p, s, out_path)
-                print("[route3] probe -> %s  verdict=%s rel_err=%.4f bg_cos=%.4f T=%.3f"
+                print("[SeamKit] Route3: probe -> %s  verdict=%s rel_err=%.4f bg_cos=%.4f T=%.3f"
                       % (out_path, s["verdict"], s["rel_err_median"], s["bg_cos_median"], s["overall_median"]),
                       flush=True)
                 state["done"] = True
             except Exception as e:
-                logging.warning("[route3] probe failed: %r", e)
+                logging.warning("[SeamKit] Route3: probe failed: %r", e)
                 state["done"] = True
             finally:
                 state["busy"] = False
@@ -198,7 +198,7 @@ class MiniMaxH3Route3Assemble(io.ComfyNode):
     def execute(cls, latent_p1_up, latent_p2, s_bg=3, method="lerp", only_bg=True, mask_path=""):
         if method == "none" or latent_p2.get("route3_last_step_dense"):
             if latent_p2.get("route3_last_step_dense"):
-                print("[route3] Assemble: detected last_step_dense=True -> direct passthrough (full-frame refined)", flush=True)
+                print("[SeamKit] Route3: Assemble detected last_step_dense=True -> passthrough", flush=True)
             return io.NodeOutput(latent_p2)
 
         vid_a, _aud_a, is_nested_a = _unpack_av(latent_p1_up["samples"])
@@ -358,7 +358,7 @@ class MiniMaxH3Route3AutoMask(io.ComfyNode):
         rep = "backend=%s fg=%.1f%% shape=%s thr=%.4f -> %s" % (
             used_backend, 100.0 * cov, tuple(m_grid.shape), info["thr"], mpath
         )
-        print("[route3] AutoMask: " + rep, flush=True)
+        print("[SeamKit] Route3: AutoMask " + rep, flush=True)
         return io.NodeOutput(mpath, prev_mask, rep)
 
 

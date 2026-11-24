@@ -221,16 +221,7 @@ class MiniMaxH3FirstPassSampler(io.ComfyNode):
                 n_v, n_a = zero_audio_part(samples, label="一采缓存")
                 dropped = _release_upstream_audio(latent_image)
                 print(
-                    f"[SeamKit] 一采缓存 HIT（跳过采样）: {fname}  fp={fp[:12]}  "
-                    f"saved_at={meta.get('saved_at')}\n"
-                    f"[SeamKit]         音频按设计清零（防旧音频与本次上游音频混流）：\n"
-                    f"[SeamKit]           · 一采把音频与视频一起采样并写入缓存（第一次）；"
-                    f"之后每次运行，上游音频链路照样先跑完才进本节点\n"
-                    f"[SeamKit]           · 缓存里那份是上次采样的旧音频 → 清零（{n_a} 元素）；"
-                    f"上游 latent_image 送入的音频 → 丢弃（{dropped} 元素）\n"
-                    f"[SeamKit]           · ⇒ HIT 路径流向下游的音频恒为静音"
-                    f"（二采拿「干净视频 + 静音」；成片音频由上游/后续节点决定）"
-                    f"——设计行为，不是 bug，也不省显存（音频 latent ≈ 53 KB）",
+                    f"[SeamKit] 一采缓存 HIT（跳过采样）: {fname} | fp={fp[:12]} | 缓存音频已清零 ({n_a}->{dropped})",
                     flush=True,
                 )
                 out = {"samples": samples}

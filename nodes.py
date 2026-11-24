@@ -528,9 +528,14 @@ class MiniMaxH3HardCutPass2Plan(io.ComfyNode):
             "dump_dir": str(legacy_kwargs.get("dump_dir", "latent_dump")),
             "show_memory_log": bool(legacy_kwargs.get("show_memory_log", True)),
         }
+        _extras = []
+        if plan["route3_enabled"]:
+            _extras.append("route3=on")
+        if mode != "auto" or eff_blend:
+            _extras.append(f"seam={mode}" + ("+blend" if eff_blend else ""))
+        _extra_str = (" | " + ", ".join(_extras)) if _extras else ""
         print(
-            "[SeamKit] Pass-2 plan: mode=%s overlap=%df blend=%s pad=%d route3=%s"
-            % (mode, eff_overlap, eff_blend, plan["upscale_pad_tokens"], plan["route3_enabled"]),
+            f"[SeamKit] 二采配置: upscaler={plan['model_name']} ({plan['precision']}, pad={plan['upscale_pad_tokens']}){_extra_str}",
             flush=True,
         )
         return io.NodeOutput(plan)

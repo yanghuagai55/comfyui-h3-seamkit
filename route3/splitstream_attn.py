@@ -171,7 +171,7 @@ def attn_lse(q, k, v, provider: str = "auto"):
             out = _PROVIDERS[name](q, k, v)
             _STATE["provider"] = name
             if name != "flex":
-                print("[route3] LSE provider -> %s" % name)
+                print("[SeamKit] Route3: LSE provider -> %s" % name)
             return out
         except Exception as e:
             _STATE["last_error"] = "%s: %s" % (name, repr(e)[:160])

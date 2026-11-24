@@ -382,6 +382,201 @@ def test_sol_attn_morton_and_sparse_path():
         print("[PASS] test_sol_attn_morton_and_sparse_path (CPU/parser/Morton checks)")
 
 
+@torch.inference_mode()
+def test_bf16_lora_side_branch_and_hooks():
+    """Verify Punch 1: BF16 LoRA side-branch, Triton SwiGLU, LowVramPatch stash/restore, BypassForwardHook."""
+    from comfy.model_patcher import LowVramPatch
+    from comfy.weight_adapter.lora import LoRAAdapter
+    from comfy.weight_adapter.bypass import BypassForwardHook
+
+    # 1. Extractor rejects non-standard patches (DoRA, mid, reshape, offset, fn, strength_model != 1.0)
+    up = torch.randn(32, 4, dtype=torch.float16)
+    dn = torch.randn(4, 16, dtype=torch.float16)
+    ok_ad = LoRAAdapter(set(), (up, dn, 8.0, None, None, None))
+    dora_ad = LoRAAdapter(set(), (up, dn, 8.0, None, torch.ones(32), None))
+    tuck_ad = LoRAAdapter(set(), (up, dn, 8.0, torch.randn(4, 4), None, None))
+    assert cs._extract_lora_entries_from_patches([(0.5, ok_ad, 1.0, None, None)], (32, 16)) is not None
+    got_ok = cs._extract_lora_entries_from_patches([(0.5, ok_ad, 1.0, None, None)], (32, 16))
+    assert len(got_ok) == 1 and abs(got_ok[0][2] - 1.0) < 1e-6  # 0.5 * (8/4) = 1.0
+    assert cs._extract_lora_entries_from_patches([(0.5, dora_ad, 1.0, None, None)], (32, 16)) is None
+    assert cs._extract_lora_entries_from_patches([(0.5, tuck_ad, 1.0, None, None)], (32, 16)) is None
+    assert cs._extract_lora_entries_from_patches([(0.5, ok_ad, 0.8, None, None)], (32, 16)) is None
+    assert cs._extract_lora_entries_from_patches([(0.5, ok_ad, 1.0, (0, 0, 16), None)], (32, 16)) is None
+    assert cs._extract_lora_entries_from_patches([(0.5, ok_ad, 1.0, None, lambda x: x)], (32, 16)) is None
+
+    if not torch.cuda.is_available() or not os.path.exists(CKPT_PATH):
+        print("[PASS] test_bf16_lora_side_branch_and_hooks (CPU checks)")
+        return
+
+    from safetensors import safe_open
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    # 2. Triton fused SwiGLU matches exact FP32 SiLU * up
+    fc1_probe = torch.randn(256, 2048, device=device, dtype=dtype)
+    got_sw = cs._swiglu_chunk(fc1_probe)
+    g_ref, u_ref = fc1_probe.chunk(2, dim=-1)
+    ref_sw = (nn.functional.silu(g_ref.float()) * u_ref.float()).to(dtype)
+    assert (got_sw.float() - ref_sw.float()).abs().max().item() <= 0.02, "Triton SwiGLU mismatch!"
+
+    # 3. Real dasiwa blocks.0 with 2 stacked BF16 LoRAs + LowVramPatch stash/restore + BypassForwardHook
+    ops = comfy.ops.mixed_precision_ops(compute_dtype=dtype)
+    block = DiTBlock(
+        hidden=5376, heads=56, head_dim=128, ffn=14336, t_dim=8,
+        eps=1e-5, qk_eps=1e-5, apply_silu=False, adaln_dtype=torch.float32,
+        gate_compress=False, dtype=dtype, device="cpu", operations=ops,
+    )
+    sd = {}
+    with safe_open(CKPT_PATH, framework="pt", device="cpu") as f:
+        for k in f.keys():
+            if k.startswith("blocks.0."):
+                sd[k[len("blocks.0."):]] = f.get_tensor(k)
+    block.load_state_dict(sd, strict=False)
+    block.to(device=device).requires_grad_(False).eval()
+
+    gen_cpu = torch.Generator(device="cpu").manual_seed(2026)
+    def _mk(in_f, out_f, r, st):
+        u = torch.randn((out_f, r), dtype=torch.float16, generator=gen_cpu) * 0.01
+        d = torch.randn((r, in_f), dtype=torch.float16, generator=gen_cpu) * 0.01
+        return (st, LoRAAdapter(set(), (u, d, float(r), None, None, None)), 1.0, None, None), u, d
+
+    p_qkv1, u_qkv1, d_qkv1 = _mk(5376, 21504, 16, 1.0)
+    p_qkv2, u_qkv2, d_qkv2 = _mk(5376, 21504, 32, 0.2)
+    p_out1, u_out1, d_out1 = _mk(7168, 5376, 16, 1.0)
+    p_fc1, u_fc1, d_fc1 = _mk(5376, 28672, 16, 0.5)
+    p_fc2, u_fc2, d_fc2 = _mk(14336, 5376, 16, 0.5)
+
+    # Dynamic LowVramPatch + non-dynamic LowVramPatch + BypassForwardHook runtime test
+    lv_map = {
+        "diffusion_model.blocks.0.attn.qkv_proj.weight": [p_qkv1, p_qkv2],
+        "diffusion_model.blocks.0.mlp.fc1.weight": [p_fc1],
+    }
+    lv_dyn = LowVramPatch("diffusion_model.blocks.0.attn.qkv_proj.weight", lv_map)
+    lv_nondyn = LowVramPatch("diffusion_model.blocks.0.mlp.fc1.weight", lv_map)
+    block.attn.qkv_proj.weight_lowvram_function = lv_dyn
+    block.mlp.fc1.weight_lowvram_function = None
+    block.mlp.fc1.weight_function = [lv_nondyn]
+    bp = BypassForwardHook(block.attn.out_proj, p_out1[1])
+    bp.adapter.multiplier = 1.0
+    bp.inject()
+
+    observed = {}
+    class _Holder:
+        def __init__(self, b):
+            self.blocks = [b]
+        def _run_blocks(self, h_in, te, segs, lay, topts):
+            observed["dyn_stashed"] = self.blocks[0].attn.qkv_proj.weight_lowvram_function is None
+            observed["nondyn_stashed"] = len(self.blocks[0].mlp.fc1.weight_function) == 0
+            act = topts.get("_chunked_sage_active_loras") or {}
+            observed["qkv_n"] = len(act.get(id(self.blocks[0].attn.qkv_proj), []))
+            observed["out_n"] = len(act.get(id(self.blocks[0].attn.out_proj), []))
+            observed["fc1_n"] = len(act.get(id(self.blocks[0].mlp.fc1), []))
+            observed["fc2_n"] = len(act.get(id(self.blocks[0].mlp.fc2), []))
+            return h_in
+
+    holder = _Holder(block)
+    static_fc2 = {
+        "diffusion_model.blocks.0.mlp.fc2.weight": cs._extract_lora_entries_from_patches([p_fc2], (5376, 14336))
+    }
+    rb = types.MethodType(cs._make_chunked_run_blocks(_Holder._run_blocks, None, static_loras=static_fc2), holder)
+    topts_rt = {}
+    _ = rb(torch.zeros((16, 5376), device=device, dtype=dtype), None, [(0, 16, 0)], None, topts_rt)
+    assert observed == {"dyn_stashed": True, "nondyn_stashed": True, "qkv_n": 2, "out_n": 1, "fc1_n": 1, "fc2_n": 1}, f"Hook mismatch: {observed}"
+    assert block.attn.qkv_proj.weight_lowvram_function is lv_dyn
+    assert block.mlp.fc1.weight_function == [lv_nondyn]
+    assert "_chunked_sage_active_loras" not in topts_rt
+    block.attn.qkv_proj.weight_lowvram_function = None
+    block.mlp.fc1.weight_function = []
+    bp.eject()
+
+    # End-to-end block cosine parity against exact BF16 W_dequant + B@A reference
+    S = 2048
+    gen_gpu = torch.Generator(device=device).manual_seed(17)
+    x0 = torch.randn(S, 5376, dtype=dtype, device=device, generator=gen_gpu) * 0.4
+    t_emb = torch.randn(2, 8, dtype=dtype, device=device, generator=gen_gpu) * 0.2
+    mod_segs = [(0, 128, 1), (128, 256, 5), (256, S, 0)]
+    angles = torch.randn(S, 96, dtype=torch.float32, device=device, generator=gen_gpu)
+    angles[:, 48:] = angles[:, :48]
+    rope = rope_rotation_table(angles, dtype)
+
+    def _ref_w(w_q, specs):
+        w = w_q.dequantize().float()
+        for u, d, sc in specs:
+            w = w + sc * (u.to(device).float() @ d.to(device).float())
+        return w.to(dtype)
+
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaln_proj(t_emb)
+    h1 = cs._mod_scale_shift(nn.functional.rms_norm(x0, (5376,), block.norm1.weight, block.norm1.eps), shift_msa, scale_msa, mod_segs)
+    q, k, v = nn.functional.linear(h1, _ref_w(block.attn.qkv_proj.weight, [(u_qkv1, d_qkv1, 1.0), (u_qkv2, d_qkv2, 0.2)])).split(7168, dim=-1)
+    q, k = cs._apply_qk_norm_rope(block.attn, q.view(1, S, 56, 128).contiguous(), k.view(1, S, 56, 128).contiguous(), rope, block.attn.q_norm.weight, block.attn.k_norm.weight, 96)
+    o = cs._staged_sageattn_nhd(q, k, lambda: v.view(1, S, 56, 128).contiguous(), dtype).view(S, 7168)
+    x_ref = cs._mod_gate(x0.clone(), gate_msa, nn.functional.linear(o, _ref_w(block.attn.out_proj.weight, [(u_out1, d_out1, 1.0)])), mod_segs)
+    h2 = cs._mod_scale_shift(nn.functional.rms_norm(x_ref, (5376,), block.norm2.weight, block.norm2.eps), shift_mlp, scale_mlp, mod_segs)
+    g_r, u_r = nn.functional.linear(h2, _ref_w(block.mlp.fc1.weight, [(u_fc1, d_fc1, 0.5)])).chunk(2, dim=-1)
+    x_ref = cs._mod_gate(x_ref, gate_mlp, nn.functional.linear(nn.functional.silu(g_r) * u_r, _ref_w(block.mlp.fc2.weight, [(u_fc2, d_fc2, 0.5)])), mod_segs)
+
+    act_loras = {
+        id(block.attn.qkv_proj): cs._extract_lora_entries_from_patches([p_qkv1, p_qkv2], (21504, 5376)),
+        id(block.attn.out_proj): cs._extract_lora_entries_from_patches([p_out1], (5376, 7168)),
+        id(block.mlp.fc1): cs._extract_lora_entries_from_patches([p_fc1], (28672, 5376)),
+        id(block.mlp.fc2): cs._extract_lora_entries_from_patches([p_fc2], (5376, 14336)),
+    }
+    block.attn.forward = types.MethodType(cs._make_chunked_attn_forward(head_chunks=7, token_chunk=1024), block.attn)
+    for mode in ("exact", "streaming"):
+        blk_fwd = types.MethodType(cs._make_chunked_block_forward(head_chunks=7, out_proj_mode=mode, token_chunk=1024), block)
+        y = blk_fwd(x0.clone(), t_emb, mod_segs, rope, transformer_options={"_chunked_sage_active_loras": act_loras})
+        cos = nn.functional.cosine_similarity(y.float().flatten(), x_ref.float().flatten(), dim=0).item()
+        assert cos > 0.999, f"BF16 LoRA side-branch {mode} cos too low: {cos}"
+    print(f"[PASS] test_bf16_lora_side_branch_and_hooks (Triton SwiGLU + hooks + exact/streaming LoRA cos={cos:.6f})")
+
+
+def test_split_band_rope_and_temp_isolation():
+    """Verify Split-Band Spatial RoPE scales ONLY video high-freq h/w bands and restores cleanly."""
+    class _FakeModel:
+        def __init__(self):
+            self.blocks = []
+        def rope_freqs(self, position_ids, dev):
+            # [S, 3] -> [S, 96] identical layout to MiniMaxH3Model.rope_freqs
+            pos = position_ids.to(torch.float32).to(dev)
+            inv = torch.tensor([10.0 ** (-k / 4.0) for k in range(16)], dtype=torch.float32, device=dev)
+            per_ax = pos.unsqueeze(-1) * inv.view(1, 1, -1)
+            t_f, h_f, w_f = per_ax.unbind(dim=1)
+            half = torch.cat((t_f, h_f, w_f), dim=-1)
+            return torch.cat((half, half), dim=-1)
+        def _run_blocks(self, h, t_emb, mod_segs, lay, topts):
+            self.seen_angles = self.rope_freqs(lay.position_ids, h.device)
+            self.seen_temp = topts.get("_chunked_sage_attn_temp")
+            return h
+
+    m = _FakeModel()
+    pos = torch.randn((40, 3), dtype=torch.float64)
+    lay = types.SimpleNamespace(segments=[(0, 10, "text"), (10, 16, "audio"), (16, 40, "video")], position_ids=pos)
+    ref_angles = m.rope_freqs(pos, torch.device("cpu"))
+    rb = types.MethodType(
+        cs._make_chunked_run_blocks(_FakeModel._run_blocks, None, rope_hf_scale=1.32, attn_temp_scale=1.08),
+        m,
+    )
+    topts = {}
+    _ = rb(torch.zeros((40, 16)), None, [(0, 40, 0)], lay, topts)
+    ang = m.seen_angles
+    assert m.seen_temp == 1.08 and "_chunked_sage_attn_temp" not in topts
+    assert "rope_freqs" not in m.__dict__, "Temporary rope_freqs wrapper leaked!"
+    # Non-video rows (:16) 100% untouched
+    assert torch.equal(ang[:16], ref_angles[:16]), "Text/audio RoPE rows were mutated!"
+    # Time axis cols (0:16, 48:64) 100% untouched
+    assert torch.equal(ang[16:, 0:16], ref_angles[16:, 0:16])
+    assert torch.equal(ang[16:, 48:64], ref_angles[16:, 48:64])
+    # Low spatial bands k=8..15 (24:32, 40:48, 72:80, 88:96) 100% untouched
+    for c0, c1 in ((24, 32), (40, 48), (72, 80), (88, 96)):
+        assert torch.equal(ang[16:, c0:c1], ref_angles[16:, c0:c1])
+    # High spatial bands k=0..5 scaled by exactly 1.32; taper k=6 -> 1.24, k=7 -> 1.08
+    for base in (16, 32, 64, 80):
+        assert torch.allclose(ang[16:, base : base + 6], ref_angles[16:, base : base + 6] * 1.32, atol=1e-5)
+        assert torch.allclose(ang[16:, base + 6], ref_angles[16:, base + 6] * 1.24, atol=1e-5)
+        assert torch.allclose(ang[16:, base + 7], ref_angles[16:, base + 7] * 1.08, atol=1e-5)
+    print("[PASS] test_split_band_rope_and_temp_isolation")
+
+
 if __name__ == "__main__":
     test_split_heads_even()
     test_slice_mod_segments()
@@ -390,4 +585,6 @@ if __name__ == "__main__":
     test_dense_bf16_block_and_external_deferral()
     test_real_dasiwa_int8_bit_exact()
     test_sol_attn_morton_and_sparse_path()
+    test_bf16_lora_side_branch_and_hooks()
+    test_split_band_rope_and_temp_isolation()
     print("ALL CHUNKED SAGE TESTS PASSED!")

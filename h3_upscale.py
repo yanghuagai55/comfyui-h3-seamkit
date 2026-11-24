@@ -596,9 +596,9 @@ def _dump_av_latent(path, video, audio=None, meta=None):
         if meta:
             payload["meta"] = meta
         torch.save(payload, str(path))
-        print(f"[HardCut]   dump -> {path}", flush=True)
+        print(f"[SeamKit] dump -> {path}", flush=True)
     except Exception as _dump_exc:  # pragma: no cover - 诊断路径绝不打断采样
-        print(f"[HardCut]   dump FAILED ({path}): {_dump_exc}", flush=True)
+        print(f"[SeamKit] dump FAILED ({path}): {_dump_exc}", flush=True)
 
 
 def _anchor_conditioning_multi(
@@ -913,7 +913,7 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
             # Functionally this cut is already covered downstream: the caller
             # treats "no entry / no boundary_frame" as "keep the planned frame".
             _diagnostics.append(
-                f"[HardCut]   cut {cut}: no candidate token within {tolerance}f "
+                f"[SeamKit] cut {cut}: no candidate token within {tolerance}f "
                 f"(one token spans ~{GRID_FRAMES_PER_TOKEN}f) -> increase "
                 f"seam_tolerance_frames or the hunt will find nothing here"
             )
@@ -969,7 +969,7 @@ def _align_to_profile(profile, planned, tolerance: int, video_tokens: int,
             _grey_pers = float(min_persistence) if min_persistence > 0.0 else 0.8
             if peak_ratio >= _grey_floor and peak_pers >= _grey_pers:
                 _diagnostics.append(
-                    f"[HardCut]   cut {cut}: ratio {peak_ratio:.2f} in grey zone "
+                    f"[SeamKit] cut {cut}: ratio {peak_ratio:.2f} in grey zone "
                     f"[{_grey_floor:.2f}, {HUNT_MIN_CUT_RATIO:.2f}) but persistence "
                     f"{peak_pers:.2f} >= {_grey_pers:.2f} -> accepted as a turn"
                 )
@@ -1051,20 +1051,14 @@ def _hunt_log_line(entry) -> str:
     boundary = entry.get("boundary_frame")
     if boundary is None:
         _why = (entry.get("note") or "").split("->")[0].strip()
-        return f"[HardCut]   cut {planned_cut}: REJECTED" + (f" — {_why}" if _why else "")
-    # ★ 只报 **residual（边界 vs 实测转镜）**，不报 `边界 vs 计划`。
-    #   planΔ（边界−计划）恒等于"吸附到 17k 之后的位移"，永远看着像 +0f，
-    #   与"缝到底有没有落在模型自己的转镜上"是两回事 —— 2026-09-29 它把用户
-    #   误导过一次（看着贴得完美，实际转镜差 8 帧）。这里保留 planΔ 只作参考，
-    #   判读一律看 residual：上限 = FRAME_GRID//2 = 8（转镜恰在两格正中间），
-    #   阈值 = seam_tolerance（残差 ≤ 阈值才走硬切，否则锚定 overlap）。
+        return f"[SeamKit] cut {planned_cut}: REJECTED" + (f" — {_why}" if _why else "")
     _parts = [f"cut {planned_cut}: bound {boundary}",
               f"planΔ {int(boundary) - int(planned_cut):+d}"]
     _turn = entry.get("measured_turn_frame")
     if _turn is not None:
         _parts.append(f"turn {_turn} residual {abs(int(boundary) - int(_turn))}f")
     _parts.append(f"ratio {entry.get('ratio')}")
-    return "[HardCut]   " + " | ".join(_parts)
+    return "[SeamKit] " + " | ".join(_parts)
 
 
 _TE_HINTS = ("clip", "temodel", "qwen", "t5", "llama", "bert")
@@ -1417,10 +1411,10 @@ def execute(
                 if _plan_cut == int(calm_boundaries[_i]):
                     continue                      # already the plan; nothing to undo
                 _log_buf["calm"].append(
-                    f"[HardCut]   calm: cut {_plan_cut}: move to "
+                    f"[SeamKit] calm cut {_plan_cut}: move to "
                     f"{int(calm_boundaries[_i])} would make segment {_i} "
                     f"{_frames}f x {_mp:.2f}MP = {_frames * _mp:.0f} >= "
-                    f"{_eff_load_fail:.0f} -> reverted to the planned frame"
+                    f"{_eff_load_fail:.0f} -> reverted to planned frame"
                 )
                 calm_boundaries[_i] = _plan_cut
                 if _i < len(calm_overlaps):
@@ -1439,20 +1433,8 @@ def execute(
     if bool((plan.get("hardcut") or {}).get("unload_text_encoder_before_sampling", True)):
         _freed_te = release_text_encoders()
         if _freed_te:
-            print(f"[HardCut]   TE unloaded before sampling: {', '.join(_freed_te)}",
-                  flush=True)
+            print(f"[SeamKit] 已卸载文本编码器: {', '.join(_freed_te)}", flush=True)
 
-    # ---- windowing: explicit (possibly unequal) first, then the equal paths ----
-    # overlap tokens: when > 0 each window's START is pulled back so the sampler
-    # can anchor its first token on the previous window (see anchor_conditioning
-    # below).  The knob is free to set, but the value that actually reaches the
-    # sampler is clamped below one full window - an overlap of a whole window
-    # would leave nothing new to generate.
-    # Unequal windows + anchored prefixes give every segment a different shape,
-    # so PyTorch's caching allocator cannot reuse the previous block and the
-    # pool fragments upward run after run.  Releasing the cached blocks between
-    # segments keeps the footprint flat; the models stay loaded (this is
-    # soft_empty_cache, never unload_all_models).
     _empty_between = bool((plan.get("hardcut") or {}).get("empty_cache_between_segments", True))
     ov_input = max(0, int(_p2("overlap_frames", plan.get("temporal_overlap_frames", 0))))
     if is_green_screen and ov_input == 0:
@@ -1464,17 +1446,6 @@ def execute(
     locked_overlap = max(
         0, min(int(plan.get("locked_overlap_tokens", ov_tokens)), ov_tokens)
     )
-    if ov_input:
-        # This is the FALLBACK only: when the calm search runs it decides each
-        # seam individually (calm_overlaps), and a hard cut there is 0.  Say so,
-        # otherwise the line reads as if every seam got the global value.
-        _log_buf["overlap"].append(
-            f"[HardCut]   overlap: fallback {ov_input}f -> {ov_tokens}f "
-            f"(chunk {_chunk}f), locked {locked_overlap}f"
-            + ("   [clamped below one window]" if ov_tokens != ov_input else "")
-            + ("   | per-seam values below take precedence"
-               if calm_overlaps is not None else "")
-        )
     if segment_frames:
         segments = explicit_segments(
             int(video.shape[2]), frame_count, segment_frames,
@@ -1490,97 +1461,77 @@ def execute(
             ov_tokens,
         )
 
-    # ---- log the cut decisions NOW ----
-    # The report only lands when the whole second pass is finished, and a 15s
-    # render takes minutes; without this you stare at a black console while the
-    # thing decides where to split.  Never let logging break a run.
+    _single_window = len(segments) <= 1
+
+    # ---- log slicing decisions ONLY when multi-window slicing is active ----
     try:
-        lengths = [int(e) - int(s) for _st, s, _et, e in segments]
-        longest = max(lengths) if lengths else 0
-        # the FINAL boundaries are what the windows actually ended on: every
-        # segment's end frame except the last one.  Reporting only the hunt's
-        # accepted frames was misleading - a cut that fell back to its planned
-        # frame (because the anchor killed the latent change) showed up as
-        # "boundary=None" while the windows were split exactly on it.
-        boundaries = [int(e) for _st, _sf, _et, e in segments][:-1]
-        hunted = [int(f) for f in (seam_hunt or {}).get("boundary_frames") or []]
-        # Three states, not two.  '' = hunt accepted a real turn here; '+' = the
-        # calm search moved it; '*' = untouched, on the planned frame.  The old
-        # version labelled calm moves as '*' too, which read as "nothing was
-        # found here" even though the boundary had clearly moved.
-        _moved = set()
-        if calm_boundaries is not None:
-            for _pc, _cb in zip(planned or [], calm_boundaries):
-                if int(_pc) != int(_cb):
-                    _moved.add(int(_cb))
+        if not _single_window:
+            if ov_input:
+                _log_buf["overlap"].append(
+                    f"[SeamKit] 切片 overlap: fallback {ov_input}f -> {ov_tokens}f "
+                    f"(chunk {_chunk}f, locked {locked_overlap}f)"
+                    + (" [clamped]" if ov_tokens != ov_input else "")
+                    + (" | per-seam overrides" if calm_overlaps is not None else "")
+                )
+            lengths = [int(e) - int(s) for _st, s, _et, e in segments]
+            longest = max(lengths) if lengths else 0
+            boundaries = [int(e) for _st, _sf, _et, e in segments][:-1]
+            hunted = [int(f) for f in (seam_hunt or {}).get("boundary_frames") or []]
+            _moved = set()
+            if calm_boundaries is not None:
+                for _pc, _cb in zip(planned or [], calm_boundaries):
+                    if int(_pc) != int(_cb):
+                        _moved.add(int(_cb))
 
-        def _tag(_b):
-            if _b in hunted:
-                return ""
-            return "+" if _b in _moved else "*"
+            def _tag(_b):
+                if _b in hunted:
+                    return ""
+                return "+" if _b in _moved else "*"
 
-        src_tag = ", ".join(f"{b}{_tag(b)}" for b in boundaries)
-        _log_buf["sum"].append(
-            f"[HardCut] planned_cuts={planned or '-'} "
-            f"boundary_frames=[{src_tag or '-'}] "
-            f"segments={len(segments)} lengths={lengths} longest={longest}f"
-            + ("   ('+' = moved by the search, '*' = on the planned frame)"
-               if any(b not in hunted for b in boundaries) else "")
-        )
-        if is_green_screen:
-            _log_buf["cfg"].append(
-                "[HardCut]   绿幕模式已开启 (Green Screen Mode)：全程使用 overlap 平缓衔接，禁用硬切"
+            src_tag = ", ".join(f"{b}{_tag(b)}" for b in boundaries)
+            _log_buf["sum"].append(
+                f"[SeamKit] 多窗切分: segments={len(segments)} lengths={lengths} longest={longest}f "
+                f"| cuts={planned or '-'} boundaries=[{src_tag or '-'}]"
             )
-        if seam_hunt:
-            _log_buf["cfg"].append(
-                f"[HardCut]   tolerance={seam_hunt.get('tolerance_frames')}f "
-                f"hunt={'on' if auto_seam_hunt else 'off'}"
-            )
-            # ★ 每条缝只出一行：hunt 的头段 + calm 的决策段合并（2026-09-29 日志瘦身）。
-            #   以前一条缝吐 2~3 行（hunt 一行 + calm 一行 + 偶尔再一行），一跑十几行，
-            #   真正要看的那两个数（residual / 最终判定）反而被淹掉。
-            _calm_by_cut = {}
-            for _n in (_calm_notes or []):
-                _s = str(_n)
-                if _s.startswith("cut ") and ":" in _s:
-                    _c, _tail = _s[4:].split(":", 1)
-                    try:
-                        _calm_by_cut[int(_c.strip())] = _tail.strip()
-                    except ValueError:
-                        pass
-            for entry in seam_hunt.get("aligned") or []:
-                _line = _hunt_log_line(entry)
-                _tail = _calm_by_cut.pop(int(entry.get("planned_cut")), None)
-                _log_buf["hunt"].append(_line + ("  ⟵ " + _tail if _tail else ""))
-            for _c, _tail in sorted(_calm_by_cut.items()):
-                _log_buf["hunt"].append(f"[HardCut]   cut {_c}: {_tail}")
-            if seam_hunt.get("note"):
-                _log_buf["hunt"].append(f"[HardCut]   note: {seam_hunt['note']}")
-        for _section in ("cfg", "hunt", "calm", "overlap", "sum"):
-            for _line in _log_buf[_section]:
-                print(_line, flush=True)
+            if is_green_screen:
+                _log_buf["cfg"].append("[SeamKit] 绿幕模式已开启: 全程 overlap 平缓衔接，禁用硬切")
+            if seam_hunt:
+                _log_buf["cfg"].append(
+                    f"[SeamKit] 寻缝配置: tolerance={seam_hunt.get('tolerance_frames')}f "
+                    f"hunt={'on' if auto_seam_hunt else 'off'}"
+                )
+                _calm_by_cut = {}
+                for _n in (_calm_notes or []):
+                    _s = str(_n)
+                    if _s.startswith("cut ") and ":" in _s:
+                        _c, _tail = _s[4:].split(":", 1)
+                        try:
+                            _calm_by_cut[int(_c.strip())] = _tail.strip()
+                        except ValueError:
+                            pass
+                for entry in seam_hunt.get("aligned") or []:
+                    _line = _hunt_log_line(entry)
+                    _tail = _calm_by_cut.pop(int(entry.get("planned_cut")), None)
+                    _log_buf["hunt"].append(_line + ("  <- " + _tail if _tail else ""))
+                for _c, _tail in sorted(_calm_by_cut.items()):
+                    _log_buf["hunt"].append(f"[SeamKit] cut {_c}: {_tail}")
+                if seam_hunt.get("note"):
+                    _log_buf["hunt"].append(f"[SeamKit] note: {seam_hunt['note']}")
+            for _section in ("cfg", "hunt", "calm", "overlap", "sum"):
+                for _line in _log_buf[_section]:
+                    print(_line, flush=True)
     except Exception as _log_exc:  # pragma: no cover - logging must never fail the run
-        print(f"[HardCut] log error: {_log_exc}", flush=True)
+        print(f"[SeamKit] log error: {_log_exc}", flush=True)
 
     accumulated = None
     accumulated_up = None
     segment_reports = []
     prev_end_frame = None
     seam_marks = []
-    # ── 二采画布 / 最大负载：一行摘要（2026-09-29 新增）─────────────────
-    # 为什么要打这一行：崩了以后想核对"这次到底提交了多大画布"时，日志里
-    # 什么都没有（E1 只在规划器报错时才带 MP，而它已被降为 warning 不拦；
-    # 画布尺寸只出现在节点报告里、不进日志）。用户 2026-09-29 实际踩过：
-    # 崩了想核 1.3 还是 1.5 MP，只能靠猜。
-    def _tokens_of(_frames: int, _h: int, _w: int) -> int:
-        """窗口的 DiT token 数 —— **采样阶段的正确量纲**（随帧数线性长，跨分辨率可比）。
 
-        H3 的映射：像素帧 17k+5 ↔ latent 5k+2；空间 16× 下采样。
-        `frames × MP` 只是它的线性代理（∝ token），所以两者同量级；
-        但 token 是**有意义的绝对量**，能跨分辨率比对，`帧×MP` 不能。
-        """
+    def _tokens_of(_frames: int, _h: int, _w: int) -> int:
         _lt = max(1, (_frames - 5) // 17 * 5 + 2) if _frames > 5 else 1
-        return _lt * max(1, _h // 16) * max(1, _w // 16)
+        return _lt * max(1, _h // 32) * max(1, _w // 32)
 
     _eff_load_pass, _eff_load_fail, _cs_info = effective_load_thresholds(model)
     _cv_mp = float((plan.get("hardcut") or {}).get("canvas_mp") or 0.0)
@@ -1589,28 +1540,14 @@ def execute(
     _wins = [int(e) - int(s) for _st, s, _et, e in segments]
     if _cv_mp > 0.0 and _wins:
         _fmax = max(_wins)
-        print(
-            f"[HardCut] 二采画布 {_cv_w}×{_cv_h} = {_cv_mp:.3f} MP ｜ 窗口 {len(_wins)} 个，"
-            f"最长 {_fmax}f ⇒ token {_tokens_of(_fmax, _cv_h, _cv_w):,}",
-            flush=True,
-        )
+        _load_val = _fmax * _cv_mp
+        _mode_lbl = "二采单窗直出" if _single_window else f"二采多窗({len(_wins)}段)"
+        _engine_parts = []
         if _cs_info is not None:
-            print(
-                f"[HardCut]   Chunked QKV SageAttention 已挂载 "
-                f"(head_chunks={_cs_info.get('head_chunks')}, "
-                f"out_proj_mode={_cs_info.get('out_proj_mode')}, "
-                f"attn={_cs_info.get('attention_mode', 'dense_sage')}, "
-                f"arch={_cs_info.get('arch')})："
-                f"负载代理 = {_fmax * _cv_mp:.1f}（8GB 稳妥线 {_eff_load_pass:.0f} / 警戒线 {_eff_load_fail:.0f}，"
-                f"已替代旧版 191.0 锚）",
-                flush=True,
-            )
-        else:
-            print(
-                f"[HardCut]   负载口径：代理值 = 最长窗×MP = {_fmax * _cv_mp:.1f}"
-                f"（实测阈值 (183.8, 191.0]，与 LOAD_FAIL 吻合）｜ 解码阶段另算："
-                f"ComfyUI 官方只按 min(frames, chunk+2) 算一个时间块 ⇒ **不随本窗帧数长**",
-                flush=True,
+            _engine_parts.append(
+                f"ChunkedSage(hc={_cs_info.get('head_chunks')}, "
+                f"{_cs_info.get('attention_mode', 'dense_sage')}, "
+                f"{_cs_info.get('out_proj_mode')})"
             )
         _r3_info = (
             model.model_options.get("route3_info")
@@ -1618,23 +1555,19 @@ def execute(
             else None
         )
         if _r3_info:
-            print(
-                f"[HardCut]   Route 3 双流已挂载 (s_bg={_r3_info.get('s_bg')}, "
-                f"beta_scale={_r3_info.get('beta_scale', 1.0):.2f}, "
-                f"beta_max={_r3_info.get('beta_max', 0.0):.2f})："
-                f"上方负载代理为稠密上限，实际每步视频 token 约降至 50%~65%（依前景占比）。",
-                flush=True,
-            )
-        # ── 运行期实测余量：**这才是能预测的**（2026-09-29 实证）───────────
-        # 用成片反查发现：同一画布/同一窗长/同样稠密注意力，00072~00076 全部出片，
-        # 而 09-29 那次崩 —— 静态几何量**分不开过与崩**。真约束在 host 侧：
-        #   pinned 预算 = RAM × 0.45 × 2（本机 28.5 GiB）+ 系统其它进程占用
-        # 所以报**实时**数字：可用物理内存 / pinned 余量 / 显存空闲。
+            _engine_parts.append(f"Route3(s_bg={_r3_info.get('s_bg')})")
+        _eng_str = (" | " + " + ".join(_engine_parts)) if _engine_parts else ""
+        print(
+            f"[SeamKit] {_mode_lbl}: {_cv_w}×{_cv_h} ({_cv_mp:.2f} MP) × {_fmax}f "
+            f"| token {_tokens_of(_fmax, _cv_h, _cv_w):,}{_eng_str} "
+            f"| 负载 {_load_val:.1f} (稳妥 {_eff_load_pass:.0f} / 警戒 {_eff_load_fail:.0f})",
+            flush=True,
+        )
         _live = []
         try:
             import psutil
             _av = psutil.virtual_memory().available / 2**30
-            _live.append(f"可用物理内存 {_av:.1f} GiB")
+            _live.append(f"物理内存 {_av:.1f} GiB")
         except Exception:
             _av = None
         try:
@@ -1642,8 +1575,7 @@ def execute(
             _pmax = float(getattr(_mm, "MAX_PINNED_MEMORY", 0)) / 2**30
             _pused = float(getattr(_mm, "TOTAL_PINNED_MEMORY", 0)) / 2**30
             if _pmax > 0:
-                _live.append(f"pinned {_pused:.1f}/{_pmax:.1f} GiB"
-                             f"（余 {_pmax - _pused:.1f}）")
+                _live.append(f"pinned {_pused:.1f}/{_pmax:.1f} GiB")
         except Exception:
             _pmax = _pused = 0.0
         try:
@@ -1652,45 +1584,28 @@ def execute(
         except Exception:
             pass
         if _live:
-            print(f"[HardCut]   运行期余量：" + " ｜ ".join(_live), flush=True)
-        # 阈值是**启发式**：host 侧余量薄会**降低**阈值（几何代理本身有效，见上）。
+            print("[SeamKit] 运行余量: " + " | ".join(_live), flush=True)
         if _av is not None and _av < 6.0:
             print(
-                f"[HardCut] ⚠⚠ 可用物理内存只剩 {_av:.1f} GiB —— 二采锁存峰值本就 "
-                f"~25.6 GiB（host 侧），余量薄会把上面那条阈值的**有效线往下压**。\n"
-                f"         跑之前先关掉吃内存的东西（浏览器/其它模型进程）更稳。",
+                f"[SeamKit] ⚠ 可用物理内存偏低 ({_av:.1f} GiB < 6.0 GiB)，建议关闭占用内存的无关程序。",
                 flush=True,
             )
     for start_token, start_frame, end_token, end_frame in segments:
-        # how much this window re-reads from the published output: > 0 only when
-        # a seam asked for an anchored prefix (the calm search sets it per cut)
         seg_overlap = max(0, (prev_end_frame or 0) - int(start_frame)) if prev_end_frame is not None else 0
-        # ── 二采负载预警（2026-09-29 新增）──────────────────────────────
-        # 规划器那份估计用的是**段长 × MP**，但真正吃显存的是**窗长**：
-        # 每窗从 `start_token − overlap` 起采 ⇒ 窗 = 段 + overlap。
-        # 实测差一个 overlap（17 帧）就足以硬崩：target 5.67 时段 [119,119,124]
-        # 排出来是窗 [119,136,141]，最长窗 141×1.544MP = 217.7 ≫ 锚 191，
-        # 进程在给 window 2 装模型时**直接消失（无 traceback）**（21:39 实测）。
-        # 这里用执行器**真实的窗长**再报一次。**只警告不拦** —— 191 是 8GB 卡上的
-        # 实测锚，12/16GB 的人本来就该能往上走（用户 2026-09-29 定调：不拦）。
         _win_mp = float((plan.get("hardcut") or {}).get("canvas_mp") or 0.0)
         if _win_mp > 0.0:
             _win_frames = int(end_frame) - int(start_frame)
             _win_load = _win_frames * _win_mp
             if _win_load >= _eff_load_fail:
                 print(
-                    f"[HardCut] ⚠⚠ window {len(segment_reports)} 负载 {_win_load:.0f} "
-                    f"= {_win_frames}f × {_win_mp:.3f}MP ≥ 警戒锚 {_eff_load_fail:.0f}"
-                    f" —— 8GB 卡存在 OOM 风险。\n"
-                    f"         压窗的办法：降 second_megapixels / 调小 "
-                    f"target_segment_seconds（每段更短）/ 调小 overlap_frames。",
+                    f"[SeamKit] ⚠ window {len(segment_reports)} 负载 {_win_load:.0f} "
+                    f"({_win_frames}f × {_win_mp:.2f}MP) >= 警戒线 {_eff_load_fail:.0f}，8GB 卡存在 OOM 风险。",
                     flush=True,
                 )
             elif _win_load >= _eff_load_pass:
                 print(
-                    f"[HardCut]   window {len(segment_reports)} 负载 {_win_load:.0f} "
-                    f"= {_win_frames}f × {_win_mp:.3f}MP 已过稳妥线 {_eff_load_pass:.0f}"
-                    f"（BORDERLINE，8GB 上留意）",
+                    f"[SeamKit] window {len(segment_reports)} 负载 {_win_load:.0f} "
+                    f">= 稳妥线 {_eff_load_pass:.0f} (BORDERLINE)",
                     flush=True,
                 )
         # ── 上采样时间 padding（熔化修复 ③，2026-09-26）─────────────────
@@ -1816,7 +1731,7 @@ def execute(
                 _topts["route3_cuts"] = _r3_cuts
                 _topts["route3_pin_tokens"] = _r3_pins
                 if _mopts.get("route3_info"):
-                    print(f"[HardCut]   Route 3 window: cuts={_r3_cuts}, cut_pins={_c_pins}, motion_pins={_m_pins} -> pin_tokens={_r3_pins}", flush=True)
+                    print(f"[SeamKit] Route3 window: cuts={_r3_cuts} pins={_r3_pins}", flush=True)
                 del _p1_tchw
             except Exception:
                 _topts["route3_cuts"] = []
@@ -1911,22 +1826,14 @@ def execute(
             # the published seam (previous output meets this window's fresh
             # sample) sits where the frozen guard ends
             seam_marks.append(int(start_token) + int(_locked_tokens))
-            print(f"[HardCut]   window {len(segment_reports)}: anchored prefix "
-                  f"{seg_overlap} frames at {start_frame} (frozen)", flush=True)
+            print(f"[SeamKit] window {len(segment_reports)}: anchored prefix {seg_overlap}f @ {start_frame}", flush=True)
         else:
             if seg_overlap:
-                # crossfade smears the join across the whole overlap; centre
-                # any later seam window on the middle of that blend
                 seam_marks.append(
                     int(start_token) + (seg_overlap * 5 // FRAME_GRID) // 2
                 )
-                print(f"[HardCut]   window {len(segment_reports)}: crossfaded overlap "
-                      f"{seg_overlap} frames at {start_frame}", flush=True)
+                print(f"[SeamKit] window {len(segment_reports)}: crossfaded overlap {seg_overlap}f @ {start_frame}", flush=True)
             accumulated = core._append_video(accumulated, sampled, start_token)
-        # ── 本窗实测峰值（跑到这里才知道真数，2026-09-29 新増）─────────────
-        # 为什么要量：8GB 卡上「显存峰值」恒等于卡容量（一直是满的，报它没意义），
-        # 真正决定崩不崩的是 **host/pinned 峰值**（权重驻留是主要项）。有了这个数
-        # 才能把"预计最高占用 XX GB"从猜变成标定。
         _win_sec = round(time.perf_counter() - _t_win0, 2)
         _win_alloc_peak_gb = None
         _win_rsv_peak_gb = None
@@ -1934,45 +1841,28 @@ def execute(
             import comfy.model_management as _mm2
             _pu = float(getattr(_mm2, "TOTAL_PINNED_MEMORY", 0)) / 2**30
             _pm = float(getattr(_mm2, "MAX_PINNED_MEMORY", 0)) / 2**30
-            _rsv = torch.cuda.memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
             _maxa = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
             _maxr = torch.cuda.max_memory_reserved() / 2**30 if torch.cuda.is_available() else 0.0
             _win_alloc_peak_gb = round(_maxa, 3)
             _win_rsv_peak_gb = round(_maxr, 3)
+            _free_str = ""
+            if show_memory_log and torch.cuda.is_available():
+                _free, _ = torch.cuda.mem_get_info()
+                if _empty_between and not _single_window:
+                    comfy.model_management.soft_empty_cache()
+                    _free, _ = torch.cuda.mem_get_info()
+                _free_str = f" | 显存空闲 {_free / 2**30:.2f} GiB"
+            _done_lbl = "二采完成" if _single_window else f"二采 seg {len(segment_reports)} 完成"
+            _pin_str = f"pinned {_pu:.1f}/{_pm:.1f} GiB" if _pm > 0 else f"pinned {_pu:.1f} GiB"
             print(
-                f"[HardCut]   peak/mem: pinned {_pu:.1f}"
-                + (f"/{_pm:.1f} GiB (余 {_pm - _pu:.1f})" if _pm > 0 else " GiB")
-                + f" ｜ 本窗真峰值 alloc-peak {_maxa:.2f} / reserved-peak {_maxr:.2f} GiB"
-                + f" (现 reserved {_rsv:.2f}) ｜ sample {_win_sec:.1f}s",
+                f"[SeamKit] {_done_lbl} ({_win_sec:.1f}s): "
+                f"alloc-peak {_maxa:.2f} / rsv-peak {_maxr:.2f} GiB | {_pin_str}{_free_str}",
                 flush=True,
             )
         except Exception:
             pass  # 诊断绝不打断采样
 
         prev_end_frame = int(end_frame)
-        # The probe is optional; when it is off, simply do not run it.  (An
-        # earlier version raised a private exception to skip the block and
-        # caught it below - but the class was never defined anywhere, so
-        # turning the switch off took the whole node down with a NameError.
-        # Plain control flow has no such failure mode.)
-        if show_memory_log:
-            try:
-                _free, _total = torch.cuda.mem_get_info()
-                print(
-                    f"[HardCut]   seg {len(segment_reports)} done ({_win_sec:.1f}s): "
-                    f"window-peak alloc {(_win_alloc_peak_gb or 0.0):.2f}GB / rsv {(_win_rsv_peak_gb or 0.0):.2f}GB  "
-                    f"now-alloc {torch.cuda.memory_allocated()/2**30:.2f}GB  "
-                    f"device-free(含缓存/他模) {_free/2**30:.2f}GB",
-                    flush=True,
-                )
-                if _empty_between:
-                    comfy.model_management.soft_empty_cache()
-                    _free2, _ = torch.cuda.mem_get_info()
-                    if _free2 - _free > 32 * 2**20:
-                        print(f"[HardCut]   cache released: +{(_free2-_free)/2**30:.2f}GB free",
-                              flush=True)
-            except Exception as _mm_exc:
-                print(f"[HardCut]   mem probe skipped: {_mm_exc}", flush=True)
         segment_reports.append(
             {
                 "index": len(segment_reports),

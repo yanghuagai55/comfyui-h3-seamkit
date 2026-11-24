@@ -135,6 +135,7 @@ class MiniMaxH3AVLatentSave(io.ComfyNode):
             ),
             category="MiniMax H3 Hard Cut",
             is_experimental=True,
+            is_output_node=True,
             inputs=[
                 io.Latent.Input("latent"),
                 io.String.Input(

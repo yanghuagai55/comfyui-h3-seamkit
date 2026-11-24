@@ -5,7 +5,7 @@
 Two-pass hard-cut planning, cacheable first-pass sampling, and Route 3
 split-stream acceleration for MiniMax H3.
 
-Active Nodes (11 total — cleaned up from 21 legacy/pixel-repair nodes):
+Active Nodes (14 total — cleaned up from 21 legacy/pixel-repair nodes):
   Core Two-Pass Chain (MiniMax H3 Hard Cut):
     * `MiniMaxH3HardCutFirstPassPlan` — 上游规划：片长/分辨率/分段/一采缓存
     * `MiniMaxH3HardCutPass2Plan`     — 下游二采规划（精简版，已适配 Route 3）
@@ -32,6 +32,13 @@ from .nodes import (
 )
 from .nodes_firstpass import MiniMaxH3FirstPassSampler
 from .nodes_latent_cache import MiniMaxH3AVLatentLoad, MiniMaxH3AVLatentSave
+from .sol_vae_decode import MiniMaxH3SafeAVDecode
+from .train.teacher_capture import (
+    MiniMaxH3ConditioningDump,
+    MiniMaxH3TeacherLatentDump,
+    MiniMaxH3TeacherProbe,
+)
+from .train.dense_rope_patch import MiniMaxH3DenseRopePatch
 from .route3.nodes import (
     MiniMaxH3Route3Apply,
     MiniMaxH3Route3Assemble,
@@ -52,6 +59,11 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3ChunkedSageAttentionPatch,
             MiniMaxH3AVLatentSave,
             MiniMaxH3AVLatentLoad,
+            MiniMaxH3SafeAVDecode,
+            MiniMaxH3TeacherProbe,
+            MiniMaxH3ConditioningDump,
+            MiniMaxH3TeacherLatentDump,
+            MiniMaxH3DenseRopePatch,
             MiniMaxH3Route3AutoMask,
             MiniMaxH3Route3Apply,
             MiniMaxH3Route3Assemble,
