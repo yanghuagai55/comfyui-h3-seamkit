@@ -1,55 +1,25 @@
-# 示例工作流 · workflow.json
+# 示例工作流总览（v2.7）
 
-**v1.4 新架构**：上游 Plan（12 控件）→ 一采（零控件，可缓存）→ 二采执行器（零控件）← 下游 Pass-2 Plan（33 控件）。
-15 秒 / 1.3MP / 四窗，`calm_policy=auto`（逐缝自动选硬切或锚定）。
+本目录提供三套面向 8GB 消费级显卡（RTX 4060 实测 0 OOM）的 **v2.7 单窗主力工作流**，以及早期多窗硬切归档示例。
 
-## 快速上手（四步）
+## 一、v2.7 三套主力单窗工作流（推荐直接拖入 ComfyUI）
 
-1. **导入**：把 `workflow.json` 拖进 ComfyUI 画布（插件已装并重启过）。
-2. **换模型**：加载器里的模型 / LoRA 是作者本机的名字，按自己的环境重选——
-   ref2va DiT（int8/fp8 皆可）· Qwen3-VL 文本编码器（`CLIPLoader` type = `minimax`）·
-   video VAE (fp16) + audio VAE (fp32) **别接反** · turbo/风格 LoRA 按需。
-3. **写提示词**：照 [`templates/prompt-template.md`](../templates/prompt-template.md)
-   （官方六段骨架）。时间戳**任意浮点**即可，对不齐只会警告；
-   **blocking（站位/朝向/视线）写死**并声明全片统一——这是接缝不跳的关键。
-4. **排队**。切点由 `target_segment_seconds` 算出（报告的 `cut points` 可直接抄）；
-   出片后想调二采，**只动下游 Pass-2 Plan**——改它不重采一采。
+| 文件 | 二采画布 | 最终分辨率 | 10s 全程耗时 (4060 8GB) | 推荐用途 |
+|---|---|---|---:|---|
+| **[`workflow_singlewin_selflora_13mp_vsr3k.json`](workflow_singlewin_selflora_13mp_vsr3k.json)** | `1.30 MP` (`1568×864`) | **`3136×1728` (真 3K)** | **`~10–11 分钟`**（2步 `~8.5m`） | **★ 日常主力甜点王**：双路 `ChunkedSage` 三刀提速 + 去油胶片 + 自训保锐 + 一步 `RelayVSR x2 (detail=0.50)` |
+| **[`workflow_singlewin_selflora_1080p.json`](workflow_singlewin_selflora_1080p.json)** | `1.98 MP` (`1920×1088`) | **`1920×1088` (纯原生)** | **`~15 分钟`**（2步 `~12m` / 5s `9m`） | **纯原生 1080p 直出**：移除 VSR 分支（0 误触 4K OOM 风险），含三刀提速 + 去油双槽 |
+| **[`workflow_singlewin_sharp_vsr2k.json`](workflow_singlewin_sharp_vsr2k.json)** | `1.00 MP` (`1376×768`) | **`2752×1536` (真 2.7K)** | **`~8.5–9.5 分钟`** | **经典最速 2.7K**：H3 原生 RoPE 甜点 + `LMS` + `RelayVSR x2 (detail=0.60)` |
 
-## 两个规划节点的分工
+### 通用上手要点
+1. **模型替换**：加载器中的底模 / LoRA 为作者本机文件名，拖入后按本机路径重选（底模 `dasiwa_v5xs INT8` 或官方 BF16/INT8 均可，`CLIPLoader` type = `minimax`，视频 VAE 推荐 `minimax_h3_sol_vae_fp16`）。
+2. **去油 + 保锐独立双旋钮**：
+   - `#15` 社区去油胶片 LoRA（保留 `adaln_proj`，推荐 `0.35~0.45`；换上 Stage-2 去油终版自训 LoRA 后可降至 `0.0~0.30`）；
+   - `#48` 自训 200 层无 `adaln` 稀疏保锐 LoRA（推荐 `0.55~0.75`，走 `bf16_lora=200/200` 无损旁路）。
+3. **15s 超长片**：将 `#20 total_seconds` 改为 `15.0`，并将 `#18 head_chunks` 改为 `14`（1080p 用 `14~28`，`1.3MP` 用 `7~14`），`#36 MiniMaxH3SafeAVDecode` 会自动 2 段安全解码零 OOM。
+4. **32GB 内存报错排查**：若遇 `pinned memory` / `hostbuf_grow`，运行 [`../tools/pinned_memory_patch.py`](../tools/pinned_memory_patch.py)（预设 3）并确保 ComfyUI 带 `--disable-async-offload`。
 
-| 节点 | 管什么 | 改了会重采一采吗 |
-|---|---|---|
-| **上游 Plan**（12 控件） | 片长 / 画布 / 每段秒数 / 缓存 key / 提示词 | **会** |
-| **下游 Pass-2 Plan**（33 控件） | 模型 / hunt / calm+overlap / 锚定 / 拼缝 / 重去噪 / 诊断 | **不会** |
+---
 
-## 硬件参考
-
-8GB 级（RTX 4060 Laptop）实测通过。
-负载 = **最长段帧数 × 二采画布 MP**：本机经验线 **≤ 180 通过 / ≥ 191 OOM**
-（2026-09-20 加质量 LoRA 后重测）。报告里的 `load estimate` 直接给 SAFE / LIKELY-OOM 判定。
-
-## 报错先看这里
-
-- **pinned / hostbuf / `aimdo memory compile error` / CUDA OOM** 一类 →
-  运行 [`tools/pinned_memory_patch.py`](../tools/pinned_memory_patch.py)，选预设
-  **3) 新设置（稳定跑通）**，改完**重启 ComfyUI**。
-- 反复崩在采样中途 + 系统出现 Kernel_117/141 报告 → GPU 驱动级故障（本机已知问题），
-  重启 ComfyUI 重试；频繁复发考虑回滚显卡驱动。
-- 提示词校验警告 → 按报告提示改（时间戳是指示值，不必精确）。
-
-原理与每个参数的详解：[`docs/GUIDE.md`](../docs/GUIDE.md)。
-
-## 示例成片
-
-本目录附带两条 15.08 秒 / 四窗的实测片，展示缝的两种结局：
-
-| 文件 | 看什么 | 声音 |
-|---|---|---|
-| `exp_4v10a_00095.mp4` | 三条缝里**最明显的只有一处**：帧 272 附近背景褪色一闪（overlap 交叉淡化的痕迹），**人物主体全程不突变**；另两条缝在静止段，几乎不可见 | ✅ 正常 |
-| `exp_4v10a_00090.mp4` | 帧 85 处是**直接分割**，人物内容整体突变——**剪辑软件剪掉那几帧即可**，去掉不影响 | ⚠️ 缺失 |
-
-> `00090` 没声音是**意外**：生成于 2026-09-26，当时音频 mux 线在早前的节点清理中被误删，
-> 已于 09-27 修复（`00095` 为修复后产物，声音正常）。音频本体一直在生成，只是没接进合成器。
-
-缝 272 的逐帧对照图：[`../docs/img/example_095_seam272.jpg`](../docs/img/example_095_seam272.jpg)。
-
+## 二、历史归档工作流
+- [`workflow_singlewin_chunkedsage.json`](workflow_singlewin_chunkedsage.json)：v2.0 纯单窗最小骨架（无超分、无额外 LoRA 槽）。
+- [`workflow.json`](workflow.json)：v1.4 四窗硬切示例（`15s / 1.3MP / calm_policy=auto`，详解见 [`../docs/GUIDE.md`](../docs/GUIDE.md) 与 [`../docs/README_LEGACY_HARDCUT.md`](../docs/README_LEGACY_HARDCUT.md)），附两条 15s 示例片 `exp_4v10a_00095.mp4`（含音轨）与 `exp_4v10a_00090.mp4`。

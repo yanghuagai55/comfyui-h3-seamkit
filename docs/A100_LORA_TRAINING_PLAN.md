@@ -1,10 +1,37 @@
-# Colab G4 / A100 双 Agent 协同任务书：MiniMax H3 原生 1080p 逼近满血 + 提速蒸馏 LoRA 训练
+# Colab G4 / A100 协同任务书：MiniMax H3 原生 1080p 逼近满血 + 稀疏锐度通用补丁 LoRA 训练（v2.6 去油定案）
 
-> **本文档面向接手本项目的两个自主 AI Agent（DeepSeek 部署工程师 + Grok Bot 夜间值守员）**。
-> 请在动手前先通读 [`docs/PRINCIPLES_AND_FORMULAS.md`](PRINCIPLES_AND_FORMULAS.md)，以彻底理解本仓库在 RTX 4060 8GB 上的显存、耗时、Sol-Attn 与 16-bit BF16 LoRA 旁路机制。
-> **硬件硬门槛**：本项目**仅在 Google Colab G4（NVIDIA RTX PRO 6000 96GB Blackwell）或 A100（40GB / 80GB）上运行**；若分到 T4 / L4 / V100，开机第一步立即退出，绝不浪费时间降级硬跑！
+> **本文档面向当前接手新 A100-80GB / G4 96GB 号的执行工程师（DeepSeek）**。
+> 请在动手前先通读 [`docs/PRINCIPLES_AND_FORMULAS.md`](PRINCIPLES_AND_FORMULAS.md)（含第 6 节 v2.6 去油公式推导）与本节 **v2.6 实战定案**。
+> **硬件硬门槛**：本项目**仅在 Google Colab G4（NVIDIA RTX PRO 6000 96GB Blackwell）或 A100（80GB 优先 / 40GB 保底）上运行**；若分到 T4 / L4 / V100，开机第一步立即退出！
 
 ---
+
+## 🔥 v2.6 实战定案与实测里程碑（2026-11-25）
+
+> **已落地全链路闭环**：
+> 1. **Stage-1 (`lora_run_v2`)**：修复 `train_h3_lora.py` `checkpoint` 闭包晚绑定（`_blk=block`）+ 强制 Step 1/2 `400/400` 梯度门禁 + 空间邻域 `±2` + 质心余弦路由后，真 200/200 层全活收敛至 `step 200`（`gn=0.10–0.67`）；4060 实测 `step 200` 清晰度显著优于 `step 150` 且零接缝。
+> 2. **72 条多元教师全量入库（`shards=9`）**：原 32 条 `22f` + 16 条武戏 [`train/prompts_action_16.jsonl`](../train/prompts_action_16.jsonl) + 24 条混编 `8×39f + 16×22f` [`train/prompts_39f_diverse_24.jsonl`](../train/prompts_39f_diverse_24.jsonl) 全数零失败上云。
+> 3. **Stage-2 (`lora_run_v2_s2`, v2.6 Scheme 2A 高低频解耦洗油)**：从 `step_000200` 热启，启用 `--lf-base-anchor --lf-kernel 5 --sigma-min 0.14 --sigma-max 0.62 --sigmas 0.54,0.20 --anchor-prob 0.35 --lr 8e-5 --steps 165`（按桶样本数加权抽样，小桶压至 `<4.5%`；`0.0 GB` 额外峰值显存，A100 峰值 `mem_gb=65.2 GB`、`46.6s/步`），实测仅 25 步即将低频油光误差 `loss_lf` 从 `0.872` 压降至 **`0.079`（`-91%`）**！
+
+经 Carbon 架构师对本机现有市面加速 LoRA（`dasiwa` 内置 Turbo、`minimax_h3_lms_v1.0_r64_r`、`curveproj1025` Turbo、`pika_h3_flex`）及已有数据分布的逐项代码/Header 审计，**正式修订后半程路线（省时 ~3h 且大幅提升泛化与通用性）**：
+
+1. **砍掉原计划独立的 300 步 Phase B（不单训 `--phase B`），也不将市面 Turbo/LMS 冻结进训练底模！改为【路线 3：纯解耦通用精修补丁 Phase A+】**：
+   - 原因：① `dasiwa` 底座已内置 4 步 Turbo，`curveproj1025` 写死 `exact_checkpoint_sha256_only`，强焊会触发 `adaln` 门控冲突且毁掉跨版本通用性；② 现行 `--phase B` 仅缩窄至 2 个离散 $\sigma$ 点单步回归，无法替代 Pass-1 Turbo，易过拟合背图；③ 我们 200 层（0 `adaln`）纯线性 LoRA 推理时与任意市面加速 LoRA（`pika` / `LMS` / `dasiwa` / 未来新加速 LoRA）并挂，走 `chunked_sage.py` 单次融合 `addmm`，**每步仅增 `<0.4s` 且 0 额外反量化**！
+   - 做法：在现有 `step 450` 基础上，补齐武戏/高速动态样本后，**续训 `step 450 → 700`（`--anchor-prob 0.30 --sigmas 0.85,0.54,0.20`：70% 连续 $\sigma\in[0.12,0.85]$ + 30% 真实 Pass-2 锚点）**，一趟封版交付！
+2. **修复原提示词池 `0%` 武戏与 34% 重复缺陷**：
+   - 原 `build_prompts.py` 因 `gcd(40,20)=20` 导致前 32 条 `22f` 样本仅 21 条唯一提示词且 **0 条武戏/高速大位移镜头**（不补会导致 4 帧合包运动模糊被过锐成双轮廓鬼影 + Sol-Attn 跨块检索漏召回）。
+   - 已备好全新 0 重复 **16 条武戏/高速大位移 `22f` 提示词**：[`train/prompts_action_16.jsonl`](../train/prompts_action_16.jsonl)（`act_0001`~`act_0016`：兵刃挥斩 4 + 高速跟拍横摇 4 + 刚体破水火星撞击 4 + `deepseek.png` Ref2VA 急旋甩发闪避 4）。
+3. **本轮新 A100-80GB 完整 4 步执行单（总耗时约 3.2 小时一趟封版，详见 `d:\dev\colab\DEEPSEEK_A100_MISSION.md`）**：
+   - **Step A（~5 分钟）**：用 [`train/eval_lora_a100.py`](../train/eval_lora_a100.py) 直接在 A100 上对现有 **`step_000450.safetensors`** 做 1080p 稀疏 Pass-2 视频 A/B 实测（`z_up` vs `no_lora` vs `lora_0.65` vs `lora_1.00` vs `teacher_gt`），输出对比长图 + 并排 MP4 并传 HF `eval_step450/`。
+   - **Step B（~60 分钟）**：跑 `run_teacher.py --prompts train/prompts_action_16.jsonl` 生成 16 条武戏/高速 `22f` 满血教师并自动推送至 HF（总样本 `32 → 48` 条，高速占比 ~30% 黄金比例）。
+   - **Step C（~125 分钟）**：卸载 ComfyUI 模型（`/free`）后，拉齐全部 48 条缓存，从 `lora_run/resume/latest_state.pt`（`step 450`）续训 **Phase A+ 至 `step 700`**（开启 `--anchor-prob 0.30 --sigmas 0.85,0.54,0.20 --grad-clamp 10 --save-every 50`）。
+   - **Step D–G（v2.5 真 200 层早停 + 混编封神定案，14:48 → 19:38 一趟收官，详见 `d:\dev\colab\DEEPSEEK_A100_MISSION.md`）**：
+     - 定位并修复 `train_h3_lora.py:468` Python 闭包延迟绑定（`_blk=block`）后，真 200/200 层 `lora_run_v2` 收敛极快（`step 50` 已达 `x0_mse=0.214~0.300`, `gn=0.60`）；
+     - 为避免小桶过拟合且赶在本号 `~19:45–20:30` 额度耗尽前收官：**`~14:48` 拉回 `step 150` 到本地 4060 抢先实测 → `~15:15` 到达 `step 200` 上云后优雅停机 → `15:20–17:18` 用混编 [`train/prompts_39f_diverse_24.jsonl`](../train/prompts_39f_diverse_24.jsonl) 补齐 `8 条 39f + 16 条 22f` 多元新教师（总库 `~67–72` 条）→ `17:18–19:25` 用新版按样本数加权抽样 `train_h3_lora.py` + `--init-lora step_000200 --out lora_run_v2_s2 --frames 22,39 --steps 220 --lr 8e-5` 精调封版 → `19:25–19:38` 复测 `22f/39f` 并归档终版 `final/minimax_h3_sol_sharp_v2_final.safetensors`**！
+
+---
+
+> *(以下保留原初版设计背景与排障矩阵供参考；实际执行以本页顶部 **v2.4 定案** 与 `DEEPSEEK_A100_MISSION.md` 为准。)*
 
 ## 0. 项目核心目的与跨模型通用性评估（战略必读）
 
