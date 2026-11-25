@@ -1358,6 +1358,36 @@ def _resolve_out_proj_mode(mode: str, seq_len: int, device: torch.device) -> str
     return "streaming"
 
 
+def _resolve_safe_chunks(
+    head_chunks: int,
+    token_chunk: int,
+    out_proj_mode: str,
+    seq_len: int,
+    heads: int,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Deterministically guard <=12GB GPUs in `auto` mode against OOM on 15s+ sequences (constant across all 50 blocks)."""
+    eff_hc = max(1, min(int(head_chunks), int(heads)))
+    eff_tc = max(1024, int(token_chunk))
+    if out_proj_mode != "auto" or device.type != "cuda" or seq_len <= 155000:
+        return eff_hc, eff_tc
+    try:
+        total_vram_gib = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    except Exception:
+        return eff_hc, eff_tc
+    if total_vram_gib >= 14.0:
+        return eff_hc, eff_tc
+    if seq_len > 175000:
+        # e.g. 15s 1080p (S ≈ 218k): hc=28 (g=2, exact 256 ConvRot) prevents 8GB activation OOM
+        eff_hc = max(eff_hc, min(28, int(heads)))
+        eff_tc = min(eff_tc, 8192)
+    else:
+        # e.g. 10s 1984x1120 (S ≈ 163k) or 15s 768p: hc=14 (g=4, exact 512 ConvRot)
+        eff_hc = max(eff_hc, min(14, int(heads)))
+        eff_tc = min(eff_tc, 8192)
+    return eff_hc, eff_tc
+
+
 def _apply_qk_norm_rope(attn, q_g: torch.Tensor, k_g: torch.Tensor, rope_freqs, qw, kw, rot_dim: int):
     if rope_freqs is not None and _ck is not None and q_g.is_cuda and not mm.in_training:
         _ck.rms_rope_split_half_(
@@ -2049,7 +2079,7 @@ def _run_chunked_mlp_inplace(
     del fc1_packed, fc2_packed, gated_fc2_cache
 
 
-def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
+def _make_chunked_attn_forward(head_chunks: int, token_chunk: int, out_proj_mode: str = "auto"):
     """Standalone patched `attn.forward` (used if another node overrides `block.forward`, e.g. KJ LowVRAM chained after us)."""
     def minimax_chunked_sageattn_forward(self, x, rope_freqs=None, transformer_options={}):
         if isinstance(x, list):
@@ -2064,7 +2094,9 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
         n_groups = head_chunks
         if isinstance(transformer_options, dict) and transformer_options.get("minimax_head_chunks"):
             n_groups = max(n_groups, int(transformer_options["minimax_head_chunks"]))
-        n_groups = min(n_groups, heads)
+        n_groups, eff_token_chunk = _resolve_safe_chunks(
+            n_groups, token_chunk, out_proj_mode, s, heads, device
+        )
         sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
         block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
         attn_temp_scale = float(transformer_options.get("_chunked_sage_attn_temp", 1.0)) if isinstance(transformer_options, dict) else 1.0
@@ -2088,8 +2120,8 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                     if qkv_packed is not None
                     else None
                 )
-                for t0 in range(0, s, token_chunk):
-                    t1 = min(t0 + token_chunk, s)
+                for t0 in range(0, s, eff_token_chunk):
+                    t1 = min(t0 + eff_token_chunk, s)
                     if qkv_mid is not None:
                         qkv_mid[t0:t1] = F.linear(x[t0:t1], qkv_packed[1])
                     _quantize_int8_convrot_into(x[t0:t1], x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
@@ -2157,8 +2189,8 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
                 q_all = torch.empty((s, inner), dtype=dtype, device=device)
                 k_all = torch.empty((s, inner), dtype=dtype, device=device)
                 v_all = torch.empty((s, inner), dtype=dtype, device=device)
-                for t0 in range(0, s, token_chunk):
-                    t1 = min(t0 + token_chunk, s)
+                for t0 in range(0, s, eff_token_chunk):
+                    t1 = min(t0 + eff_token_chunk, s)
                     qc, kc, vc = self.qkv_proj(x[t0:t1]).split(inner, dim=-1)
                     q_all[t0:t1] = qc
                     k_all[t0:t1] = kc
@@ -2186,8 +2218,8 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int):
 
         res = torch.empty((s, self.out_proj.out_features), dtype=dtype, device=device)
         with _cast_linear_once(self.out_proj, device, dtype) as (w_out, b_out):
-            for t0 in range(0, s, token_chunk):
-                t1 = min(t0 + token_chunk, s)
+            for t0 in range(0, s, eff_token_chunk):
+                t1 = min(t0 + eff_token_chunk, s)
                 o_c = out[t0:t1]
                 r_c = _linear_with_cast_weight(o_c, w_out, b_out)
                 if out_packed is not None:
@@ -2231,10 +2263,18 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
         n_groups = head_chunks
         if isinstance(transformer_options, dict) and transformer_options.get("minimax_head_chunks"):
             n_groups = max(n_groups, int(transformer_options["minimax_head_chunks"]))
-        n_groups = min(n_groups, self.attn.heads)
+        n_groups, eff_token_chunk = _resolve_safe_chunks(
+            n_groups, token_chunk, out_proj_mode, s, self.attn.heads, device
+        )
         eff_mode = _resolve_out_proj_mode(out_proj_mode, s, device)
         sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
         block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
+        if block_idx == 0 and (n_groups != head_chunks or eff_token_chunk != token_chunk):
+            print(
+                f"[SeamKit] 8GB 超长序列显存护栏 (S={s:,}): 自动调整 head_chunks {head_chunks}→{n_groups}, "
+                f"token_chunk {token_chunk}→{eff_token_chunk} 防 OOM",
+                flush=True,
+            )
         attn_temp_scale = float(transformer_options.get("_chunked_sage_attn_temp", 1.0)) if isinstance(transformer_options, dict) else 1.0
         qkv_loras = _get_linear_loras(self.attn.qkv_proj, transformer_options)
         out_loras = _get_linear_loras(self.attn.out_proj, transformer_options)
@@ -2249,7 +2289,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                 if _is_int8_tensorwise(w_qkv) and x.is_cuda and _ck_cuda is not None:
                     _run_chunked_attention_int8(
                         self, self.attn, x, shift_msa, scale_msa, gate_msa, mod_segments,
-                        rope_freqs, w_qkv, b_qkv, n_groups, token_chunk, eff_mode,
+                        rope_freqs, w_qkv, b_qkv, n_groups, eff_token_chunk, eff_mode,
                         sol_ctx=sol_ctx, block_idx=block_idx,
                         qkv_loras=qkv_loras, out_loras=out_loras,
                         attn_temp_scale=attn_temp_scale,
@@ -2258,7 +2298,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                 elif not isinstance(w_qkv, qops.QuantizedTensor):
                     _run_chunked_attention_dense(
                         self, self.attn, x, shift_msa, scale_msa, gate_msa, mod_segments,
-                        rope_freqs, w_qkv, b_qkv, n_groups, token_chunk, eff_mode,
+                        rope_freqs, w_qkv, b_qkv, n_groups, eff_token_chunk, eff_mode,
                         sol_ctx=sol_ctx, block_idx=block_idx,
                         qkv_loras=qkv_loras, out_loras=out_loras,
                         attn_temp_scale=attn_temp_scale,
@@ -2277,7 +2317,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
             del attn_out
 
         _run_chunked_mlp_inplace(
-            self, x, shift_mlp, scale_mlp, gate_mlp, mod_segments, token_chunk,
+            self, x, shift_mlp, scale_mlp, gate_mlp, mod_segments, eff_token_chunk,
             transformer_options=transformer_options,
             use_fused_rms=(eff_mode == "streaming"),
         )
@@ -2661,7 +2701,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             if popped_any:
                 m.patches_uuid = uuid.uuid4()
 
-        attn_fwd = _make_chunked_attn_forward(head_chunks, token_chunk_size)
+        attn_fwd = _make_chunked_attn_forward(head_chunks, token_chunk_size, str(out_proj_mode))
         block_fwd = _make_chunked_block_forward(head_chunks, str(out_proj_mode), token_chunk_size)
 
         for idx, block in enumerate(blocks):
