@@ -1363,14 +1363,16 @@ def _uniform_head_chunk_candidates(heads: int, convrot_unit: int = 2) -> list[in
 
 
 def _activation_vram_budget_bytes(total_vram_bytes: int) -> int:
-    """Aggressive activation VRAM budget for mainstream GPUs (6/8/10/12/16/24GB+): `B_act(V) = 0.92*V - 0.56 GiB`.
+    """WDDM Sysmem-spill-free activation VRAM budget (6/8/10/12/16/24GB+): `B_act(V) = 0.88*V - 0.90 GiB`.
 
-    Allows 8GB GPUs (`B_act = 6.80 GiB`) to run 10s 1080p at `hc=4` (6.00 GiB) and 15s 1080p at `hc=7` (6.64-6.76 GiB),
-    leaving ~1.2 GiB for CUDA context + single pinned INT8 block (~0.15 GiB) + allocator overhead.
+    Empirically bracketed on RTX 4060 8GB (Windows WDDM):
+    - 10s 1080p hc=4 (`6.00 GiB` <= `6.14 GiB`): 0 spill, full TDP (`202s/it`);
+    - 15s 1080p hc=14 (`5.20 GiB` <= `6.14 GiB`): 0 spill, full TDP (`7.1/8.0 GB`);
+    - 15s 1080p hc=7 (`6.64 GiB` > `6.14 GiB`): triggers silent WDDM Sysmem fallback (`7.6/8.0 GB`, `29W/58°C` PCIe stall).
     """
     gib = 1024 ** 3
     v_gib = float(total_vram_bytes) / gib
-    return int(max(2.2, 0.92 * v_gib - 0.56) * gib)
+    return int(max(2.0, 0.88 * v_gib - 0.90) * gib)
 
 
 def _estimate_block_peak_bytes(

@@ -55,20 +55,20 @@ $$M_{\text{attn}}(S, g) = M_{\text{base}}(S) + \mathbb{I}[\text{exact}]\cdot 2 N
 
 $$M_{\text{mlp}}(S, C_{\text{tok}}) = 2 H S + 2 \cdot (3 F) \cdot \min(S, C_{\text{tok}}) = 10{,}752\, S + 86{,}016\, \min(S, C_{\text{tok}})$$
 
-主流显存规格激进激活预算（仅扣 ~1.2 GiB CUDA 上下文 + 单层常驻 INT8 权重 `0.15 GiB` + 分配器余量，`comfy-aimdo` 自动淘汰空闲 VBAR 页让路）：
+主流显存规格 **防 WDDM 共享显存静默溢出（Sysmem Fallback）** 激活预算——实测在 RTX 4060 8GB 上，`10s hc=4 (6.00 GiB)` 与 `15s hc=14 (5.20 GiB)` 均满功耗（`82°C`）运行，而 `15s hc=7 (6.64 GiB)` 会把专用显存顶至 `7.6/8.0 GB` 并触发 NVIDIA WDDM 静默溢出到系统内存（不报 OOM 但 GPU 跌至 `29W / 58°C` 死等 PCIe）：
 
-$$B_{\text{act}}(V_{\text{total}}) = \max\!\big(2.2\text{ GiB},\; 0.92\, V_{\text{total}} - 0.56\text{ GiB}\big)$$
+$$B_{\text{act}}(V_{\text{total}}) = \max\!\big(2.0\text{ GiB},\; 0.88\, V_{\text{total}} - 0.90\text{ GiB}\big)$$
 
 求解器在均匀 ConvRot-256 约数集合 $G \in \{1, 2, 4, 7, 14, 28\}$（保证每组张量形状完全一致、零 `cudaMallocAsync` 池碎片）中选择满足 $M_{\text{attn}}(S, 56/G) \le B_{\text{act}}$ 的**最小（最快）$G$**，且仅当 $M_{\text{mlp}} > B_{\text{act}}$ 时才缩减 `token_chunk_size`（设 `head_chunks = 0` 即全自动最优）：
 
 | 显卡规格 ($V_{\text{total}}$) | 激活预算 $B_{\text{act}}$ | 5s 1080p ($79\text{k}$) | 10s 1080p ($153\text{k}$) | 15s 1080p ($224\text{k}$) | 20s 1080p ($296\text{k}$) |
 |---|---:|---|---|---|---|
-| **6 GB** | `4.96 GiB` | `hc=2` (`4.76 GiB`) | `hc=7` (`4.55 GiB`) | `hc=28` (`4.61 GiB`) | 需降分辨率 |
-| **8 GB (4060/3070)** | **`6.80 GiB`** | **`hc=2`** (`4.76 GiB`) | **`hc=4, tc=16k`** (`6.00 GiB`) | **`hc=7, tc=16k`** (`6.64–6.76 GiB`) | **`hc=28, tc=16k`** (`6.11 GiB`) |
-| **10 GB (3080)** | `8.64 GiB` | `hc=1` (`8.14 GiB`) | `hc=4` (`6.00 GiB`) | **`hc=7, tc=16k`** (`6.76 GiB`) | `hc=14` (`7.08 GiB`) |
-| **12 GB (4070/3060)** | `10.48 GiB` | `hc=1` (`8.14 GiB`) | **`hc=2`** (`9.35 GiB`) | **`hc=4, tc=16k`** (`8.92 GiB`) | `hc=7` (`9.02 GiB`) |
-| **16 GB (4080/4060Ti)** | `14.16 GiB` | `exact hc=1` (`9.20 GiB`) | **`exact hc=2`** (`11.39 GiB`) | **`exact hc=4`** (`11.91 GiB`) | `streaming hc=4` (`11.93 GiB`) |
-| **24 GB (3090/4090)** | `21.52 GiB` | `exact hc=1` (`9.20 GiB`) | **`exact hc=1`** (`18.09 GiB`) | **`exact hc=2`** (`16.94 GiB`) | `exact hc=4` (`15.88 GiB`) |
+| **6 GB** | `4.38 GiB` | `hc=4` (`3.06 GiB`) | `hc=14` (`3.61 GiB`) | `hc=28` (`4.61 GiB`) | 需降分辨率 |
+| **8 GB (4060/3070)** | **`6.14 GiB`** | **`hc=2`** (`4.76 GiB`) | **`hc=4, tc=16k`** (`6.00 GiB`) | **`hc=14, tc=16k`** (`5.20–5.32 GiB`) | **`hc=28, tc=16k`** (`6.11 GiB`) |
+| **10 GB (3080)** | `7.90 GiB` | `hc=2` (`4.76 GiB`) | `hc=4` (`6.00 GiB`) | **`hc=7, tc=16k`** (`6.76 GiB`) | `hc=14` (`7.08 GiB`) |
+| **12 GB (4070/3060)** | `9.66 GiB` | `hc=1` (`8.14 GiB`) | **`hc=2`** (`9.35 GiB`) | **`hc=4, tc=16k`** (`8.92 GiB`) | `hc=7` (`9.02 GiB`) |
+| **16 GB (4080/4060Ti)** | `13.18 GiB` | `exact hc=1` (`9.20 GiB`) | **`exact hc=2`** (`11.39 GiB`) | **`exact hc=4`** (`11.91 GiB`) | `streaming hc=4` (`11.93 GiB`) |
+| **24 GB (3090/4090)** | `20.22 GiB` | `exact hc=1` (`9.20 GiB`) | **`exact hc=1`** (`18.09 GiB`) | **`exact hc=2`** (`16.94 GiB`) | `exact hc=4` (`15.88 GiB`) |
 
 *(上表按 `Sol-Attn (aug=64)` + 重载 LoRA 栈 `R_sum = 864` 计算；无 LoRA 或 `dense_sage` 时峰值还会更低。)*
 
