@@ -43,8 +43,34 @@ $$N_{\text{tok/frame}} = \frac{W_{\text{px}}}{32} \cdot \frac{H_{\text{px}}}{32}
    - **`streaming` 模式**（8GB 卡长序列自动启用）：每组头输出 `o_g [S, g·128]` 直接乘 `out_proj` 列切片 `W[:, c0:c1]` 并原地累加进残差 `x`，彻底消灭 `[S, 7168]` 缓冲（单层余弦精度 `cos = 0.999965`）。
    - **碎片带宽公式（v2.7 核心提速发现）**：在 `streaming` 模式下，每组头都会对残差 `x`（`1.58 GB @ 147k`）做一次读写累加，因此 50 层每步由 `out_proj` 产生的额外残差 HBM 流量与核函数启动次数为：
      $$\text{Traffic}_{\text{resid}}(G) = 50 \cdot G \cdot 2 \cdot (2 S H), \qquad N_{\text{launches}}(G, C_{\text{tok}}) = 50 \cdot G \cdot \left\lceil\frac{S}{C_{\text{tok}}}\right\rceil$$
-     - 旧配 `G=14, C_tok=8192`（$S=147\text{k}$）：每步高达 **`12,600` 次**窄矩阵（512 列）核启动、**`2.2 TB`** 残差读写，而激活峰值仅 `1.17 GiB`；
-     - 升级 **`G=4, C_tok=16384`**（每组 14 头 = `1792` 列 = `7×256` 严格对齐）：核启动骤降至 **`1,800` 次（`-85.7%`）**、残差读写降 **`3.5×`**，激活峰值仅升至 `~2.2 GiB`（8GB 卡完全宽裕），100% 数值等价下 3 步立省 **`~40s`**！（拍 `15s` 时 `S=222k` 改回 `hc=14` 或 `28` 即可）。
+     - 旧配 `G=14, C_tok=8192`（$S=147\text{k}$）：每步高达 **`12,600` 次**窄矩阵（512 列）核启动、**`2.2 TB`** 残差读写；
+     - 升级 **`G=4, C_tok=16384`**（每组 14 头 = `1792` 列 = `7×256` 严格对齐）：核启动骤降至 **`1,800` 次（`-85.7%`）**、残差读写降 **`3.5×`**，100% 数值等价下 3 步立省 **`~40s`**。
+
+### 1.3 精确单块峰值显存解析公式与全规格显卡自适应求解器（v2.8）
+[`_estimate_block_peak_bytes`](../chunked_sage.py) 与 [`_resolve_vram_plan`](../chunked_sage.py) 直接对单层 DiT Block 所有并发驻留张量逐字节精确求和（并零显存调用 `comfy_kitchen._C.sol_attn_plan(1, S, g, token_aug)` 读取真实 Sol-Attn 工作区字节数）：
+
+$$M_{\text{base}}(S) = S \cdot \big(2H + H + 4 + 768 + 2(R_{\text{qkv}} + R_{\text{out}})\big) \approx 16{,}900\, S + 2 R_{\text{sum}} S$$
+
+$$M_{\text{attn}}(S, g) = M_{\text{base}}(S) + \mathbb{I}[\text{exact}]\cdot 2 N_h D S + \begin{cases} 4 \cdot 2 g D S + W_{\text{sol}}(S, g, \text{aug}) & (\text{Sol-Attn}) \\ 6 g D S + 16 g S & (\text{Dense Sage}) \end{cases}$$
+
+$$M_{\text{mlp}}(S, C_{\text{tok}}) = 2 H S + 2 \cdot (3 F) \cdot \min(S, C_{\text{tok}}) = 10{,}752\, S + 86{,}016\, \min(S, C_{\text{tok}})$$
+
+主流显存规格激活预算（扣除 CUDA 上下文、单层 INT8 固定权重、VBAR/分配器安全余量，经 RTX 4060 8GB `10s hc=4 (6.00 GiB)` 实测通过与 `15s hc=4 (8.92 GiB)` OOM 标定）：
+
+$$B_{\text{act}}(V_{\text{total}}) = \max\!\big(2.0\text{ GiB},\; 0.88\, V_{\text{total}} - 0.90\text{ GiB}\big)$$
+
+求解器在均匀 ConvRot-256 约数集合 $G \in \{1, 2, 4, 7, 14, 28\}$（保证每组张量形状完全一致、零 `cudaMallocAsync` 池碎片）中选择满足 $M_{\text{attn}}(S, 56/G) \le B_{\text{act}}$ 的**最小（最快）$G$**，且仅当 $M_{\text{mlp}} > B_{\text{act}}$ 时才缩减 `token_chunk_size`（设 `head_chunks = 0` 即全自动最优）：
+
+| 显卡规格 ($V_{\text{total}}$) | 激活预算 $B_{\text{act}}$ | 5s 1080p ($79\text{k}$) | 10s 1080p ($153\text{k}$) | 15s 1080p ($224\text{k}$) | 20s 1080p ($296\text{k}$) |
+|---|---:|---|---|---|---|
+| **6 GB** | `4.38 GiB` | `hc=4` (`3.09 GiB`) | `hc=14` (`3.64 GiB`) | `hc=28, tc=16k` (`4.66*`) | 需降分辨率 |
+| **8 GB (4060/3070)** | **`6.14 GiB`** | **`hc=2`** (`4.78 GiB`) | **`hc=4, tc=16k`** (`6.00 GiB`) | **`hc=14, tc=16k`** (`5.33 GiB`) | **`hc=28, tc=16k`** (`6.11 GiB`) |
+| **10 GB (3080)** | `7.90 GiB` | `hc=2` (`4.78 GiB`) | `hc=4` (`6.00 GiB`) | **`hc=7, tc=16k`** (`6.76 GiB`) | `hc=14` (`7.09 GiB`) |
+| **12 GB (4070/3060)** | `9.66 GiB` | `hc=1` (`8.16 GiB`) | **`hc=2`** (`9.35 GiB`) | **`hc=4, tc=16k`** (`8.92 GiB`) | `hc=7` (`9.03 GiB`) |
+| **16 GB (4080/4060Ti)** | `13.18 GiB` | `exact hc=1` (`9.21 GiB`) | **`exact hc=2`** (`11.39 GiB`) | **`exact hc=4`** (`11.91 GiB`) | `streaming hc=4` (`11.94 GiB`) |
+| **24 GB (3090/4090)** | `20.22 GiB` | `exact hc=1` (`9.21 GiB`) | **`exact hc=1`** (`18.09 GiB`) | **`exact hc=2`** (`16.94 GiB`) | `exact hc=4` (`15.89 GiB`) |
+
+*(上表按 `Sol-Attn (aug=64)` + 重载 LoRA 栈 `R_sum = 864` 计算；无 LoRA 或 `dense_sage` 时峰值还会更低。)*
 
 ---
 

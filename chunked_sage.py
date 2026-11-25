@@ -1342,20 +1342,173 @@ def _linear_with_cast_weight(x: torch.Tensor, weight, bias) -> torch.Tensor:
     return F.linear(x, weight, bias)
 
 
-def _resolve_out_proj_mode(mode: str, seq_len: int, device: torch.device) -> str:
-    """Deterministically resolve 'auto' -> 'exact' or 'streaming' (constant across all 50 blocks for malloc_graph)."""
-    if mode in ("exact", "streaming"):
-        return mode
-    if seq_len <= 64000:
-        return "exact"
-    if device.type == "cuda":
+def _sol_attn_workspace_bytes(seq_len: int, group_heads: int, token_aug: int = 64) -> int:
+    """Exact byte size of `comfy_kitchen.sol_attn` workspace (queries `_C.sol_attn_plan` on CPU, 0 VRAM)."""
+    if _ck_cuda is not None and hasattr(_ck_cuda, "_C") and hasattr(_ck_cuda._C, "sol_attn_plan"):
         try:
-            total_vram_gib = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-            if total_vram_gib >= 16.0:
-                return "exact"
+            return int(_ck_cuda._C.sol_attn_plan(1, int(seq_len), int(group_heads), token_aug=int(token_aug))["total"])
         except Exception:
             pass
-    return "streaming"
+    n_blk = (int(seq_len) + 63) // 64
+    return int(group_heads) * (int(seq_len) * 384 + n_blk * n_blk * 12 + n_blk * 4096)
+
+
+def _uniform_head_chunk_candidates(heads: int, convrot_unit: int = 2) -> list[int]:
+    """Ascending exact divisors of `heads // convrot_unit` so every group has identical shape (0 allocator frag)."""
+    unit = max(1, int(convrot_unit))
+    if heads % unit != 0:
+        unit = 1
+    n_units = max(1, heads // unit)
+    return [d for d in range(1, n_units + 1) if n_units % d == 0]
+
+
+def _activation_vram_budget_bytes(total_vram_bytes: int) -> int:
+    """Calibrated activation VRAM budget for mainstream GPUs (6/8/10/12/16/24GB+): `B_act(V) = 0.88*V - 0.90 GiB`."""
+    gib = 1024 ** 3
+    v_gib = float(total_vram_bytes) / gib
+    return int(max(2.0, 0.88 * v_gib - 0.90) * gib)
+
+
+def _estimate_block_peak_bytes(
+    seq_len: int,
+    hidden: int,
+    heads: int,
+    head_dim: int,
+    ffn: int,
+    group_heads: int,
+    token_chunk: int,
+    eff_mode: str,
+    use_sol: bool,
+    sol_token_aug: int = 64,
+    dtype_bytes: int = 2,
+    lora_rank_sum: int = 0,
+) -> tuple[int, int]:
+    """Exact `(attn_peak_bytes, mlp_peak_bytes)` simultaneously alive in one INT8-ConvRot DiT block."""
+    s = int(seq_len)
+    # Resident across attention: x(bf16) + x_qdata(int8) + x_scale(fp32) + rope(~768B) + qkv_mid + out_mid
+    base = s * (dtype_bytes * int(hidden) + int(hidden) + 4 + 768 + dtype_bytes * max(0, int(lora_rank_sum)))
+    out_buf = (dtype_bytes * int(heads) * int(head_dim) * s) if eff_mode == "exact" else 0
+    if use_sol:
+        # Live simultaneously inside ck.sol_attn(q_g, k_g, v_g): q_g, k_g, v_g, o_g + sol_attn_plan workspace
+        grp = 4 * dtype_bytes * int(group_heads) * int(head_dim) * s + _sol_attn_workspace_bytes(s, group_heads, sol_token_aug)
+    else:
+        # _staged_sageattn_nhd frees BF16 q,k before allocating v,o: peak is BF16 q,k + INT8 q,k + scales
+        grp = (2 * dtype_bytes + 2) * int(group_heads) * int(head_dim) * s + 16 * int(group_heads) * s
+    attn_peak = base + out_buf + grp
+    # MLP peak inside _swiglu_chunk: x(bf16) + fc1_c[tc, 2*FFN] + act_c[tc, FFN]
+    mlp_peak = dtype_bytes * int(hidden) * s + dtype_bytes * (3 * int(ffn)) * min(s, int(token_chunk))
+    return attn_peak, mlp_peak
+
+
+def _resolve_vram_plan(
+    head_chunks: int,
+    token_chunk: int,
+    out_proj_mode: str,
+    seq_len: int,
+    hidden: int,
+    heads: int,
+    head_dim: int,
+    ffn: int,
+    device: torch.device,
+    use_sol: bool = True,
+    sol_token_aug: int = 64,
+    dtype_bytes: int = 2,
+    lora_rank_sum: int = 0,
+    convrot_unit: int = 2,
+) -> tuple[str, int, int, float, float, float]:
+    """Deterministically solve `(eff_mode, eff_hc, eff_tc, attn_gib, mlp_gib, budget_gib)` from closed-form VRAM math.
+
+    Constant across all 50 blocks (safe for `malloc_graph`).
+    - `head_chunks == 0`: automatically chooses the fastest uniform ConvRot-aligned `hc` that fits `B_act(V)`.
+    - `head_chunks > 0` in `out_proj_mode == "auto"`: keeps user's `hc` if it fits, else bumps only to the
+      smallest (fastest) safe uniform divisor (e.g. 8GB 15s 1080p: `hc 4 -> 14`, keeping `tc=16384`).
+    """
+    gib = float(1024 ** 3)
+    req_hc = int(head_chunks)
+    req_tc = max(1024, int(token_chunk))
+    candidates = _uniform_head_chunk_candidates(heads, convrot_unit)
+    max_hc = candidates[-1]
+
+    total_vram = 0
+    if device.type == "cuda":
+        try:
+            total_vram = int(torch.cuda.get_device_properties(device).total_memory)
+        except Exception:
+            total_vram = 0
+
+    if total_vram <= 0:
+        eff_mode = out_proj_mode if out_proj_mode in ("exact", "streaming") else ("exact" if seq_len <= 64000 else "streaming")
+        eff_hc = max(1, min(req_hc if req_hc > 0 else 7, heads))
+        g_eff = (heads + eff_hc - 1) // eff_hc
+        ap, mp = _estimate_block_peak_bytes(
+            seq_len, hidden, heads, head_dim, ffn, g_eff, req_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
+        )
+        return eff_mode, eff_hc, req_tc, ap / gib, mp / gib, 0.0
+
+    budget = _activation_vram_budget_bytes(total_vram)
+    v_gib = total_vram / gib
+
+    # 1. Resolve out_proj_mode
+    if out_proj_mode in ("exact", "streaming"):
+        eff_mode = out_proj_mode
+    elif seq_len <= 64000:
+        eff_mode = "exact"
+    elif v_gib >= 14.0:
+        # Use exact on >=16GB GPUs whenever a reasonable hc (<= max(req_hc, 4)) fits the exact budget
+        probe_hc = max(req_hc, 4) if req_hc > 0 else 4
+        probe_hc = min((c for c in candidates if c >= probe_hc), default=max_hc)
+        ap_ex, _ = _estimate_block_peak_bytes(
+            seq_len, hidden, heads, head_dim, ffn, heads // probe_hc, req_tc, "exact", use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
+        )
+        eff_mode = "exact" if ap_ex <= budget else "streaming"
+    else:
+        eff_mode = "streaming"
+
+    # 2. Solve minimum safe uniform head_chunks
+    hc_safe = max_hc
+    for cand in candidates:
+        g_cand = heads // cand
+        ap, _ = _estimate_block_peak_bytes(
+            seq_len, hidden, heads, head_dim, ffn, g_cand, req_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
+        )
+        if ap <= budget:
+            hc_safe = cand
+            break
+
+    if req_hc <= 0:
+        eff_hc = hc_safe
+    elif out_proj_mode == "auto":
+        if req_hc >= hc_safe:
+            eff_hc = min(req_hc, heads)
+        else:
+            eff_hc = hc_safe
+    else:
+        eff_hc = min(req_hc, heads)
+
+    # 3. Solve maximum safe token_chunk for MLP (never shrinks unless MLP actually exceeds budget)
+    eff_tc = req_tc
+    if req_hc <= 0 or out_proj_mode == "auto":
+        x_bytes = dtype_bytes * int(hidden) * int(seq_len)
+        bytes_per_tok = dtype_bytes * (3 * int(ffn))
+        avail_mlp = budget - x_bytes
+        if avail_mlp < bytes_per_tok * min(int(seq_len), eff_tc):
+            tc_max = max(2048, (max(0, avail_mlp) // (bytes_per_tok * 1024)) * 1024)
+            eff_tc = max(2048, min(eff_tc, int(tc_max)))
+
+    g_final = max(1, (heads + eff_hc - 1) // eff_hc)
+    ap_fin, mp_fin = _estimate_block_peak_bytes(
+        seq_len, hidden, heads, head_dim, ffn, g_final, eff_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
+    )
+    return eff_mode, eff_hc, eff_tc, ap_fin / gib, mp_fin / gib, budget / gib
+
+
+def _resolve_out_proj_mode(mode: str, seq_len: int, device: torch.device) -> str:
+    """Backwards-compatible wrapper around `_resolve_vram_plan`."""
+    eff_mode, _, _, _, _, _ = _resolve_vram_plan(
+        head_chunks=4, token_chunk=16384, out_proj_mode=mode, seq_len=seq_len,
+        hidden=5376, heads=56, head_dim=128, ffn=14336, device=device, use_sol=True,
+    )
+    return eff_mode
 
 
 def _resolve_safe_chunks(
@@ -1365,26 +1518,21 @@ def _resolve_safe_chunks(
     seq_len: int,
     heads: int,
     device: torch.device,
+    hidden: int = 5376,
+    head_dim: int = 128,
+    ffn: int = 14336,
+    use_sol: bool = True,
+    sol_token_aug: int = 64,
+    dtype_bytes: int = 2,
+    lora_rank_sum: int = 0,
 ) -> tuple[int, int]:
-    """Deterministically guard <=12GB GPUs in `auto` mode against OOM on 15s+ sequences (constant across all 50 blocks)."""
-    eff_hc = max(1, min(int(head_chunks), int(heads)))
-    eff_tc = max(1024, int(token_chunk))
-    if out_proj_mode != "auto" or device.type != "cuda" or seq_len <= 155000:
-        return eff_hc, eff_tc
-    try:
-        total_vram_gib = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    except Exception:
-        return eff_hc, eff_tc
-    if total_vram_gib >= 14.0:
-        return eff_hc, eff_tc
-    if seq_len > 175000:
-        # e.g. 15s 1080p (S ≈ 218k): hc=28 (g=2, exact 256 ConvRot) prevents 8GB activation OOM
-        eff_hc = max(eff_hc, min(28, int(heads)))
-        eff_tc = min(eff_tc, 8192)
-    else:
-        # e.g. 10s 1984x1120 (S ≈ 163k) or 15s 768p: hc=14 (g=4, exact 512 ConvRot)
-        eff_hc = max(eff_hc, min(14, int(heads)))
-        eff_tc = min(eff_tc, 8192)
+    """Backwards-compatible wrapper returning `(eff_hc, eff_tc)` from the analytical VRAM solver."""
+    _, eff_hc, eff_tc, _, _, _ = _resolve_vram_plan(
+        head_chunks=head_chunks, token_chunk=token_chunk, out_proj_mode=out_proj_mode,
+        seq_len=seq_len, hidden=hidden, heads=heads, head_dim=head_dim, ffn=ffn,
+        device=device, use_sol=use_sol, sol_token_aug=sol_token_aug,
+        dtype_bytes=dtype_bytes, lora_rank_sum=lora_rank_sum,
+    )
     return eff_hc, eff_tc
 
 
@@ -2094,18 +2242,26 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int, out_proj_mode
         n_groups = head_chunks
         if isinstance(transformer_options, dict) and transformer_options.get("minimax_head_chunks"):
             n_groups = max(n_groups, int(transformer_options["minimax_head_chunks"]))
-        n_groups, eff_token_chunk = _resolve_safe_chunks(
-            n_groups, token_chunk, out_proj_mode, s, heads, device
-        )
         sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
+        qkv_loras_sa = _get_linear_loras(self.qkv_proj, transformer_options)
+        out_loras_sa = _get_linear_loras(self.out_proj, transformer_options)
+        lora_r_sa = sum(int(a.shape[0]) for _, a, _ in qkv_loras_sa) + sum(int(a.shape[0]) for _, a, _ in out_loras_sa)
+        n_groups, eff_token_chunk = _resolve_safe_chunks(
+            n_groups, token_chunk, out_proj_mode, s, heads, device,
+            hidden=int(x.shape[1]), head_dim=head_dim,
+            use_sol=(sol_ctx is not None),
+            sol_token_aug=int(sol_ctx["token_aug"]) if sol_ctx is not None else 64,
+            dtype_bytes=x.element_size(),
+            lora_rank_sum=lora_r_sa,
+        )
         block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
         attn_temp_scale = float(transformer_options.get("_chunked_sage_attn_temp", 1.0)) if isinstance(transformer_options, dict) else 1.0
 
         qw = mm.cast_to(self.q_norm.weight, device=device) if rope_freqs is not None else None
         kw = mm.cast_to(self.k_norm.weight, device=device) if rope_freqs is not None else None
         rot_dim = rope_freqs.shape[-3] * 2 if rope_freqs is not None else 0
-        qkv_packed = _prepare_lora_packed(_get_linear_loras(self.qkv_proj, transformer_options), device, dtype)
-        out_packed = _prepare_lora_packed(_get_linear_loras(self.out_proj, transformer_options), device, dtype)
+        qkv_packed = _prepare_lora_packed(qkv_loras_sa, device, dtype)
+        out_packed = _prepare_lora_packed(out_loras_sa, device, dtype)
 
         with _cast_linear_once(self.qkv_proj, device, dtype) as (w_qkv, b_qkv):
             if _is_int8_tensorwise(w_qkv) and x.is_cuda and _ck_cuda is not None:
@@ -2260,24 +2416,41 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
             )
             return x
 
-        n_groups = head_chunks
+        req_groups = head_chunks
         if isinstance(transformer_options, dict) and transformer_options.get("minimax_head_chunks"):
-            n_groups = max(n_groups, int(transformer_options["minimax_head_chunks"]))
-        n_groups, eff_token_chunk = _resolve_safe_chunks(
-            n_groups, token_chunk, out_proj_mode, s, self.attn.heads, device
-        )
-        eff_mode = _resolve_out_proj_mode(out_proj_mode, s, device)
+            req_groups = max(req_groups, int(transformer_options["minimax_head_chunks"]))
         sol_ctx = transformer_options.get("_chunked_sage_sol_ctx") if isinstance(transformer_options, dict) else None
         block_idx = transformer_options.get("block_index") if isinstance(transformer_options, dict) else None
-        if block_idx == 0 and (n_groups != head_chunks or eff_token_chunk != token_chunk):
-            print(
-                f"[SeamKit] 8GB 超长序列显存护栏 (S={s:,}): 自动调整 head_chunks {head_chunks}→{n_groups}, "
-                f"token_chunk {token_chunk}→{eff_token_chunk} 防 OOM",
-                flush=True,
-            )
         attn_temp_scale = float(transformer_options.get("_chunked_sage_attn_temp", 1.0)) if isinstance(transformer_options, dict) else 1.0
         qkv_loras = _get_linear_loras(self.attn.qkv_proj, transformer_options)
         out_loras = _get_linear_loras(self.attn.out_proj, transformer_options)
+        lora_rank_sum = sum(int(a.shape[0]) for _, a, _ in qkv_loras) + sum(int(a.shape[0]) for _, a, _ in out_loras)
+        ffn_dim = int(self.mlp.fc1.out_features) // 2
+        eff_mode, n_groups, eff_token_chunk, pred_attn_gib, pred_mlp_gib, budget_gib = _resolve_vram_plan(
+            head_chunks=req_groups,
+            token_chunk=token_chunk,
+            out_proj_mode=out_proj_mode,
+            seq_len=s,
+            hidden=int(x.shape[1]),
+            heads=int(self.attn.heads),
+            head_dim=int(self.attn.head_dim),
+            ffn=ffn_dim,
+            device=device,
+            use_sol=(sol_ctx is not None),
+            sol_token_aug=int(sol_ctx["token_aug"]) if sol_ctx is not None else 64,
+            dtype_bytes=x.element_size(),
+            lora_rank_sum=lora_rank_sum,
+        )
+        if block_idx == 0 and (n_groups != req_groups or eff_token_chunk != token_chunk):
+            g_show = max(1, (int(self.attn.heads) + n_groups - 1) // n_groups)
+            hc_label = f"auto→{n_groups}" if req_groups <= 0 else f"{req_groups}→{n_groups}"
+            tc_label = f"{token_chunk}→{eff_token_chunk}" if eff_token_chunk != token_chunk else f"{eff_token_chunk}"
+            print(
+                f"[SeamKit] 显存公式自适应 (预算 {budget_gib:.2f} GiB, S={s:,}, LoRA_R={lora_rank_sum}): "
+                f"hc={hc_label} (g={g_show}), tc={tc_label}, {eff_mode} | "
+                f"预计峰值 Attn {pred_attn_gib:.2f} / MLP {pred_mlp_gib:.2f} GiB",
+                flush=True,
+            )
 
         has_qkv_extra_scales = (
             getattr(self.attn.qkv_proj, "pre_quant_scale", None) is not None
@@ -2441,11 +2614,14 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                 io.Model.Input("model"),
                 io.Int.Input(
                     "head_chunks",
-                    default=7,
-                    min=1,
+                    default=0,
+                    min=0,
                     max=56,
                     step=1,
-                    tooltip="注意力头分组数（56 头默认推荐 7=每组8头，显存带宽折半且吃满 SM89；极限超长序列可改 14=每组4头；自动按 2 头=256 ConvRot 块对齐）。",
+                    tooltip=(
+                        "注意力头分组数（0 = 按显存公式自适应当前显卡 6/8/10/12/16/24GB 与序列长度自动选最快安全档；"
+                        "手动指定如 4/7 时，auto 模式下若超显存预算会自动升至最小安全均匀约数 1/2/4/7/14/28，按 2 头=256 ConvRot 对齐）。"
+                    ),
                 ),
                 io.Combo.Input(
                     "out_proj_mode",
