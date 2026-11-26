@@ -33,6 +33,7 @@ from .nodes import (
 from .nodes_firstpass import MiniMaxH3FirstPassSampler
 from .nodes_latent_cache import MiniMaxH3AVLatentLoad, MiniMaxH3AVLatentSave
 from .sol_vae_decode import MiniMaxH3SafeAVDecode
+from .vsr_stream_save import MiniMaxH3StreamingVSRSave
 from .train.teacher_capture import (
     MiniMaxH3ConditioningDump,
     MiniMaxH3LatentDownsample2x,
@@ -61,6 +62,7 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3AVLatentSave,
             MiniMaxH3AVLatentLoad,
             MiniMaxH3SafeAVDecode,
+            MiniMaxH3StreamingVSRSave,
             MiniMaxH3TeacherProbe,
             MiniMaxH3ConditioningDump,
             MiniMaxH3TeacherLatentDump,
