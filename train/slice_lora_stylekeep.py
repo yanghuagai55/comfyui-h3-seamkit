@@ -14,6 +14,9 @@ Presets
 - `stylekeep`:
     * attn.qkv_proj / attn.out_proj (all 50 blocks): 1.00x
     * mlp.fc1 / mlp.fc2: blocks 0..4 = 0.25x, blocks 5..31 = 0.45x, blocks 32..49 = 0.15x
+- `clean`:
+    * attn.qkv_proj / attn.out_proj (all 50 blocks): 1.00x
+    * mlp.fc1 / mlp.fc2: blocks 0..35 = 0.80x, blocks 36..49 = 0.30x (realistic/cinematic anti-boiling)
 - `attn_only`:
     * attn.qkv_proj / attn.out_proj (all 50 blocks): 1.00x
     * mlp.fc1 / mlp.fc2: omitted cleanly (halves LoRA size & skips 100 MLP BF16 GEMMs!)
@@ -47,6 +50,8 @@ def _layer_scale(block_idx: int, mod: str, preset: str, attn_scale: float, mlp_e
         return attn_scale
     if preset == "attn_only":
         return 0.0
+    if preset == "clean":
+        return 0.80 if block_idx <= 35 else 0.30
     if block_idx <= 4:
         return mlp_early
     if block_idx <= 31:
@@ -139,11 +144,14 @@ def slice_lora(
 
     meta["seamkit_slice_preset"] = preset
     meta["seamkit_slice_source"] = os.path.basename(input_path)
-    meta["seamkit_slice_scales"] = (
-        f"attn={attn_scale},mlp_0_4={0.0 if preset == 'attn_only' else mlp_early},"
-        f"mlp_5_31={0.0 if preset == 'attn_only' else mlp_mid},"
-        f"mlp_32_49={0.0 if preset == 'attn_only' else mlp_late}"
-    )
+    if preset == "clean":
+        meta["seamkit_slice_scales"] = f"attn={attn_scale},mlp_0_35=0.80,mlp_36_49=0.30"
+    elif preset == "attn_only":
+        meta["seamkit_slice_scales"] = f"attn={attn_scale},mlp_all=0.0"
+    else:
+        meta["seamkit_slice_scales"] = (
+            f"attn={attn_scale},mlp_0_4={mlp_early},mlp_5_31={mlp_mid},mlp_32_49={mlp_late}"
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     save_file(out_tensors, output_path, metadata=meta)
@@ -170,7 +178,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Offline layer-wise stylekeep LoRA slicer for MiniMax-H3.")
     ap.add_argument("--input", required=True, help="Source .safetensors LoRA path")
     ap.add_argument("--output", required=True, help="Destination .safetensors LoRA path")
-    ap.add_argument("--preset", choices=["stylekeep", "attn_only", "custom"], default="stylekeep")
+    ap.add_argument("--preset", choices=["stylekeep", "clean", "attn_only", "custom"], default="stylekeep")
     ap.add_argument("--attn-scale", type=float, default=1.0)
     ap.add_argument("--mlp-early", type=float, default=0.25, help="MLP scale for blocks 0..4")
     ap.add_argument("--mlp-mid", type=float, default=0.45, help="MLP scale for blocks 5..31")
