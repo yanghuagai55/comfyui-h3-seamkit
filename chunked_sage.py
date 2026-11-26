@@ -154,8 +154,13 @@ _sol_attn_available = bool(
 # ---------------------------------------------------------------------------
 
 _SOL_BLOCK_SIZE = 64
-_MORTON_CPU_CACHE: dict[tuple[tuple[int, int, int], str, int], tuple[torch.Tensor, torch.Tensor]] = {}
-_MORTON_DEV_CACHE: dict[tuple[tuple[int, int, int], str, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+_MORTON_SHIFT_OFFSETS: tuple[tuple[int, int], ...] = ((0, 0), (4, 4), (2, 6), (6, 2))
+_MORTON_CPU_CACHE: dict[tuple[tuple[int, int, int], str, int, tuple[int, int]], tuple[torch.Tensor, torch.Tensor]] = {}
+_MORTON_DEV_CACHE: dict[tuple[tuple[int, int, int], str, int, tuple[int, int], str], tuple[torch.Tensor, torch.Tensor]] = {}
+_MORTON_SHIFT_DEV_CACHE: dict[
+    tuple[tuple[int, int, int], str, int, str],
+    tuple[tuple[torch.Tensor | None, ...], tuple[torch.Tensor | None, ...]],
+] = {}
 
 
 def _part1by2(value: torch.Tensor) -> torch.Tensor:
@@ -173,10 +178,12 @@ def _morton_perm_aligned(
     start: int,
     device: torch.device,
     curve: str = "2d_frame",
+    offset: tuple[int, int] = (0, 0),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return `(perm_dev, inv_dev, perm_cpu)` aligned to Sol-Attn's 64-token block grid."""
     pad = (-int(start)) % _SOL_BLOCK_SIZE
-    cpu_key = (grid, curve, pad)
+    off = (int(offset[0]), int(offset[1]))
+    cpu_key = (grid, curve, pad, off)
     cpu_hit = _MORTON_CPU_CACHE.get(cpu_key)
     if cpu_hit is None:
         frames, height, width = grid
@@ -186,10 +193,11 @@ def _morton_perm_aligned(
         rem = linear - z * area
         y = rem // width
         x = rem - y * width
+        ox, oy = off
         if curve == "2d_frame":
-            code = (z << 42) | _part1by2(x) | (_part1by2(y) << 1)
+            code = (z << 42) | _part1by2(x + ox) | (_part1by2(y + oy) << 1)
         else:
-            code = _part1by2(x) | (_part1by2(y) << 1) | (_part1by2(z) << 2)
+            code = _part1by2(x + ox) | (_part1by2(y + oy) << 1) | (_part1by2(z) << 2)
         perm = linear[torch.argsort(code)]
         if pad:
             perm = torch.roll(perm, pad)
@@ -197,7 +205,7 @@ def _morton_perm_aligned(
         cpu_hit = (perm, inv)
         _MORTON_CPU_CACHE[cpu_key] = cpu_hit
 
-    dev_key = (grid, curve, pad, str(device))
+    dev_key = (grid, curve, pad, off, str(device))
     dev_hit = _MORTON_DEV_CACHE.get(dev_key)
     if dev_hit is None:
         # Keep device cache bounded to avoid lingering memory across shape changes
@@ -206,6 +214,80 @@ def _morton_perm_aligned(
         dev_hit = (cpu_hit[0].to(device), cpu_hit[1].to(device))
         _MORTON_DEV_CACHE[dev_key] = dev_hit
     return dev_hit[0], dev_hit[1], cpu_hit[0]
+
+
+def _morton_shift_rel_perms(
+    grid: tuple[int, int, int],
+    start: int,
+    device: torch.device,
+    curve: str = "2d_frame",
+) -> tuple[tuple[torch.Tensor | None, ...], tuple[torch.Tensor | None, ...]]:
+    """Precompute 4-phase Swin-style relative permutations `(rel_fwd, rel_inv)` on `device`.
+
+    Rotates Morton `(ox, oy)` across `(0,0), (4,4), (2,6), (6,2)` by `block_idx & 3`, ensuring
+    every 256/512/768/1024 px tile seam sits inside the interior of an 8x8 Morton block in 3 of 4
+    consecutive DiT layers (eliminates 50-layer stacked horizontal/vertical seams at y=512/1024).
+    """
+    pad = (-int(start)) % _SOL_BLOCK_SIZE
+    key = (grid, curve, pad, str(device))
+    hit = _MORTON_SHIFT_DEV_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    # Base phase-0 perm/inv on CPU
+    _morton_perm_aligned(grid, start, device, curve=curve, offset=(0, 0))
+    perm0, inv0 = _MORTON_CPU_CACHE[(grid, curve, pad, (0, 0))]
+
+    fwd_list: list[torch.Tensor | None] = [None]
+    inv_list: list[torch.Tensor | None] = [None]
+    for off in _MORTON_SHIFT_OFFSETS[1:]:
+        cpu_key = (grid, curve, pad, off)
+        pair = _MORTON_CPU_CACHE.get(cpu_key)
+        if pair is None:
+            frames, height, width = grid
+            linear = torch.arange(frames * height * width, dtype=torch.int64)
+            area = height * width
+            z = linear // area
+            rem = linear - z * area
+            y = rem // width
+            x = rem - y * width
+            ox, oy = off
+            if curve == "2d_frame":
+                code = (z << 42) | _part1by2(x + ox) | (_part1by2(y + oy) << 1)
+            else:
+                code = _part1by2(x + ox) | (_part1by2(y + oy) << 1) | (_part1by2(z) << 2)
+            perm_p = linear[torch.argsort(code)]
+            if pad:
+                perm_p = torch.roll(perm_p, pad)
+            inv_p = torch.argsort(perm_p)
+            pair = (perm_p, inv_p)
+            _MORTON_CPU_CACHE[cpu_key] = pair
+        perm_p, inv_p = pair
+        # X_p[j] = X_0[inv0[perm_p[j]]], Y_0[i] = Y_p[inv_p[perm0[i]]]
+        fwd_list.append(inv0[perm_p].to(device))
+        inv_list.append(inv_p[perm0].to(device))
+
+    if len(_MORTON_SHIFT_DEV_CACHE) >= 4:
+        _MORTON_SHIFT_DEV_CACHE.clear()
+    hit = (tuple(fwd_list), tuple(inv_list))
+    _MORTON_SHIFT_DEV_CACHE[key] = hit
+    return hit
+
+
+def _permute_nhd_span_inplace(
+    t: torch.Tensor,
+    start: int,
+    stop: int,
+    idx: torch.Tensor,
+    head_chunk: int = 2,
+) -> None:
+    """In-place token permutation of `[1, S, g, D]` over `start:stop` in small head chunks (0 peak VRAM impact)."""
+    view = t[0, start:stop]
+    g = view.shape[1]
+    step = max(1, int(head_chunk))
+    for h0 in range(0, g, step):
+        h1 = min(h0 + step, g)
+        view[:, h0:h1, :] = view[:, h0:h1, :].index_select(0, idx)
 
 
 def _permute_span_inplace(
@@ -361,6 +443,20 @@ def _attend_group(
         and _sol_attn_available
     ):
         v_g = make_v_fn()
+        shift_inv = None
+        shift_va = shift_vb = 0
+        if block_idx is not None:
+            rel_fwd_tuple = sol_ctx.get("shift_rel_fwd")
+            if rel_fwd_tuple is not None:
+                phase = int(block_idx) & 3
+                rel_fwd = rel_fwd_tuple[phase]
+                if rel_fwd is not None:
+                    shift_va = int(sol_ctx["shift_va"])
+                    shift_vb = int(sol_ctx["shift_vb"])
+                    shift_inv = sol_ctx["shift_rel_inv"][phase]
+                    _permute_nhd_span_inplace(q_g, shift_va, shift_vb, rel_fwd)
+                    _permute_nhd_span_inplace(k_g, shift_va, shift_vb, rel_fwd)
+                    _permute_nhd_span_inplace(v_g, shift_va, shift_vb, rel_fwd)
         sol_scale = (q_g.shape[-1] ** -0.5) * float(attn_temp_scale) if attn_temp_scale != 1.0 else None
         o_g = _ck.sol_attn(
             q_g,
@@ -375,6 +471,8 @@ def _attend_group(
             token_aug=sol_ctx["token_aug"],
         )
         del q_g, k_g, v_g
+        if shift_inv is not None:
+            _permute_nhd_span_inplace(o_g, shift_va, shift_vb, shift_inv)
         return o_g
     return _staged_sageattn_nhd(q_g, k_g, make_v_fn, dtype, attn_temp_scale=attn_temp_scale)
 
@@ -758,6 +856,11 @@ def _make_chunked_run_blocks(
             if morton_info is not None:
                 va, vb, grid = morton_info
                 perm_dev, inv_dev, perm_cpu = _morton_perm_aligned(grid, va, h.device, curve="2d_frame")
+                rel_fwd_dev, rel_inv_dev = _morton_shift_rel_perms(grid, va, h.device, curve="2d_frame")
+                sol_ctx["shift_va"] = va
+                sol_ctx["shift_vb"] = vb
+                sol_ctx["shift_rel_fwd"] = rel_fwd_dev
+                sol_ctx["shift_rel_inv"] = rel_inv_dev
                 _permute_span_inplace(h, va, vb, perm_dev)
                 pos_perm = layout.position_ids.clone()
                 pos_perm[va:vb] = pos_perm[va:vb].index_select(0, perm_cpu.to(pos_perm.device))
