@@ -9,7 +9,7 @@
 而 `norm1(x)` 已经把 x 存进了反向图。于是第一次 backward 必抛：
     RuntimeError: one of the variables needed for gradient computation has been
     modified by an inplace operation: [torch.cuda.FloatTensor [207, 256]] ...
-（本机 tiny 模型已复现，见 docs/ROUTE3_READINESS.md §2-E）
+（本机 tiny 模型已复现）
 
 另外 `rms_rope_split_half_` 在非训练模式下是原地算子，会抛
     "in-place RoPE operations are inference-only and do not support autograd"
@@ -43,7 +43,7 @@ def rms_rope_split_half_ref(q, k, freqs_cis, q_scale, k_scale=None,
     为什么必须自己写：comfy_kitchen 的 custom op 没有注册 autograd，backward 会抛
         RuntimeError: Trying to backward through comfy_kitchen.rms_rope_split_half.default
         but no autograd formula was registered.
-    （本机已复现，见 docs/ROUTE3_READINESS.md）
+    （本机已复现）
 
     语义严格对齐 eager 参考实现 `_rms_rope1(split_half=True, rot_dim=rot_dim)`：
         x = rms_norm(x, weight=scale, eps)

@@ -11,3 +11,10 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+
+# 交接与一次性任务书（本地留档，不进仓库）
+docs/SESSION_LOG_*.md
+docs/ROUTE3_A100_TASK_SPEC.md
+docs/ROUTE3_READINESS.md
+*HANDOVER*
+*交接*
