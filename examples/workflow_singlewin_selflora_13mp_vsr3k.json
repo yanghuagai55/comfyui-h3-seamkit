@@ -20,13 +20,13 @@
       "mode": 0,
       "inputs": [],
       "outputs": [],
-      "title": "★ 自训版原生 1080p 直出 · 开箱即用说明",
+      "title": "★ 1.3MP + RelayVSR x2 真 3K（v2.8 主力工作流）",
       "properties": {},
       "widgets_values": [
-        "# H3 单窗 · 自训保锐 + 去油胶片 + 1.3MP RelayVSR x2 真 3K 工作流\n\n> **日常主力甜点王**：二采跑在 **`1.30 MP (1568×864)`**（比原生 1080p 少 `35%` token，4060 8GB 全程约 **`~10–11 分钟`**），再经一步扩散 **`RelayVSR x2 (detail=0.50)`** 直出 **`3136×1728` 真 3K 成品**！\n\n## 核心配置（已全锁好，直接运行）\n- **三刀提速全开**：一采 `#16`（`hc=7, tc=16384, max_sigma=0.90`）+ 二采 `#18`（`hc=4, tc=16384, tau=1.40, min_sigma=0.0, rope=1.10, temp=1.02`），双路 `bf16_lora=200/200`。\n- **去油保锐双旋钮**：`#15 真实电影质感V0.1 @ 0.42` 压制官方高光漆面 + `#48 自训 LoRA (v2_step200 @ 0.55)` 注入稀疏高锐细节（今晚 `v2_final` 落地后换文件名可拉高到 `0.65~0.80` 并把 `#15` 降到 `0.25~0.35`）。\n- **一步 3K 超分 (`#40–#47`)**：`relayvsr_x2_lightx2v_int8_convrot` + `Flash VAE x2 (detail=0.50)`，10s 仅需 **`~1分45秒`**，人脸与远景微纹理远超直接拉伸 1080p。\n- **成品路径**：`D:\\共享\\MiniMaxH3\\H3_13MP_VSR3K_xxxxx-audio.mp4`。\n\n## 常用微调\n1. **更快压进 9 分钟**：把 `#33` 改为 2 步 `0.78, 0.30, 0.0`（或 `#20` 改 `1.00 MP` 出 `2752×1536` 真 2.7K）。\n2. **细节/光晕平衡**：调 `#45 VSRDecode detail`（`0.40` 最自然胶片 / **`0.50` 推荐** / `0.60` 极锐）。\n3. **同时留超分前原片**：选中 `#38` 按 `Ctrl+B` 开启即可。"
+        "# H3 单窗 · 自训保锐 + 1.3MP RelayVSR x2 真 3K（v2.8）\n\n> **日常主力甜点王**：二采跑在 **`1.30 MP (1568×864)`**（比原生 1080p 少 `35%` token），再经一步扩散 **`RelayVSR x2 (detail=0.50)`** 与流式解码直出 **`3136×1728` 真 3K 成品**（32GB 内存零 OOM）！\n\n## v2.8 核心配置（已锁好，拖入重选底模后直接运行）\n- **全显卡自适应 + 双保险消缝**：一采 `#16` 与二采 `#18` 均设 `head_chunks=0`（WDDM 防溢出自动求解）、`token_chunk_size=16384`、四相 Shifted-Morton + `sol_dense_blocks=\"48-49\"` 零接缝，双路 `bf16_lora=200/200`。\n- **二次元 vs 真人速切**：\n  - **二次元 / `dasiwa`（默认）**：`#48` 用 `minimax_h3_sol_sharp_v2_final_stylekeep.safetensors @ 0.70`，`#15` 电影质感保持 Bypass 关闭；\n  - **真人 / 写实抗油**：把 `#48` 换成 `minimax_h3_sol_sharp_v2_final_clean.safetensors @ 0.65`，并 `Ctrl+B` 开启 `#15` 电影质感（`@ 0.35~0.42`）。\n- **32GB 内存安全 3K 落盘 (`#45`)**：使用 `MiniMaxH3StreamingVSRSave` 逐帧管道直通 `ffmpeg`，彻底省去原版 `VSRDecode` `14.7–21.9 GiB` 连续 FP32 内存分配。\n\n## 输出路径\n- 成片保存至 `ComfyUI/output/MiniMaxH3/H3_13MP_VSR3K_xxxxx-audio.mp4`。\n- 自训 LoRA 下载：`https://github.com/yanghuagai55/comfyui-h3-seamkit/releases/tag/v2.8`"
       ],
       "widgets_values_named": {
-        "text": "# H3 单窗 · 自训保锐 + 去油胶片 + 1.3MP RelayVSR x2 真 3K 工作流\n\n> **日常主力甜点王**：二采跑在 **`1.30 MP (1568×864)`**（比原生 1080p 少 `35%` token，4060 8GB 全程约 **`~10–11 分钟`**），再经一步扩散 **`RelayVSR x2 (detail=0.50)`** 直出 **`3136×1728` 真 3K 成品**！\n\n## 核心配置（已全锁好，直接运行）\n- **三刀提速全开**：一采 `#16`（`hc=7, tc=16384, max_sigma=0.90`）+ 二采 `#18`（`hc=4, tc=16384, tau=1.40, min_sigma=0.0, rope=1.10, temp=1.02`），双路 `bf16_lora=200/200`。\n- **去油保锐双旋钮**：`#15 真实电影质感V0.1 @ 0.42` 压制官方高光漆面 + `#48 自训 LoRA (v2_step200 @ 0.55)` 注入稀疏高锐细节（今晚 `v2_final` 落地后换文件名可拉高到 `0.65~0.80` 并把 `#15` 降到 `0.25~0.35`）。\n- **一步 3K 超分 (`#40–#47`)**：`relayvsr_x2_lightx2v_int8_convrot` + `Flash VAE x2 (detail=0.50)`，10s 仅需 **`~1分45秒`**，人脸与远景微纹理远超直接拉伸 1080p。\n- **成品路径**：`D:\\共享\\MiniMaxH3\\H3_13MP_VSR3K_xxxxx-audio.mp4`。\n\n## 常用微调\n1. **更快压进 9 分钟**：把 `#33` 改为 2 步 `0.78, 0.30, 0.0`（或 `#20` 改 `1.00 MP` 出 `2752×1536` 真 2.7K）。\n2. **细节/光晕平衡**：调 `#45 VSRDecode detail`（`0.40` 最自然胶片 / **`0.50` 推荐** / `0.60` 极锐）。\n3. **同时留超分前原片**：选中 `#38` 按 `Ctrl+B` 开启即可。"
+        "text": "# H3 单窗 · 自训保锐 + 1.3MP RelayVSR x2 真 3K（v2.8）\n\n> **日常主力甜点王**：二采跑在 **`1.30 MP (1568×864)`**（比原生 1080p 少 `35%` token），再经一步扩散 **`RelayVSR x2 (detail=0.50)`** 与流式解码直出 **`3136×1728` 真 3K 成品**（32GB 内存零 OOM）！\n\n## v2.8 核心配置（已锁好，拖入重选底模后直接运行）\n- **全显卡自适应 + 双保险消缝**：一采 `#16` 与二采 `#18` 均设 `head_chunks=0`（WDDM 防溢出自动求解）、`token_chunk_size=16384`、四相 Shifted-Morton + `sol_dense_blocks=\"48-49\"` 零接缝，双路 `bf16_lora=200/200`。\n- **二次元 vs 真人速切**：\n  - **二次元 / `dasiwa`（默认）**：`#48` 用 `minimax_h3_sol_sharp_v2_final_stylekeep.safetensors @ 0.70`，`#15` 电影质感保持 Bypass 关闭；\n  - **真人 / 写实抗油**：把 `#48` 换成 `minimax_h3_sol_sharp_v2_final_clean.safetensors @ 0.65`，并 `Ctrl+B` 开启 `#15` 电影质感（`@ 0.35~0.42`）。\n- **32GB 内存安全 3K 落盘 (`#45`)**：使用 `MiniMaxH3StreamingVSRSave` 逐帧管道直通 `ffmpeg`，彻底省去原版 `VSRDecode` `14.7–21.9 GiB` 连续 FP32 内存分配。\n\n## 输出路径\n- 成片保存至 `ComfyUI/output/MiniMaxH3/H3_13MP_VSR3K_xxxxx-audio.mp4`。\n- 自训 LoRA 下载：`https://github.com/yanghuagai55/comfyui-h3-seamkit/releases/tag/v2.8`"
       },
       "color": "#1b263b",
       "bgcolor": "#0d1b2a"
@@ -707,7 +707,7 @@
       ],
       "flags": {},
       "order": 18,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "localized_name": "模型",
@@ -744,7 +744,7 @@
           ]
         }
       ],
-      "title": "★ [去油胶片·已启用] 真实电影质感V0.1 @ 0.42 (保留adaln压制漆光)",
+      "title": "★ [去油胶片·二次元默认Bypass/真人Ctrl+B开] 真实电影质感V0.1 @ 0.42 (保留adaln压制漆光)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -3537,11 +3537,11 @@
       },
       "widgets_values": [
         "minimax_h3_sol_sharp_v2_final_stylekeep.safetensors",
-        0.55
+        0.7
       ],
       "widgets_values_named": {
-        "lora_name": "minimax_h3_sol_sharp_v2_final.safetensors",
-        "strength_model": 0.55
+        "lora_name": "minimax_h3_sol_sharp_v2_final_stylekeep.safetensors",
+        "strength_model": 0.7
       },
       "color": "#1b4332",
       "bgcolor": "#2d6a4f"
@@ -3565,10 +3565,10 @@
       "title": "★ 快捷对照口诀",
       "properties": {},
       "widgets_values": [
-        "### 1.3MP + VSR 3K 速查口诀\n\n1. **控制台核对**：应打印两次 `bf16_lora=200/200`，二采 token 约 `~94k`（显存峰值 `~2 GiB`，0 OOM）。\n2. **32GB 内存护航**：已配 `#35 / #37 / #44 / #46` 四道 `cleanGpuUsed` 卸载墙，跑 `10s 3K` 时尽量关掉高占内存网页。\n3. **拍 `15s` 时**：把 `#18 head_chunks` 改为 `7`，`#36` 会自动 2 段 `Sol-VAE` 解码零 OOM。\n4. **纯原生无超分对比**：用同目录 `H3单窗-自训LoRA-原生1080p直出.json`。"
+        "### 1.3MP + VSR 3K 速查口诀（v2.8）\n\n1. **控制台核对**：应打印两次 `bf16_lora=200/200`，二采 token 约 `~96k`（0 OOM，零 `y=512` 接缝）。\n2. **32GB 内存护航**：已配 `MiniMaxH3StreamingVSRSave` + 显存清理墙；跑 `10s/15s 3K` 时建议关闭高占内存网页。\n3. **拍 `15s` 时**：只改 `#20 total_seconds = 15`，`head_chunks=0` 自动选档、`#36` 自动 2 段 `Sol-VAE` 解码零 OOM。\n4. **纯原生无超分对比**：用同目录 `workflow_singlewin_selflora_1080p.json`。"
       ],
       "widgets_values_named": {
-        "text": "### 1.3MP + VSR 3K 速查口诀\n\n1. **控制台核对**：应打印两次 `bf16_lora=200/200`，二采 token 约 `~94k`（显存峰值 `~2 GiB`，0 OOM）。\n2. **32GB 内存护航**：已配 `#35 / #37 / #44 / #46` 四道 `cleanGpuUsed` 卸载墙，跑 `10s 3K` 时尽量关掉高占内存网页。\n3. **拍 `15s` 时**：把 `#18 head_chunks` 改为 `7`，`#36` 会自动 2 段 `Sol-VAE` 解码零 OOM。\n4. **纯原生无超分对比**：用同目录 `H3单窗-自训LoRA-原生1080p直出.json`。"
+        "text": "### 1.3MP + VSR 3K 速查口诀（v2.8）\n\n1. **控制台核对**：应打印两次 `bf16_lora=200/200`，二采 token 约 `~96k`（0 OOM，零 `y=512` 接缝）。\n2. **32GB 内存护航**：已配 `MiniMaxH3StreamingVSRSave` + 显存清理墙；跑 `10s/15s 3K` 时建议关闭高占内存网页。\n3. **拍 `15s` 时**：只改 `#20 total_seconds = 15`，`head_chunks=0` 自动选档、`#36` 自动 2 段 `Sol-VAE` 解码零 OOM。\n4. **纯原生无超分对比**：用同目录 `workflow_singlewin_selflora_1080p.json`。"
       },
       "color": "#233",
       "bgcolor": "#263238"

@@ -1,4 +1,4 @@
-# comfyui-h3-seamkit 核心原理与数学公式详解（v2.7）
+# comfyui-h3-seamkit 核心原理与数学公式详解（v2.8）
 
 > **AI / 开发者 30 秒快速接手摘要**：
 > - **项目目标**：在 **RTX 4060 Laptop 8GB / 32GB RAM**（同时原生兼容 **A100 / H100 / 4090 / 5090 / RTX PRO 6000**）上，实现 MiniMax H3 **10s–15s 单窗零拼缝直出（最高原生 `1920×1088` 与真 `2.7K / 3K`）**，并在高锐度、去油腻胶片质感与音画同步的前提下把 8GB 推理速度压到硬件物理极限。
@@ -176,9 +176,10 @@ $$F(T_{\text{lat}}) = 17\left\lfloor\frac{T_{\text{lat}}}{5}\right\rfloor + \max
 
 [`MiniMaxH3SafeAVDecode`](../sol_vae_decode.py) 在潜空间总 token $> 630{,}000$（如 15s 1080p $873{,}120$ token）时，自动按 `5` 的整数倍分段解码并在中间保护块做 17 帧线性交叉融合，峰值显存稳控 `7,535 MiB`（0 OOM，过渡帧零接缝）。
 
-### 5.4 `1.30 MP / 1.00 MP` + 一步 `RelayVSR x2` 真 3K / 2.7K 路线
-- **`1.30 MP (1568×864)` + `RelayVSR x2 (detail=0.50)` → `3136×1728`（真 3K）**：比原生 1080p 少 `35%` DiT token，配三刀提速 + 自训 LoRA + 电影质感，全程仅 **`~10–11 分钟`**，`Face120 = 331.2`、`Halo = 21.7`；
-- **`1.00 MP (1376×768)` + `RelayVSR x2 (detail=0.60)` → `2752×1536`（真 2.7K）**：全程 **`~8–9 分钟`**，`@1080p LapVar = 179.2–258.8`。
+### 5.4 `1.30 MP / 1.00 MP` + 一步 `RelayVSR x2` 真 3K / 2.7K 路线与流式 32GB 安全落盘
+- **`1.30 MP (1568×864)` + `RelayVSR x2 (detail=0.50)` → `3136×1728`（真 3K）**：比原生 1080p 少 `35%` DiT token，配三刀提速 + 自训 LoRA，全程仅 **`~10–11 分钟`**，`Face120 = 331.2`、`Halo = 21.7`；
+- **`1.00 MP (1376×768)` + `RelayVSR x2 (detail=0.60)` → `2752×1536`（真 2.7K）**：全程 **`~8–9 分钟`**，`@1080p LapVar = 179.2–258.8`；
+- **流式零内存 OOM 解码（[`vsr_stream_save.py`](../vsr_stream_save.py)）**：原版 ComfyUI `VSRDecode` 会在 CPU 上一次性预分配整段 FP32 3K 张量（`10s @ 3136×1728` 需 **`14.72 GiB`**，`15s` 高达 **`21.93 GiB`**），在 32GB 宿主机上会直接撞破 Windows 提交上限闪退；`MiniMaxH3StreamingVSRSave` 按 `RelayFlash` 逐帧解码并即时转 `RGB24 uint8` 管道送入 `ffmpeg` 封装 H.264/AAC MP4，额外峰值内存压至 **`< 0.2 GiB`**，与原版数值逐位等价。
 
 ---
 
