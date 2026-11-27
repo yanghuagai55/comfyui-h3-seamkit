@@ -1,34 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""A100-80GB 快速视频 A/B 验收脚本（纯 PyTorch，无需启 ComfyUI / 无需 32B CLIP，约 2~3 分钟出片）。
-
-功能
-----
-1. 从本地路径或 HF 私有仓拉取待测 LoRA（默认 `lora_run/steps/step_000450.safetensors`）。
-2. 从 `/content/work/teacher_cache/` 选出 2 条代表样本（优先 1 条 `ref2va` + 1 条 `t2va`），
-   复用其真实 480p→2× 糊底 `z_up` 与满血真值 `z_native`：
-   - 在**真稀疏 flex_attention (`topk=0.20`)** + `rope_hf=1.32` + `attn_temp=1.08` 下，
-     跑与 4060 二采一致的 Pass-2 采样（默认 4 步 Euler `0.85 → 0.58 → 0.34 → 0.14 → 0.0`），
-     同种子严格对照：
-       (a) `z_up` 糊底（无二采）
-       (b) `base_no_lora`（官方 BF16 无 LoRA 稀疏二采）
-       (c) `lora_0.65`（挂自训 LoRA 0.65）
-       (d) `lora_1.00`（挂自训 LoRA 1.00）
-       (e) `teacher_gt`（24 步 CFG5 原生真值上限）
-3. 用 `minimax_h3_sol_vae_fp16.safetensors` 解码成 1080p 像素，计算客观指标
-   （`LapVar@1080` 锐度、`Halo99-1` 白边、`PSNR/SSIM vs Teacher`），并输出：
-   - 5 栏标字高清对比长图 `compare_<sample>.jpg`（含中央 1:1 裁切放大）
-   - 并排对比视频 `sidebyside_<sample>.mp4`（左 `base_no_lora` | 中 `lora_0.65` | 右 `lora_1.00`）
-   - 汇总指标 `eval_metrics.json`
-4. 可选 `--upload-hf` 自动上传到 HF 私有仓 `eval_<tag>/` 与 Google Drive 方便肉眼验收。
+"""快速视频 A/B 验收脚本（v3 升级：原生兼容 AMD MI300X ROCm `sdpa_mask`、异构 rank 64/32 与运动峰值 ROI 锐度评测）。
 
 用法：
   python3 train/eval_lora_a100.py \
       --base /content/local_models/diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors \
       --vae /content/local_models/vae/minimax_h3_sol_vae_fp16.safetensors \
       --cache /content/work/teacher_cache \
-      --lora-hf lora_run/steps/step_000450.safetensors \
-      --out /content/work/eval_step450 \
-      --hf-repo coolwindtang/minimax-h3-teacher-cache --upload-hf
+      --lora /content/work/lora_run_v3/steps/step_000220.safetensors \
+      --eval-frames 39 --out /content/work/eval_v3_s220 \
+      --hf-repo coolwindtang/minimax-h3-teacher-cache --hf-eval-prefix eval_v3_s220 --upload-hf
 """
 
 from __future__ import annotations
@@ -43,7 +23,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 TRAIN_DIR = Path(__file__).resolve().parent
 if str(TRAIN_DIR) not in sys.path:
@@ -52,20 +31,34 @@ if str(TRAIN_DIR) not in sys.path:
 import train_h3_lora as T  # noqa: E402
 
 
+def _inspect_lora_ranks(lora_path: Path) -> tuple[int, int]:
+    from safetensors.torch import load_file
+
+    sd = load_file(str(lora_path), device="cpu")
+    r_attn = 32
+    r_mlp = 32
+    for k, v in sd.items():
+        if k.endswith(".lora_down.weight"):
+            if ".attn." in k:
+                r_attn = int(v.shape[0])
+            elif ".mlp." in k:
+                r_mlp = int(v.shape[0])
+    return r_attn, r_mlp
+
+
 def _load_lora_into_dm(dm, lora_path: Path, scale_mult: float) -> int:
-    """将 ComfyUI safetensors LoRA 载入 dm._train_lora；scale_mult=0 等价关闭 LoRA。"""
     from safetensors.torch import load_file
 
     sd = load_file(str(lora_path), device="cpu")
     loaded = 0
     for i, blk in enumerate(dm.blocks):
         for name in T.LORA_TARGETS:
-            owner = blk.attn if name in ("qkv_proj", "out_proj") else blk.mlp
+            owner = blk.attn if name in T.ATTN_TARGETS else blk.mlp
             lin = getattr(owner, name)
             lora = getattr(lin, "_train_lora", None)
             if lora is None:
                 continue
-            prefix = f"diffusion_model.blocks.{i}.{'attn' if name in ('qkv_proj', 'out_proj') else 'mlp'}.{name}"
+            prefix = f"diffusion_model.blocks.{i}.{'attn' if name in T.ATTN_TARGETS else 'mlp'}.{name}"
             dk, uk, ak = f"{prefix}.lora_down.weight", f"{prefix}.lora_up.weight", f"{prefix}.alpha"
             if dk in sd and uk in sd:
                 lora.A.data.copy_(sd[dk].to(lora.A.device, lora.A.dtype))
@@ -83,7 +76,7 @@ def _load_lora_into_dm(dm, lora_path: Path, scale_mult: float) -> int:
 def _zero_lora(dm) -> None:
     for blk in dm.blocks:
         for name in T.LORA_TARGETS:
-            owner = blk.attn if name in ("qkv_proj", "out_proj") else blk.mlp
+            owner = blk.attn if name in T.ATTN_TARGETS else blk.mlp
             lora = getattr(getattr(owner, name), "_train_lora", None)
             if lora is not None:
                 lora.B.data.zero_()
@@ -92,7 +85,6 @@ def _zero_lora(dm) -> None:
 
 @torch.no_grad()
 def run_pass2_euler(dm, h3, rec: dict, group, sigmas: list[float], device: torch.device, seed: int) -> torch.Tensor:
-    """从 z_up 按给定 sigma 序列跑稀疏 flex_attention Pass-2 Euler 采样，返回去噪视频潜变量。"""
     data = torch.load(rec["path"], map_location="cpu", weights_only=False)
     z_up = data["z_up"].to(device=device, dtype=torch.float32)
     z_audio = data["audio"].to(device=device, dtype=torch.float32)
@@ -153,7 +145,6 @@ def run_pass2_euler(dm, h3, rec: dict, group, sigmas: list[float], device: torch
             s_nxt = float(sched[idx + 1])
             sa_cur = h3.time_shift_sigma(s_cur, 12.0, 3.0) if hasattr(h3, "time_shift_sigma") else s_cur
             sa_nxt = h3.time_shift_sigma(s_nxt, 12.0, 3.0) if (s_nxt > 0 and hasattr(h3, "time_shift_sigma")) else s_nxt
-            # 固定每次前向稀疏随机种子，确保不同 LoRA 强度间绝对公平对照
             torch.manual_seed(seed + idx)
             to = {"_h3_plan": group, "_h3_keep_kv": keep}
             out = dm([x_v.to(torch.bfloat16), x_a.to(torch.bfloat16)],
@@ -161,7 +152,6 @@ def run_pass2_euler(dm, h3, rec: dict, group, sigmas: list[float], device: torch
                      transformer_options=to, minimax_payload=payload)
             v_v = out[0].float()
             v_a = out[1].float()
-            # CONST flow Euler: x_next = x_cur + (s_nxt - s_cur) * v_pred
             x_v = x_v + (s_nxt - s_cur) * v_v
             x_a = x_a + (sa_nxt - sa_cur) * v_a
     finally:
@@ -171,7 +161,6 @@ def run_pass2_euler(dm, h3, rec: dict, group, sigmas: list[float], device: torch
 
 
 def _decode_video(comfy_sd, vae_path: str, z_vid: torch.Tensor) -> np.ndarray:
-    """用 Sol-H3-VAE 解码 [1, C, T, H, W] -> uint8 [F, H, W, 3]。"""
     import comfy.utils
 
     sd = comfy.utils.load_torch_file(str(vae_path))
@@ -187,8 +176,7 @@ def _decode_video(comfy_sd, vae_path: str, z_vid: torch.Tensor) -> np.ndarray:
 
 
 def _frame_metrics(vid: np.ndarray, ref: np.ndarray | None = None) -> dict:
-    """计算 LapVar@1080、Halo(99-1 百分位拉普拉斯极值)、以及相对 ref 的 PSNR。"""
-    # 取中段 3 帧求平均
+    """计算全局 LapVar@1080、峰值运动帧 Motion-ROI LapVar、Halo(99-1) 与 PSNR。"""
     n = vid.shape[0]
     idxs = sorted({min(n - 1, max(0, int(n * p))) for p in (0.25, 0.5, 0.75)})
     laps, halos, psnrs = [], [], []
@@ -205,7 +193,34 @@ def _frame_metrics(vid: np.ndarray, ref: np.ndarray | None = None) -> dict:
         if ref is not None and ref.shape == vid.shape:
             mse = float(np.mean((vid[i].astype(np.float32) - ref[i].astype(np.float32)) ** 2))
             psnrs.append(50.0 if mse < 1e-6 else float(10.0 * math.log10((255.0 ** 2) / mse)))
-    out = {"lap1080": round(float(np.mean(laps)), 2), "halo": round(float(np.mean(halos)), 2)}
+
+    # 额外计算运动峰值帧的前景 ROI 锐度（直击 00:07 大动作痛点）
+    src_for_mot = ref if (ref is not None and ref.shape == vid.shape) else vid
+    if src_for_mot.shape[0] >= 2:
+        f_diffs = np.mean(np.abs(src_for_mot[1:].astype(np.float32) - src_for_mot[:-1].astype(np.float32)), axis=(1, 2, 3))
+        bf = int(np.argmax(f_diffs))
+        pix_diff = np.mean(np.abs(src_for_mot[bf + 1].astype(np.float32) - src_for_mot[bf].astype(np.float32)), axis=-1)
+        fm = vid[bf + 1]
+    else:
+        bf = 0
+        pix_diff = np.ones(vid.shape[1:3], dtype=np.float32)
+        fm = vid[0]
+    gm = (0.299 * fm[:, :, 0] + 0.587 * fm[:, :, 1] + 0.114 * fm[:, :, 2]).astype(np.float32)
+    lap_m = -4.0 * gm[1:-1, 1:-1] + gm[:-2, 1:-1] + gm[2:, 1:-1] + gm[1:-1, :-2] + gm[1:-1, 2:]
+    lh, lw = lap_m.shape
+    bh, bw = max(1, lh // 32), max(1, lw // 32)
+    ch, cw = bh * 32, bw * 32
+    dc = pix_diff[1:1 + ch, 1:1 + cw].reshape(bh, 32, bw, 32).mean(axis=(1, 3))
+    lb = lap_m[:ch, :cw].reshape(bh, 32, bw, 32)
+    roi_px = lb.transpose(0, 2, 1, 3)[dc >= float(np.percentile(dc, 75.0))]
+    motion_lap = float(np.var(roi_px)) if roi_px.size > 0 else float(np.var(lap_m))
+
+    out = {
+        "lap1080": round(float(np.mean(laps)), 2),
+        "motion_roi_lap": round(motion_lap, 2),
+        "peak_frame": bf + 1 if n >= 2 else 0,
+        "halo": round(float(np.mean(halos)), 2),
+    }
     if psnrs:
         out["psnr_vs_gt"] = round(float(np.mean(psnrs)), 2)
     return out
@@ -214,12 +229,13 @@ def _frame_metrics(vid: np.ndarray, ref: np.ndarray | None = None) -> dict:
 def _save_strip(panels: list[tuple[str, np.ndarray, dict]], out_jpg: Path) -> None:
     from PIL import Image, ImageDraw
 
-    # 顶排：整图缩小至 640×360；底排：中心 1:1 640×360 原像素裁切
     w_tile, h_tile, bar = 640, 360, 42
     canvas = Image.new("RGB", (w_tile * len(panels), (h_tile + bar) * 2), (18, 18, 22))
     draw = ImageDraw.Draw(canvas)
+    peak_idx = panels[-1][2].get("peak_frame", panels[0][1].shape[0] // 2)
     for col, (label, vid, met) in enumerate(panels):
-        mid = vid[vid.shape[0] // 2]
+        f_idx = min(vid.shape[0] - 1, max(0, int(peak_idx)))
+        mid = vid[f_idx]
         im = Image.fromarray(mid)
         full = im.resize((w_tile, h_tile), Image.Resampling.LANCZOS)
         H, W = mid.shape[:2]
@@ -230,15 +246,15 @@ def _save_strip(panels: list[tuple[str, np.ndarray, dict]], out_jpg: Path) -> No
         x_off = col * w_tile
         canvas.paste(full, (x_off, bar))
         canvas.paste(crop, (x_off, bar * 2 + h_tile))
-        txt = f"{label} | Lap={met['lap1080']} Halo={met['halo']}"
+        txt = f"{label} | MotLap={met['motion_roi_lap']} Lap={met['lap1080']} Halo={met['halo']}"
         if "psnr_vs_gt" in met:
             txt += f" PSNR={met['psnr_vs_gt']}dB"
         draw.text((x_off + 10, 12), txt, fill=(245, 245, 245))
-        draw.text((x_off + 10, bar + h_tile + 12), f"{label} (1:1 Center Crop)", fill=(180, 230, 255))
+        draw.text((x_off + 10, bar + h_tile + 12), f"{label} (Peak-Motion Frame #{f_idx} 1:1 Crop)", fill=(180, 230, 255))
     canvas.save(out_jpg, quality=93)
 
 
-def _save_mp4(frames: np.ndarray, out_mp4: Path, fps: int = 16) -> None:
+def _save_mp4(frames: np.ndarray, out_mp4: Path, fps: int = 24) -> None:
     H, W = frames.shape[1], frames.shape[2]
     cmd = [
         "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
@@ -259,17 +275,19 @@ def main() -> int:
     ap.add_argument("--vae", default="/content/local_models/vae/minimax_h3_sol_vae_fp16.safetensors")
     ap.add_argument("--cache", default="/content/work/teacher_cache")
     ap.add_argument("--lora", default="", help="本地 LoRA .safetensors 路径")
-    ap.add_argument("--lora-hf", default="lora_run/steps/step_000450.safetensors", help="若 --lora 为空则从 HF 拉取")
+    ap.add_argument("--lora-hf", default="lora_run_v3/steps/step_000220.safetensors")
     ap.add_argument("--hf-repo", default="coolwindtang/minimax-h3-teacher-cache")
     ap.add_argument("--token-file", default="/content/work/hftoken.txt")
-    ap.add_argument("--out", default="/content/work/eval_step450")
-    ap.add_argument("--sigmas", default="0.85,0.58,0.34,0.14", help="Pass-2 Euler 采样噪声点（默认 4 步）")
-    ap.add_argument("--topk", type=float, default=0.20, help="稀疏保留率（模拟 4060 Sol-Attn）")
-    ap.add_argument("--samples", type=int, default=2, help="抽取对照样本数（优先 1 Ref2VA + 1 T2VA）")
-    ap.add_argument("--eval-frames", type=int, default=22, help="抽取的帧数桶（22 / 39；0=不限）")
-    ap.add_argument("--seed", type=int, default=20261125)
+    ap.add_argument("--out", default="/content/work/eval_v3")
+    ap.add_argument("--sigmas", default="0.85,0.54,0.20", help="对齐 4060 二采 ManualSigmas 三锚点")
+    ap.add_argument("--topk", type=float, default=0.22)
+    ap.add_argument("--block-size", type=int, default=64)
+    ap.add_argument("--attn-backend", choices=["auto", "flex", "sdpa_mask"], default="auto")
+    ap.add_argument("--samples", type=int, default=2)
+    ap.add_argument("--eval-frames", type=int, default=39, help="抽取的帧数桶（22 / 39 / 73；0=不限）")
+    ap.add_argument("--seed", type=int, default=20261127)
     ap.add_argument("--upload-hf", action="store_true")
-    ap.add_argument("--hf-eval-prefix", default="eval_step450")
+    ap.add_argument("--hf-eval-prefix", default="eval_v3")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -287,17 +305,13 @@ def main() -> int:
 
     mm, comfy_sd, h3 = T.bootstrap(args.comfy)
     dm = T.load_dm(comfy_sd, args.base, device)
-    # 自动读取 LoRA rank
-    from safetensors.torch import load_file
-
-    sd_head = load_file(str(lora_path), device="cpu")
-    first_down = next(v for k, v in sd_head.items() if k.endswith(".lora_down.weight"))
-    rank = int(first_down.shape[0])
-    del sd_head
-    T.attach_lora(dm, rank=rank)
+    r_attn, r_mlp = _inspect_lora_ranks(lora_path)
+    T.attach_lora(dm, rank=r_mlp, rank_attn=r_attn, rank_mlp=r_mlp)
     T.patch_attention(dm, {"attn_temp": 1.08})
+    eff_backend = T.resolve_attn_backend(args.attn_backend)
     cfg = {
         "rope_hf": 1.32, "attn_temp": 1.08, "sparse": True,
+        "attn_backend": eff_backend,
         "topk": args.topk, "topk_max": args.topk, "ckpt": False, "grad_clamp": 0.0,
         "mask_jitter": 0.0,
     }
@@ -306,24 +320,37 @@ def main() -> int:
     groups = T.scan_cache(Path(args.cache))
     if not groups:
         raise SystemExit("teacher_cache 为空，请先拉取云端分片")
-    plan_groups = {k: T._build_group(h3, k, v, 128, 2) for k, v in groups.items()}
+    plan_groups = {k: T._build_group(h3, k, v, args.block_size, 2) for k, v in groups.items()}
 
-    # 优先选 1 个 ref2va 样本 + 1 个 t2va 样本（均为 22f）
+    # 优先选高动态 sakuga/act 样本（1 Ref2VA + 1 T2VA）
     picked = []
-    for want_ref in (True, False):
-        for g in plan_groups.values():
-            for rec in g.records:
-                if args.eval_frames > 0 and int(rec["meta"].get("frames", 22)) != args.eval_frames:
-                    continue
-                is_ref = bool(rec.get("refs"))
-                if is_ref == want_ref and all(r["path"] != rec["path"] for r, _ in picked):
-                    picked.append((rec, g))
+    for want_action in (True, False):
+        for want_ref in (True, False):
+            for g in plan_groups.values():
+                for rec in g.records:
+                    if args.eval_frames > 0 and int(rec["meta"].get("frames", 22)) != args.eval_frames:
+                        continue
+                    if bool(rec.get("is_action")) != want_action:
+                        continue
+                    if bool(rec.get("refs")) == want_ref and all(r["path"] != rec["path"] for r, _ in picked):
+                        picked.append((rec, g))
+                        break
+                if len(picked) >= args.samples:
                     break
-            if len(picked) >= (1 if want_ref else args.samples):
+            if len(picked) >= args.samples:
                 break
+        if len(picked) >= args.samples:
+            break
     picked = picked[: args.samples]
+    if not picked:
+        raise SystemExit(f"未在 teacher_cache 中找到 frames={args.eval_frames} 的样本（可设 --eval-frames 0）")
+
     sigmas = [float(x) for x in args.sigmas.split(",") if x.strip()]
-    print(f"[eval] lora={lora_path.name} rank={rank} topk={args.topk} sigmas={sigmas} samples={[r['path'].stem for r, _ in picked]}", flush=True)
+    print(
+        f"[eval] lora={lora_path.name} rank_attn={r_attn} rank_mlp={r_mlp} backend={eff_backend} "
+        f"topk={args.topk} sigmas={sigmas} samples={[r['path'].stem for r, _ in picked]}",
+        flush=True,
+    )
 
     latents_cache = {}
     for rec, g in picked:
@@ -336,22 +363,28 @@ def main() -> int:
         latents_cache[sid]["base_no_lora"] = run_pass2_euler(dm, h3, rec, g, sigmas, device, args.seed)
         print(f"  [{sid}] base_no_lora done ({time.time() - t0:.1f}s)", flush=True)
 
-        for mult, tag in ((0.65, "lora_065"), (1.00, "lora_100")):
+        for mult, tag in ((0.70, "lora_070"), (1.00, "lora_100")):
             n_loaded = _load_lora_into_dm(dm, lora_path, mult)
             t0 = time.time()
             latents_cache[sid][tag] = run_pass2_euler(dm, h3, rec, g, sigmas, device, args.seed)
             print(f"  [{sid}] {tag} (layers={n_loaded}) done ({time.time() - t0:.1f}s)", flush=True)
 
-    # 卸载 40GB DiT 再用 Sol-VAE 解码，显存无压力
     del dm
     torch.cuda.empty_cache()
 
-    summary = {"lora": str(lora_path.name), "rank": rank, "sigmas": sigmas, "topk": args.topk, "samples": {}}
+    summary = {
+        "lora": str(lora_path.name),
+        "rank_attn": r_attn,
+        "rank_mlp": r_mlp,
+        "sigmas": sigmas,
+        "topk": args.topk,
+        "samples": {},
+    }
     produced_files: list[Path] = []
     for sid, lats in latents_cache.items():
         vids = {k: _decode_video(comfy_sd, args.vae, z) for k, z in lats.items()}
         gt = vids["teacher_gt"]
-        order = ["z_up", "base_no_lora", "lora_065", "lora_100", "teacher_gt"]
+        order = ["z_up", "base_no_lora", "lora_070", "lora_100", "teacher_gt"]
         mets = {k: _frame_metrics(vids[k], None if k == "teacher_gt" else gt) for k in order}
         summary["samples"][sid] = mets
         print(f"[metrics {sid}] " + json.dumps(mets, ensure_ascii=False), flush=True)
@@ -360,14 +393,13 @@ def main() -> int:
         _save_strip([(k, vids[k], mets[k]) for k in order], strip)
         produced_files.append(strip)
 
-        # 三联对比 MP4：base_no_lora | lora_065 | lora_100（缩到 640×360×3 = 1920×360 方便一眼看）
         from PIL import Image
 
         tri = []
         for fi in range(gt.shape[0]):
             row = [
                 np.asarray(Image.fromarray(vids[k][fi]).resize((640, 360), Image.Resampling.LANCZOS))
-                for k in ("base_no_lora", "lora_065", "lora_100")
+                for k in ("base_no_lora", "lora_070", "lora_100")
             ]
             tri.append(np.concatenate(row, axis=1))
         mp4 = out_dir / f"sidebyside_{sid}.mp4"

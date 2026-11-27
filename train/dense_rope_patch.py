@@ -120,8 +120,8 @@ def _make_dense_attn_forward(head_dim: int):
 
         qw = self.q_norm.weight.to(device=q.device, dtype=q.dtype)
         kw = self.k_norm.weight.to(device=k.device, dtype=k.dtype)
-        q = _rms_norm(q, qw, float(self.q_norm.eps))
-        k = _rms_norm(k, kw, float(self.k_norm.eps))
+        q = _rms_norm(q, qw, float(self.q_norm.eps) if self.q_norm.eps is not None else 1e-6)
+        k = _rms_norm(k, kw, float(self.k_norm.eps) if self.k_norm.eps is not None else 1e-6)
         if rope_freqs is not None:
             q = _apply_split_half_rope(q, rope_freqs)
             k = _apply_split_half_rope(k, rope_freqs)

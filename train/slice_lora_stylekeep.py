@@ -14,6 +14,10 @@ Presets
 - `stylekeep`:
     * attn.qkv_proj / attn.out_proj (all 50 blocks): 1.00x
     * mlp.fc1 / mlp.fc2: blocks 0..4 = 0.25x, blocks 5..31 = 0.45x, blocks 32..49 = 0.15x
+- `action_stylekeep`:
+    * attn.qkv_proj / attn.out_proj (all 50 blocks): 1.00x
+    * mlp.fc1 / mlp.fc2: blocks 0..4 = 0.30x, blocks 5..31 = 0.70x, blocks 32..49 = 0.25x
+      (releases mid-block MLP structural reconstruction capacity for high-speed 2D action)
 - `clean`:
     * attn.qkv_proj / attn.out_proj (all 50 blocks): 1.00x
     * mlp.fc1 / mlp.fc2: blocks 0..35 = 0.80x, blocks 36..49 = 0.30x (realistic/cinematic anti-boiling)
@@ -52,6 +56,12 @@ def _layer_scale(block_idx: int, mod: str, preset: str, attn_scale: float, mlp_e
         return 0.0
     if preset == "clean":
         return 0.80 if block_idx <= 35 else 0.30
+    if preset == "action_stylekeep":
+        if block_idx <= 4:
+            return 0.30
+        if block_idx <= 31:
+            return 0.70
+        return 0.25
     if block_idx <= 4:
         return mlp_early
     if block_idx <= 31:
@@ -148,6 +158,8 @@ def slice_lora(
         meta["seamkit_slice_scales"] = f"attn={attn_scale},mlp_0_35=0.80,mlp_36_49=0.30"
     elif preset == "attn_only":
         meta["seamkit_slice_scales"] = f"attn={attn_scale},mlp_all=0.0"
+    elif preset == "action_stylekeep":
+        meta["seamkit_slice_scales"] = f"attn={attn_scale},mlp_0_4=0.30,mlp_5_31=0.70,mlp_32_49=0.25"
     else:
         meta["seamkit_slice_scales"] = (
             f"attn={attn_scale},mlp_0_4={mlp_early},mlp_5_31={mlp_mid},mlp_32_49={mlp_late}"
@@ -178,7 +190,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Offline layer-wise stylekeep LoRA slicer for MiniMax-H3.")
     ap.add_argument("--input", required=True, help="Source .safetensors LoRA path")
     ap.add_argument("--output", required=True, help="Destination .safetensors LoRA path")
-    ap.add_argument("--preset", choices=["stylekeep", "clean", "attn_only", "custom"], default="stylekeep")
+    ap.add_argument("--preset", choices=["stylekeep", "action_stylekeep", "clean", "attn_only", "custom"], default="stylekeep")
     ap.add_argument("--attn-scale", type=float, default=1.0)
     ap.add_argument("--mlp-early", type=float, default=0.25, help="MLP scale for blocks 0..4")
     ap.add_argument("--mlp-mid", type=float, default=0.45, help="MLP scale for blocks 5..31")

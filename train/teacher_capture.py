@@ -1,34 +1,27 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 comfyui-h3-seamkit contributors
-"""教师轨迹采集三件套（仅训练用，不影响正常出片）。
+"""教师轨迹采集与动态锐度质检组件（仅训练用，不影响正常出片，保持原 4 个节点 ID 不变）。
 
-为什么放在 ComfyUI 节点里，而不是另写一套采样器
-------------------------------------------------
-二采的 conditioning（参考图 keyframe、音频 latent、双时钟噪声）由 T8 节点在
-运行期才拼好，自己复刻一遍必然漂移。这里只做**旁路观察**：
-
-* `MiniMaxH3TeacherProbe`  —— MODEL 进、MODEL 出。用 ComfyUI 官方的
-  `model_function_wrapper` 钩子包住二采的每一次去噪调用，记录
-  `(sigma, x, denoised)`；速度 `v = (x - denoised) / sigma` 与 Euler 更新
-  完全同式，不需要猜符号。放在**二采 model 链**上，一采不受影响。
-* `MiniMaxH3ConditioningDump` —— CONDITIONING 进、出。把二采的完整条件
-  （Qwen3-VL 文本特征 + 参考图 keyframe latent + 音频条件）原样落盘，
-  训练时才能重放同一次前向。
-* `MiniMaxH3TeacherLatentDump` —— LATENT 进、出。存二采的 `upscaled_latent`
-  （z_up）和最终 `z_teacher_clean`。
-
-落盘格式刻意保持“普通张量 + pickle”，训练脚本用 `torch.load(weights_only=False)`
-直接读；单个 22f/1088p 样本约 6–10 MB。
+* `MiniMaxH3TeacherProbe`       —— 旁路观察二采 (sigma, x, v)。
+* `MiniMaxH3ConditioningDump`   —— 把二采完整 conditioning 原样落盘。
+* `MiniMaxH3TeacherLatentDump`  —— 把 AV latent 按 `<key>.<tag>.pt` 落盘；若可选接入 `vae`，
+                                   同步解码运动峰值 5-latent 窗并写出 `<key>.qa.json`
+                                   （含运动 ROI `motion_roi_lap` 锐度，供教师自动筛糊重试）。
+* `MiniMaxH3LatentDownsample2x` —— 视频潜空间 H/W 下采样（支持 `scale_factor=1` 纯提取视频分量，
+                                   以及 `keep_av=True` 保留联合 AV NestedTensor 供真一采 `real_pass1` 重采样）。
 """
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
+import comfy.nested_tensor
 import folder_paths
 from comfy_api.latest import io
 
@@ -76,6 +69,65 @@ def _sigma_of(timestep) -> float:
         return float(timestep)
     except (TypeError, ValueError):
         return float("nan")
+
+
+def compute_motion_peak_qa(vae, video_latent: torch.Tensor) -> dict:
+    """解码运动能量最高的单个 5-latent 窗（<=17 帧），计算全局与运动前景 ROI 的 LapVar@1080。"""
+    if video_latent.ndim != 5 or video_latent.shape[2] < 1:
+        return {"global_lap": 0.0, "motion_roi_lap": 0.0, "peak_latent_t": 0}
+    t_len = int(video_latent.shape[2])
+    if t_len >= 2:
+        lat_diff = (video_latent[:, :, 1:].float() - video_latent[:, :, :-1].float()).abs().mean(dim=(0, 1, 3, 4))
+        peak_t = int(lat_diff.argmax().item())
+    else:
+        peak_t = 0
+    t0 = max(0, min(t_len - 5, (peak_t // 5) * 5)) if t_len >= 5 else 0
+    t1 = min(t_len, t0 + 5)
+    z_win = video_latent[:, :, t0:t1].detach()
+
+    with torch.no_grad():
+        imgs = vae.decode(z_win)
+    if imgs.ndim == 5:
+        imgs = imgs[0]
+    arr = (imgs.float().clamp(0.0, 1.0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+    n_f = arr.shape[0]
+    if n_f >= 2:
+        f_diffs = np.mean(np.abs(arr[1:].astype(np.float32) - arr[:-1].astype(np.float32)), axis=(1, 2, 3))
+        best_f = int(np.argmax(f_diffs))
+        pix_diff = np.mean(np.abs(arr[min(n_f - 1, best_f + 1)].astype(np.float32) - arr[best_f].astype(np.float32)), axis=-1)
+        frame = arr[min(n_f - 1, best_f + 1)]
+    else:
+        best_f = 0
+        pix_diff = np.ones(arr.shape[1:3], dtype=np.float32)
+        frame = arr[0]
+
+    gray = (0.299 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.114 * frame[:, :, 2]).astype(np.float32)
+    lap = (
+        -4.0 * gray[1:-1, 1:-1]
+        + gray[:-2, 1:-1] + gray[2:, 1:-1]
+        + gray[1:-1, :-2] + gray[1:-1, 2:]
+    )
+    global_lap = float(np.var(lap))
+
+    # 按 32×32 块选取运动能量最高的前 25% 区域计算 LapVar（避免暗色静止背景拉低动作主体锐度评分）
+    lh, lw = lap.shape
+    bh, bw = max(1, lh // 32), max(1, lw // 32)
+    crop_h, crop_w = bh * 32, bw * 32
+    diff_crop = pix_diff[1:1 + crop_h, 1:1 + crop_w].reshape(bh, 32, bw, 32).mean(axis=(1, 3))
+    lap_blocks = lap[:crop_h, :crop_w].reshape(bh, 32, bw, 32)
+    thresh = float(np.percentile(diff_crop, 75.0))
+    mask = diff_crop >= thresh
+    roi_pixels = lap_blocks.transpose(0, 2, 1, 3)[mask]
+    motion_roi_lap = float(np.var(roi_pixels)) if roi_pixels.size > 0 else global_lap
+
+    return {
+        "peak_latent_t": peak_t,
+        "window_latents": [t0, t1],
+        "peak_local_frame": best_f,
+        "global_lap": round(global_lap, 2),
+        "motion_roi_lap": round(motion_roi_lap, 2),
+        "max_block_diff": round(float(diff_crop.max()), 2),
+    }
 
 
 class MiniMaxH3TeacherProbe(io.ComfyNode):
@@ -145,7 +197,6 @@ class MiniMaxH3TeacherProbe(io.ComfyNode):
         state = {"n": 0}
 
         def _wrap(model_function, kwargs):
-            # ComfyUI 的钩子签名：wrapper(model.apply_model, {"input","timestep","c",...})
             result = model_function(kwargs["input"], kwargs["timestep"], **kwargs["c"])
             try:
                 sigma = _sigma_of(kwargs.get("timestep"))
@@ -185,12 +236,11 @@ class MiniMaxH3TeacherProbe(io.ComfyNode):
                     f"[Distill] probe {path.name}  shapes={[list(t.shape) for t in payload['x']]}",
                     flush=True,
                 )
-            except Exception as exc:  # 观察失败绝不能打断采样
+            except Exception as exc:
                 print(f"[Distill] probe error (ignored): {exc}", flush=True)
             return result
 
         patched = model.clone()
-        # clone() 的 model_options 可能是浅拷贝；显式再拷一层，避免污染一采共用链
         patched.model_options = dict(getattr(patched, "model_options", {}) or {})
         patched.set_model_unet_function_wrapper(_wrap)
         print(f"[Distill] teacher probe armed: dir={root} key={stem} sigmas={targets}", flush=True)
@@ -247,8 +297,8 @@ class MiniMaxH3TeacherLatentDump(io.ComfyNode):
             node_id="MiniMaxH3TeacherLatentDump",
             display_name="MiniMax H3 Teacher Latent Dump",
             description=(
-                "把 AV latent 按 `<key>.<tag>.pt` 落盘（z_up / z_teacher_clean / 任意中间量）。"
-                "直通节点，不改数值。"
+                "把 AV latent 按 `<key>.<tag>.pt` 落盘（z_up / z_native / 任意中间量）；"
+                "若可选接入 `vae`，同步对运动峰值帧写出 `<key>.qa.json` 锐度审计。直通节点，不改数值。"
             ),
             category=CATEGORY,
             is_experimental=True,
@@ -259,12 +309,13 @@ class MiniMaxH3TeacherLatentDump(io.ComfyNode):
                 io.String.Input("key", default="sample_0000"),
                 io.String.Input("tag", default="latent"),
                 io.Boolean.Input("enabled", default=True),
+                io.Vae.Input("vae", optional=True),
             ],
             outputs=[io.Latent.Output(display_name="latent")],
         )
 
     @classmethod
-    def execute(cls, latent, out_dir, key, tag, enabled):
+    def execute(cls, latent, out_dir, key, tag, enabled, vae=None):
         if not enabled:
             return io.NodeOutput(latent)
         samples = latent.get("samples") if isinstance(latent, dict) else None
@@ -288,23 +339,28 @@ class MiniMaxH3TeacherLatentDump(io.ComfyNode):
                 root / f"{stem}.{safe_tag}.pt",
             )
             print(f"[Distill] latent -> {stem}.{safe_tag}.pt  shapes={[list(t.shape) for t in parts]}", flush=True)
+            if vae is not None and len(parts) >= 1 and torch.is_tensor(parts[0]) and parts[0].ndim == 5:
+                qa = compute_motion_peak_qa(vae, parts[0])
+                qa["key"] = stem
+                qa["tag"] = safe_tag
+                qa_path = root / f"{stem}.qa.json"
+                qa_path.write_text(json.dumps(qa, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(
+                    f"[Distill-QA] {stem}: motion_roi_lap={qa['motion_roi_lap']} "
+                    f"global_lap={qa['global_lap']} peak_t={qa['peak_latent_t']}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(f"[Distill] latent dump failed (ignored): {exc}", flush=True)
+            print(f"[Distill] latent dump/qa failed (ignored): {exc}", flush=True)
         return io.NodeOutput(latent)
 
 
-NODES = [
-    MiniMaxH3TeacherProbe,
-    MiniMaxH3ConditioningDump,
-    MiniMaxH3TeacherLatentDump,
-]
-
-
 class MiniMaxH3LatentDownsample2x(io.ComfyNode):
-    """把 1080p 视频潜空间按 H/W 2× 平均池化到 480p（T 不变）。
+    """视频潜空间空间下采样 / 分量提取节点。
 
-    用途：教师 z_up 合成。先在潜空间降到 480p，再走 VAE 解码/编码，
-    比「1080p 解码 → 像素缩放 → 编码」快约 4 倍，且保留 VAE 的软化特征。
+    - `scale_factor=2, keep_av=False`（默认）：与旧版完全一致，输出单视频 480p 潜变量供 VAE 往返；
+    - `scale_factor=2, keep_av=True`：输出 `[video_480p, audio]` NestedTensor，供 `real_pass1` 同构图粗采样退化；
+    - `scale_factor=1, keep_av=False`：从 `real_pass1` 输出的联合 AV NestedTensor 中无损剥离纯视频分量送入 `VAEDecode`。
     """
 
     @classmethod
@@ -312,15 +368,20 @@ class MiniMaxH3LatentDownsample2x(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3LatentDownsample2x",
             display_name="MiniMax H3 Latent Downsample 2x (teacher z_up)",
-            description="视频潜空间 H/W 2× 平均池化；AV 嵌套只处理视频分量。直通式，不改其它分量。",
+            description="视频潜空间 H/W 平均池化或分量剥离；支持保留 AV NestedTensor 供真一采退化分支使用。",
             category=CATEGORY,
             is_experimental=True,
-            inputs=[io.Latent.Input("latent"), io.Boolean.Input("enabled", default=True)],
+            inputs=[
+                io.Latent.Input("latent"),
+                io.Boolean.Input("enabled", default=True),
+                io.Int.Input("scale_factor", default=2, min=1, max=4, step=1, advanced=True),
+                io.Boolean.Input("keep_av", default=False, advanced=True),
+            ],
             outputs=[io.Latent.Output(display_name="latent")],
         )
 
     @classmethod
-    def execute(cls, latent, enabled):
+    def execute(cls, latent, enabled, scale_factor: int = 2, keep_av: bool = False):
         if not enabled:
             return io.NodeOutput(latent)
         samples = latent.get("samples") if isinstance(latent, dict) else None
@@ -328,15 +389,27 @@ class MiniMaxH3LatentDownsample2x(io.ComfyNode):
             return io.NodeOutput(latent)
         nested = bool(getattr(samples, "is_nested", False))
         video = samples.tensors[0] if nested else samples
+        rest = list(samples.tensors[1:]) if nested else []
         orig_dtype = video.dtype
-        v = video.float()
-        if v.ndim == 5:
-            v = F.avg_pool3d(v, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        elif v.ndim == 4:
-            v = F.avg_pool2d(v, kernel_size=2, stride=2)
-        v = v.to(orig_dtype)
-        print(f"[Distill] downsample2x {list(video.shape)} -> {list(v.shape)}", flush=True)
+        sf = max(1, int(scale_factor))
+        if sf > 1:
+            v = video.float()
+            if v.ndim == 5:
+                v = F.avg_pool3d(v, kernel_size=(1, sf, sf), stride=(1, sf, sf))
+            elif v.ndim == 4:
+                v = F.avg_pool2d(v, kernel_size=sf, stride=sf)
+            v = v.to(orig_dtype)
+        else:
+            v = video
+        print(f"[Distill] downsample(sf={sf}, keep_av={keep_av}) {list(video.shape)} -> {list(v.shape)}", flush=True)
+        if keep_av and nested and rest:
+            return io.NodeOutput({"samples": comfy.nested_tensor.NestedTensor([v, *rest])})
         return io.NodeOutput({"samples": v})
 
 
-NODES.append(MiniMaxH3LatentDownsample2x)
+NODES = [
+    MiniMaxH3TeacherProbe,
+    MiniMaxH3ConditioningDump,
+    MiniMaxH3TeacherLatentDump,
+    MiniMaxH3LatentDownsample2x,
+]
