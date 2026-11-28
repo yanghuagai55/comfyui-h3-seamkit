@@ -38,6 +38,7 @@ What this module does (100% compatible with KJ SageAttention2++ kernels across S
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import contextlib
 import importlib
 import logging
@@ -320,18 +321,33 @@ def _permute_span_inplace(
         view[:, c0:c1] = view[:, c0:c1].index_select(0, idx)
 
 
-def _parse_dense_blocks(spec: str, count: int) -> frozenset[int]:
-    """Parse block index/range spec like '0-1,48-49' or '-1' into absolute block indices."""
+def _parse_dense_blocks_spec(spec: str, count: int) -> tuple[frozenset[int], float]:
+    """Parse `sol_dense_blocks` like '0-1,48-49' or '48-49@0.35' -> `(block_indices, max_sigma)`.
+
+    When `@<sigma>` is appended (e.g. `'48-49@0.35'`), dense overrides only trigger on low-sigma
+    refinement steps (`sigma <= max_sigma`), skipping redundant O(S^2) dense passes on early
+    high-noise steps (saves ~55-65s on 15s 1080p with zero seam regression).
+    """
     s = "".join(str(spec or "").split())
     if not s:
-        return frozenset()
+        return frozenset(), 1.0
+    max_sigma = 1.0
+    if "@" in s:
+        s_blocks, s_sig = s.rsplit("@", 1)
+        try:
+            max_sigma = float(s_sig)
+        except ValueError as exc:
+            raise ValueError(f"Invalid sol_dense_blocks sigma suffix {s_sig!r} in {spec!r}") from exc
+        s = s_blocks
+    if not s:
+        return frozenset(), max_sigma
     out: set[int] = set()
     for part in s.split(","):
         if not part:
             continue
         m = re.fullmatch(r"(-?\d+)(?:-(-?\d+))?", part)
         if m is None:
-            raise ValueError(f"Invalid sol_dense_blocks entry {part!r}; expected e.g. '0-1,48-49'")
+            raise ValueError(f"Invalid sol_dense_blocks entry {part!r}; expected e.g. '0-1,48-49' or '48-49@0.35'")
         lo = int(m.group(1))
         hi = lo if m.group(2) is None else int(m.group(2))
         lo = lo if lo >= 0 else count + lo
@@ -339,7 +355,13 @@ def _parse_dense_blocks(spec: str, count: int) -> frozenset[int]:
         if lo > hi:
             lo, hi = hi, lo
         out.update(range(max(lo, 0), min(hi, count - 1) + 1))
-    return frozenset(out)
+    return frozenset(out), max_sigma
+
+
+def _parse_dense_blocks(spec: str, count: int) -> frozenset[int]:
+    """Parse block index/range spec like '0-1,48-49' or '-1' into absolute block indices."""
+    blocks_set, _ = _parse_dense_blocks_spec(spec, count)
+    return blocks_set
 
 
 class _PermutedLayoutProxy:
@@ -361,12 +383,13 @@ def _build_sol_context(layout, seq_len: int, sol_cfg: dict, transformer_options:
         return None, None
 
     use_tight_low_sigma = False
+    cur_sigma: float | None = None
     sigmas = transformer_options.get("sigmas") if isinstance(transformer_options, dict) else None
     if sigmas is not None and torch.is_tensor(sigmas) and sigmas.numel() > 0:
-        sigma = float(sigmas.flatten()[0].item())
-        if sigma > float(sol_cfg.get("sol_max_sigma", 0.95)) + 1e-6:
+        cur_sigma = float(sigmas.flatten()[0].item())
+        if cur_sigma > float(sol_cfg.get("sol_max_sigma", 0.95)) + 1e-6:
             return None, None
-        if sigma < float(sol_cfg.get("sol_min_sigma", 0.0)) - 1e-6:
+        if cur_sigma < float(sol_cfg.get("sol_min_sigma", 0.0)) - 1e-6:
             if float(sol_cfg.get("sol_low_sigma_tau", 0.0)) > 0.0:
                 use_tight_low_sigma = True
             else:
@@ -411,7 +434,11 @@ def _build_sol_context(layout, seq_len: int, sol_cfg: dict, transformer_options:
     else:
         eff_tau = float(sol_cfg.get("sol_tau", 1.3))
         eff_aug = int(sol_cfg.get("sol_token_aug", 64))
-        eff_dense = sol_cfg.get("sol_dense_blocks_set", frozenset())
+        dense_max_sig = float(sol_cfg.get("sol_dense_blocks_max_sigma", 1.0))
+        if cur_sigma is not None and cur_sigma > dense_max_sig + 1e-6:
+            eff_dense = frozenset()
+        else:
+            eff_dense = sol_cfg.get("sol_dense_blocks_set", frozenset())
 
     sol_ctx = {
         "tau": eff_tau,
@@ -770,16 +797,51 @@ def _get_linear_rot_lora(
     return b_t, a_rot
 
 
+_LORA_OPT_CACHE: OrderedDict[
+    tuple,
+    tuple[list[tuple[torch.Tensor, torch.Tensor, float]], tuple[torch.Tensor, torch.Tensor] | None],
+] = OrderedDict()
+_LORA_OPT_CACHE_MAX = 1024
+
+
+def _tensor_quick_sig(t: torch.Tensor) -> tuple:
+    """Fast collision-resistant content signature for CPU/GPU LoRA matrices (avoids data_ptr ABA)."""
+    flat = t.detach().reshape(-1)
+    n = int(flat.numel())
+    if n == 0:
+        return (tuple(t.shape), str(t.dtype), 0)
+    idx = (0, n // 5, (2 * n) // 5, (3 * n) // 5, (4 * n) // 5, n - 1)
+    vals = tuple(round(float(flat[i].item()), 6) for i in idx)
+    return (tuple(t.shape), str(t.dtype), vals)
+
+
 def _optimize_lora_entries_for_mode(
     entries: list[tuple[torch.Tensor, torch.Tensor, float]],
     lora_fast_mode: str,
     allow_rot256: bool,
     max_rank: int = 64,
     energy_ratio: float = 0.992,
+    compute_device: torch.device | str | None = None,
 ) -> tuple[list[tuple[torch.Tensor, torch.Tensor, float]], tuple[torch.Tensor, torch.Tensor] | None]:
     """Collapse multi-LoRA entries via QR-Core (if enabled) and pre-rotate `A_rot = A @ H_256`."""
     if not entries or lora_fast_mode == "legacy":
         return entries, None
+
+    orig_dev = entries[0][0].device
+    use_cpu_cache = orig_dev.type == "cpu"
+    cache_key = None
+    if use_cpu_cache:
+        cache_key = (
+            str(lora_fast_mode),
+            bool(allow_rot256),
+            int(max_rank),
+            round(float(energy_ratio), 6),
+            tuple((_tensor_quick_sig(b), _tensor_quick_sig(a), round(float(sc), 8)) for b, a, sc in entries),
+        )
+        cached = _LORA_OPT_CACHE.get(cache_key)
+        if cached is not None:
+            _LORA_OPT_CACHE.move_to_end(cache_key)
+            return cached
 
     r_sum = sum(int(a.shape[0]) for _, a, _ in entries)
     if len(entries) > 1 or r_sum > max_rank:
@@ -788,27 +850,40 @@ def _optimize_lora_entries_for_mode(
             max_rank=max_rank,
             energy_ratio=energy_ratio,
             out_dtype=torch.bfloat16,
+            compute_device=compute_device,
         )
         if collapsed is not None:
             b_tilde, a_tilde, _ = collapsed
+            if b_tilde.device != orig_dev:
+                b_tilde = b_tilde.to(device=orig_dev)
+            if a_tilde.device != orig_dev:
+                a_tilde = a_tilde.to(device=orig_dev)
             opt_entries = [(b_tilde, a_tilde, 1.0)]
         else:
             return [], None
     else:
         b0, a0, s0 = entries[0]
-        b_tilde = b0.to(dtype=torch.bfloat16).contiguous()
+        b_tilde = b0.detach().to(device=orig_dev, dtype=torch.bfloat16).contiguous()
         a_tilde = (
-            (a0.float() * float(s0)).to(dtype=torch.bfloat16).contiguous()
+            (a0.detach().to(device=orig_dev).float() * float(s0)).to(dtype=torch.bfloat16).contiguous()
             if float(s0) != 1.0
-            else a0.to(dtype=torch.bfloat16).contiguous()
+            else a0.detach().to(device=orig_dev, dtype=torch.bfloat16).contiguous()
         )
         opt_entries = [(b_tilde, a_tilde, 1.0)]
 
     rot_pair: tuple[torch.Tensor, torch.Tensor] | None = None
     if allow_rot256 and lora_fast_mode in ("auto", "rotated_int8") and int(a_tilde.shape[1]) % 256 == 0:
         a_rot = pre_rotate_lora_down(a_tilde, group_size=256, mode="convrot")
+        if a_rot.device != orig_dev:
+            a_rot = a_rot.to(device=orig_dev)
         rot_pair = (b_tilde, a_rot)
-    return opt_entries, rot_pair
+
+    result = (opt_entries, rot_pair)
+    if use_cpu_cache and cache_key is not None:
+        _LORA_OPT_CACHE[cache_key] = result
+        if len(_LORA_OPT_CACHE) > _LORA_OPT_CACHE_MAX:
+            _LORA_OPT_CACHE.popitem(last=False)
+    return result
 
 
 def _make_chunked_run_blocks(
@@ -1600,12 +1675,34 @@ def _sol_attn_workspace_bytes(seq_len: int, group_heads: int, token_aug: int = 6
 
 
 def _uniform_head_chunk_candidates(heads: int, convrot_unit: int = 2) -> list[int]:
-    """Ascending exact divisors of `heads // convrot_unit` so every group has identical shape (0 allocator frag)."""
+    """Ascending ConvRot-aligned `head_chunks` covering all distinct even max-group widths.
+
+    Includes smooth intermediate ConvRot-256-aligned partitions (e.g. for 56 heads: `hc=10` ->
+    `[6,6,6,6,6,6,6,6,4,4]` between `hc=7` (`g=8`) and `hc=14` (`g=4`)), avoiding the 2x jump
+    from 7 to 14 on 15s 1080p while keeping shapes constant across all 50 blocks.
+    """
     unit = max(1, int(convrot_unit))
     if heads % unit != 0:
         unit = 1
     n_units = max(1, heads // unit)
-    return [d for d in range(1, n_units + 1) if n_units % d == 0]
+    seen_max_u: set[int] = set()
+    cands: list[int] = []
+    for hc in range(1, n_units + 1):
+        max_u = (n_units + hc - 1) // hc
+        if max_u not in seen_max_u:
+            seen_max_u.add(max_u)
+            cands.append(hc)
+    return cands
+
+
+def _max_group_heads_for_chunks(heads: int, n_groups: int, convrot_unit: int = 2) -> int:
+    """Exact maximum group width produced by `_split_heads_even(heads, n_groups, convrot_unit*head_dim, head_dim)`."""
+    n_groups = max(1, min(int(n_groups), int(heads)))
+    unit = max(1, int(convrot_unit))
+    if unit > 1 and heads % unit == 0 and n_groups <= heads // unit:
+        n_units = heads // unit
+        return ((n_units + n_groups - 1) // n_groups) * unit
+    return (heads + n_groups - 1) // n_groups
 
 
 def _activation_vram_budget_bytes(total_vram_bytes: int) -> int:
@@ -1691,7 +1788,7 @@ def _resolve_vram_plan(
     if total_vram <= 0:
         eff_mode = out_proj_mode if out_proj_mode in ("exact", "streaming") else ("exact" if seq_len <= 64000 else "streaming")
         eff_hc = max(1, min(req_hc if req_hc > 0 else 7, heads))
-        g_eff = (heads + eff_hc - 1) // eff_hc
+        g_eff = _max_group_heads_for_chunks(heads, eff_hc, convrot_unit)
         ap, mp = _estimate_block_peak_bytes(
             seq_len, hidden, heads, head_dim, ffn, g_eff, req_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
         )
@@ -1709,17 +1806,18 @@ def _resolve_vram_plan(
         # Use exact on >=16GB GPUs whenever a reasonable hc (<= max(req_hc, 4)) fits the exact budget
         probe_hc = max(req_hc, 4) if req_hc > 0 else 4
         probe_hc = min((c for c in candidates if c >= probe_hc), default=max_hc)
+        g_probe = _max_group_heads_for_chunks(heads, probe_hc, convrot_unit)
         ap_ex, _ = _estimate_block_peak_bytes(
-            seq_len, hidden, heads, head_dim, ffn, heads // probe_hc, req_tc, "exact", use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
+            seq_len, hidden, heads, head_dim, ffn, g_probe, req_tc, "exact", use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
         )
         eff_mode = "exact" if ap_ex <= budget else "streaming"
     else:
         eff_mode = "streaming"
 
-    # 2. Solve minimum safe uniform head_chunks
+    # 2. Solve minimum safe ConvRot-aligned head_chunks (exact ceiling max group width)
     hc_safe = max_hc
     for cand in candidates:
-        g_cand = heads // cand
+        g_cand = _max_group_heads_for_chunks(heads, cand, convrot_unit)
         ap, _ = _estimate_block_peak_bytes(
             seq_len, hidden, heads, head_dim, ffn, g_cand, req_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
         )
@@ -1747,7 +1845,7 @@ def _resolve_vram_plan(
             tc_max = max(2048, (max(0, avail_mlp) // (bytes_per_tok * 1024)) * 1024)
             eff_tc = max(2048, min(eff_tc, int(tc_max)))
 
-    g_final = max(1, (heads + eff_hc - 1) // eff_hc)
+    g_final = _max_group_heads_for_chunks(heads, eff_hc, convrot_unit)
     ap_fin, mp_fin = _estimate_block_peak_bytes(
         seq_len, hidden, heads, head_dim, ffn, g_final, eff_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
     )
@@ -1997,6 +2095,7 @@ def _run_chunked_attention_int8(
     out_loras=None,
     attn_temp_scale: float = 1.0,
     qkv_rot_pair: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out_merge: int = 1,
 ) -> None:
     """INT8 TensorWise ConvRot fast path: fused RMS-AdaLN + Rotated-INT8/BF16 LoRA side-branch + CUTLASS residual epilogue."""
     s, hidden = x.shape
@@ -2105,7 +2204,70 @@ def _run_chunked_attention_int8(
                     )
 
                 group_sizes = _split_heads_even(heads, head_chunks, out_gs if out_convrot else 0, head_dim)
+                eff_out_merge = max(1, min(int(out_merge), len(group_sizes)))
+                pending_os: list[torch.Tensor] = []
+                pending_c0: int | None = None
+                pending_c1: int = 0
+                flushed_batches = 0
+
+                def _flush_pending_out() -> None:
+                    nonlocal pending_c0, pending_c1, flushed_batches
+                    if not pending_os:
+                        return
+                    bc0, bc1 = int(pending_c0), int(pending_c1)
+                    b_group = b_out if flushed_batches == 0 else None
+                    b_group_arg = bias_out_arg if flushed_batches == 0 else bias_empty_arg
+                    if out_is_int8:
+                        w_out_g = w_out._qdata[:, bc0:bc1].contiguous()
+                        out_scale = w_out._params.scale
+                        if len(pending_os) == 1:
+                            o_single = pending_os[0]
+                            for t0 in range(0, s, token_chunk):
+                                t1 = min(t0 + token_chunk, s)
+                                sub_segs = _slice_mod_segments(mod_segments, t0, t1)
+                                _int8_linear_residual_inplace(
+                                    o_single[t0:t1], w_out_g, out_scale, ws_out_cutlass, b_group_arg, b_group,
+                                    out_convrot, out_gs, x[t0:t1], gate_msa, gate_msa_cast, sub_segs,
+                                )
+                        else:
+                            # Chunk-wise horizontal cat keeps scratch <= ~32 MiB while cutting 2.38 GiB
+                            # residual `x` HBM read-modify-writes by 2x-3x and widening CUTLASS INT8 K!
+                            for t0 in range(0, s, token_chunk):
+                                t1 = min(t0 + token_chunk, s)
+                                sub_segs = _slice_mod_segments(mod_segments, t0, t1)
+                                o_cat = torch.cat([p[t0:t1] for p in pending_os], dim=1)
+                                _int8_linear_residual_inplace(
+                                    o_cat, w_out_g, out_scale, ws_out_cutlass, b_group_arg, b_group,
+                                    out_convrot, out_gs, x[t0:t1], gate_msa, gate_msa_cast, sub_segs,
+                                )
+                                del o_cat
+                        del w_out_g
+                    else:
+                        w_out_g = w_out[:, bc0:bc1]
+                        if len(pending_os) == 1:
+                            o_single = pending_os[0]
+                            for t0 in range(0, s, token_chunk):
+                                t1 = min(t0 + token_chunk, s)
+                                sub_segs = _slice_mod_segments(mod_segments, t0, t1)
+                                proj_c = F.linear(o_single[t0:t1], w_out_g, b_group)
+                                _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
+                                del proj_c
+                        else:
+                            for t0 in range(0, s, token_chunk):
+                                t1 = min(t0 + token_chunk, s)
+                                sub_segs = _slice_mod_segments(mod_segments, t0, t1)
+                                o_cat = torch.cat([p[t0:t1] for p in pending_os], dim=1)
+                                proj_c = F.linear(o_cat, w_out_g, b_group)
+                                del o_cat
+                                _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
+                                del proj_c
+                        del w_out_g
+                    pending_os.clear()
+                    pending_c0 = None
+                    flushed_batches += 1
+
                 hs = 0
+                n_grp_total = len(group_sizes)
                 for g_idx, g in enumerate(group_sizes):
                     he = hs + g
                     c0, c1 = hs * head_dim, he * head_dim
@@ -2137,31 +2299,16 @@ def _run_chunked_attention_int8(
                     o_g = _attend_group(q_g, k_g, _make_v, dtype, sol_ctx, block_idx, attn_temp_scale=attn_temp_scale)
                     del q_g, k_g, q_g_2d, k_g_2d
                     o_g_2d = o_g.view(s, g * head_dim)
+                    del o_g
                     if out_mid is not None:
                         torch.addmm(out_mid, o_g_2d, out_a_cat[:, c0:c1].t(), beta=1.0, alpha=1.0, out=out_mid)
-                    b_group = b_out if g_idx == 0 else None
-                    b_group_arg = bias_out_arg if g_idx == 0 else bias_empty_arg
-                    if out_is_int8:
-                        w_out_g = w_out._qdata[:, c0:c1].contiguous()
-                        out_scale = w_out._params.scale
-                        for t0 in range(0, s, token_chunk):
-                            t1 = min(t0 + token_chunk, s)
-                            sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-                            _int8_linear_residual_inplace(
-                                o_g_2d[t0:t1], w_out_g, out_scale, ws_out_cutlass, b_group_arg, b_group,
-                                out_convrot, out_gs, x[t0:t1], gate_msa, gate_msa_cast, sub_segs,
-                            )
-                        del w_out_g
-                    else:
-                        w_out_g = w_out[:, c0:c1]
-                        for t0 in range(0, s, token_chunk):
-                            t1 = min(t0 + token_chunk, s)
-                            sub_segs = _slice_mod_segments(mod_segments, t0, t1)
-                            proj_c = F.linear(o_g_2d[t0:t1], w_out_g, b_group)
-                            _mod_gate(x[t0:t1], gate_msa, proj_c, sub_segs)
-                            del proj_c
-                        del w_out_g
-                    del o_g, o_g_2d
+                    if pending_c0 is None:
+                        pending_c0 = c0
+                    pending_c1 = c1
+                    pending_os.append(o_g_2d)
+                    del o_g_2d
+                    if len(pending_os) >= eff_out_merge or g_idx == n_grp_total - 1:
+                        _flush_pending_out()
                     hs = he
 
                 del x_qdata, x_scale, qkv_mid, qkv_b_cat, out_a_cat, out_packed
@@ -2761,14 +2908,22 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
             dtype_bytes=x.element_size(),
             lora_rank_sum=lora_rank_sum,
         )
-        if block_idx == 0 and (n_groups != req_groups or eff_token_chunk != token_chunk):
-            g_show = max(1, (int(self.attn.heads) + n_groups - 1) // n_groups)
+        out_merge = 1
+        g_show = _max_group_heads_for_chunks(int(self.attn.heads), n_groups)
+        if eff_mode == "streaming" and n_groups >= 4 and budget_gib > 0.0:
+            o_grp_gib = (g_show * int(self.attn.head_dim) * x.element_size() * s) / float(1024 ** 3)
+            slack_gib = budget_gib - pred_attn_gib - 0.12
+            if o_grp_gib > 0.0 and slack_gib >= o_grp_gib:
+                out_merge = min(3, 1 + int(slack_gib // o_grp_gib))
+        if block_idx == 0 and (n_groups != req_groups or eff_token_chunk != token_chunk or out_merge > 1):
             hc_label = f"auto→{n_groups}" if req_groups <= 0 else f"{req_groups}→{n_groups}"
             tc_label = f"{token_chunk}→{eff_token_chunk}" if eff_token_chunk != token_chunk else f"{eff_token_chunk}"
+            merge_label = f", out_merge={out_merge}" if out_merge > 1 else ""
+            peak_with_merge = pred_attn_gib + ((out_merge - 1) * (g_show * int(self.attn.head_dim) * x.element_size() * s) / float(1024 ** 3))
             print(
                 f"[SeamKit] 显存公式自适应 (预算 {budget_gib:.2f} GiB, S={s:,}, LoRA_R={lora_rank_sum}): "
-                f"hc={hc_label} (g={g_show}), tc={tc_label}, {eff_mode} | "
-                f"预计峰值 Attn {pred_attn_gib:.2f} / MLP {pred_mlp_gib:.2f} GiB",
+                f"hc={hc_label} (g={g_show}), tc={tc_label}, {eff_mode}{merge_label} | "
+                f"预计峰值 Attn {peak_with_merge:.2f} / MLP {pred_mlp_gib:.2f} GiB",
                 flush=True,
             )
 
@@ -2788,6 +2943,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                         qkv_loras=qkv_loras, out_loras=out_loras,
                         attn_temp_scale=attn_temp_scale,
                         qkv_rot_pair=qkv_rot_pair,
+                        out_merge=out_merge,
                     )
                     handled = True
                 elif not isinstance(w_qkv, qops.QuantizedTensor):
@@ -3027,7 +3183,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                     "sol_dense_blocks",
                     default="",
                     advanced=True,
-                    tooltip="可选：强制保持稠密的层号（如 '0-1,48-49'；留空则全部 50 层走稀疏）。",
+                    tooltip="可选：强制保持稠密的层号（如 '0-1,48-49'；支持 '@sigma' 门限如 '48-49@0.35' 仅在低噪末步稠密消缝，15s 1080p 再省 ~60s）。",
                 ),
                 io.Float.Input(
                     "sol_max_sigma",
@@ -3140,7 +3296,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
         if not blocks or not hasattr(blocks[0], "attn") or not hasattr(blocks[0].attn, "qkv_proj"):
             raise RuntimeError("Unexpected MiniMax H3 model layout: missing blocks[*].attn.qkv_proj.")
 
-        head_chunks = max(1, min(int(head_chunks), int(blocks[0].attn.heads)))
+        head_chunks = max(0, min(int(head_chunks), int(blocks[0].attn.heads)))
         token_chunk_size = max(1024, int(token_chunk_size))
         eff_attn_mode = str(attention_mode)
         if eff_attn_mode == "sol_attn_sparse" and not _sol_attn_available:
@@ -3150,7 +3306,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             )
             eff_attn_mode = "dense_sage"
 
-        sol_dense_set = _parse_dense_blocks(sol_dense_blocks, len(blocks))
+        sol_dense_set, sol_dense_max_sigma = _parse_dense_blocks_spec(sol_dense_blocks, len(blocks))
         n_blk = len(blocks)
         sol_low_sigma_dense_set = sol_dense_set | frozenset(
             list(range(min(3, n_blk))) + list(range(max(0, n_blk - 3), n_blk))
@@ -3165,6 +3321,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             "sol_min_tokens": int(sol_min_tokens),
             "sol_dense_blocks": str(sol_dense_blocks),
             "sol_dense_blocks_set": sol_dense_set,
+            "sol_dense_blocks_max_sigma": float(sol_dense_max_sigma),
             "sol_low_sigma_tau": float(sol_low_sigma_tau),
             "sol_low_sigma_dense_blocks_set": sol_low_sigma_dense_set,
             "sol_max_sigma": float(sol_max_sigma),
@@ -3219,6 +3376,14 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             eff_lora_fast_mode = "auto"
         static_rot_loras: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if eff_lora_fast_mode != "legacy" and static_loras:
+            qr_dev: torch.device = torch.device("cpu")
+            if torch.cuda.is_available():
+                try:
+                    free_b, _ = torch.cuda.mem_get_info()
+                    if free_b >= int(1.5 * (1024 ** 3)):
+                        qr_dev = torch.device("cuda")
+                except Exception:
+                    qr_dev = torch.device("cpu")
             for idx, block in enumerate(blocks):
                 for suffix, lin in (
                     ("attn.qkv_proj", block.attn.qkv_proj),
@@ -3240,10 +3405,13 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                         static_loras[key],
                         eff_lora_fast_mode,
                         allow_rot256=allow_rot256,
+                        compute_device=qr_dev,
                     )
                     static_loras[key] = opt_ents
                     if rot_pair is not None:
                         static_rot_loras[key] = rot_pair
+            if qr_dev.type == "cuda":
+                torch.cuda.empty_cache()
 
         attn_fwd = _make_chunked_attn_forward(head_chunks, token_chunk_size, str(out_proj_mode))
         block_fwd = _make_chunked_block_forward(head_chunks, str(out_proj_mode), token_chunk_size)

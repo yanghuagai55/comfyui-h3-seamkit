@@ -20,13 +20,13 @@
       "mode": 0,
       "inputs": [],
       "outputs": [],
-      "title": "★ H3 武戏动作增强 1080p 专用工作流（一采/二采彻底分路）",
+      "title": "★ H3 武戏 1080p 工作流（v3.0 镜头动作修复 + 15s 提速）",
       "properties": {},
       "widgets_values": [
-        "# H3 武戏动作增强 · 原生 1080p 直出（v2.8 双保险消缝）\n\n## 核心设计：一采定动作，二采定画质（彻底分路不打架）\n- **一采分支（左列 480p 骨架）**：\n  - `pika_h3_flex @ 0.42`：比文戏调低，**松开参考图姿势锁**，大幅度转身/腾空/甩镜不僵硬；\n  - `H3_Combat_V2 @ 0.70` + `Motion_Repair_V2 @ 0.45`：打斗编排 + 高速肢体/兵器防穿帮；\n  - `H3_speed_slider @ +0.40`：专治“水下慢动作出拳”，**严格仅挂一采**防二采重影！\n- **二采分支（右列 1080p 精修）**：\n  - `pika @ 0.35` + `Motion_Repair @ 0.20` + `Combat @ 0.15`（极致干脆可 Ctrl+B 关 Combat）；\n  - **二次元 / `dasiwa` 默认**：`v2_final_stylekeep @ 0.72`（保细线、零背景微跳、#19 电影质感默认关闭）；\n  - **真人 / 写实武戏切换**：只需把 `#48` 换成 `v2_final_clean.safetensors`，并 `Ctrl+B` 开启 `#19 真实电影质感V0.1`！\n\n## v2.8 双重消缝 + 全显卡显存自适应\n- `chunked_sage.py` 内置 **四相错位 Shifted-Morton** + 本工作流 `#16/#18` 默认 **`sol_dense_blocks = 48-49`**，根治 `y=512/1024` 水平/垂直割裂线；\n- `head_chunks = 0`（全自动 WDDM 防溢出预算）：8GB 10s 自动 `hc=4`、15s 自动 `hc=14`，12/16/24GB 自动选最快安全档；\n- **不建议武戏叠 `LMS`**：高速帧含运动模糊，叠 `LMS` 会把残影边缘锐化成锯齿。"
+        "# H3 武戏动作增强 · 原生 1080p 直出（v3.0 动作镜头逻辑修复 + 15s 提速版）\n\n## v3.0 三大核心修复（根治动作僵硬/诡异 + 镜头无逻辑 + 15s 30分钟耗时）\n1. **根治镜头逻辑混乱与动作不自然（一采左列）**：\n   - **旁路 `#53 H3_speed_slider`**：该 LoRA 仅修改唯一一层 `token_refiner.blocks.1.mlp.fc2 (r=128)`，与其它 `token_refiner` LoRA 叠挂会直接扭曲 Qwen3-VL 对运镜与动线的理解；\n   - **解除武打/修动拉锯**：`pika_h3_flex` 回调至 **`0.75`** 稳住人体几何，`H3_Combat_V2` 降至 **`0.25`**（消除 `0.70` 强劫持甩镜），`Motion_Repair_V2` 降至 **`0.25`**；\n   - **一采 `6步` + 前半程 100% 稠密注意力**：`#27` 升至 `6步 (beta57)`、`#16 sol_max_sigma=0.65`，确保 15s 跨帧 3D 机位轴线与肢体惯性在稠密全局注意力下完整收敛后再切稀疏（仅多 ~40s）。\n2. **二采画质升级与精简（右列）**：\n   - 主力升级为 **`minimax_h3_sol_sharp_v2_9_action_stylekeep.safetensors @ 0.85`**；\n   - 默认旁路 `#15 H3_Combat_V2`（动作已由一采锁定，关闭可消微抖并减栈秩）。\n3. **15s 1080p 显存带宽与能效大提速（SeamKit v3.0）**：\n   - **`sol_dense_blocks = 48-49@0.35`**：仅末步 (`sigma≤0.35`) 开启双层稠密消缝，跳过前两步冗余 $O(S^2)$ 稠密计算（15s 省 ~60s）；\n   - **平滑头分组 `hc=10` + `out_merge=2/3` 合并残差写回**：残差 `x` (2.38 GiB) 显存读写由 14 趟降至 5~7 趟（**-50%~64%** 带宽），CUTLASS INT8 矩阵宽度翻倍，显著提升 GPU 有效功耗比；\n   - **QR-Core (GPU加速+缓存) + Rotated-INT8**：多 LoRA 旁路自动正交坍缩至 `R≤64` 并在旋转域直读 INT8 激活。\n\n## 15s 极致省时两档选择\n- **档 A（原生 1080p 2步极速，~15 分钟）**：把 `#33 ManualSigmas` 改为 `0.82, 0.34, 0.0`（保留 `v2.9` 锐度，二采直接减 1/3 耗时）；\n- **档 B（1.30MP + RelayVSR x2 真 3K，~12–15 分钟）**：改用 `workflow_singlewin_selflora_13mp_vsr3k.json`，8GB 全程 `hc=4` 满血 TDP。"
       ],
       "widgets_values_named": {
-        "text": "# H3 武戏动作增强 · 原生 1080p 直出（v2.8 双保险消缝）\n\n## 核心设计：一采定动作，二采定画质（彻底分路不打架）\n- **一采分支（左列 480p 骨架）**：\n  - `pika_h3_flex @ 0.42`：比文戏调低，**松开参考图姿势锁**，大幅度转身/腾空/甩镜不僵硬；\n  - `H3_Combat_V2 @ 0.70` + `Motion_Repair_V2 @ 0.45`：打斗编排 + 高速肢体/兵器防穿帮；\n  - `H3_speed_slider @ +0.40`：专治“水下慢动作出拳”，**严格仅挂一采**防二采重影！\n- **二采分支（右列 1080p 精修）**：\n  - `pika @ 0.35` + `Motion_Repair @ 0.20` + `Combat @ 0.15`（极致干脆可 Ctrl+B 关 Combat）；\n  - **二次元 / `dasiwa` 默认**：`v2_final_stylekeep @ 0.72`（保细线、零背景微跳、#19 电影质感默认关闭）；\n  - **真人 / 写实武戏切换**：只需把 `#48` 换成 `v2_final_clean.safetensors`，并 `Ctrl+B` 开启 `#19 真实电影质感V0.1`！\n\n## v2.8 双重消缝 + 全显卡显存自适应\n- `chunked_sage.py` 内置 **四相错位 Shifted-Morton** + 本工作流 `#16/#18` 默认 **`sol_dense_blocks = 48-49`**，根治 `y=512/1024` 水平/垂直割裂线；\n- `head_chunks = 0`（全自动 WDDM 防溢出预算）：8GB 10s 自动 `hc=4`、15s 自动 `hc=14`，12/16/24GB 自动选最快安全档；\n- **不建议武戏叠 `LMS`**：高速帧含运动模糊，叠 `LMS` 会把残影边缘锐化成锯齿。"
+        "text": "# H3 武戏动作增强 · 原生 1080p 直出（v3.0 动作镜头逻辑修复 + 15s 提速版）\n\n## v3.0 三大核心修复（根治动作僵硬/诡异 + 镜头无逻辑 + 15s 30分钟耗时）\n1. **根治镜头逻辑混乱与动作不自然（一采左列）**：\n   - **旁路 `#53 H3_speed_slider`**：该 LoRA 仅修改唯一一层 `token_refiner.blocks.1.mlp.fc2 (r=128)`，与其它 `token_refiner` LoRA 叠挂会直接扭曲 Qwen3-VL 对运镜与动线的理解；\n   - **解除武打/修动拉锯**：`pika_h3_flex` 回调至 **`0.75`** 稳住人体几何，`H3_Combat_V2` 降至 **`0.25`**（消除 `0.70` 强劫持甩镜），`Motion_Repair_V2` 降至 **`0.25`**；\n   - **一采 `6步` + 前半程 100% 稠密注意力**：`#27` 升至 `6步 (beta57)`、`#16 sol_max_sigma=0.65`，确保 15s 跨帧 3D 机位轴线与肢体惯性在稠密全局注意力下完整收敛后再切稀疏（仅多 ~40s）。\n2. **二采画质升级与精简（右列）**：\n   - 主力升级为 **`minimax_h3_sol_sharp_v2_9_action_stylekeep.safetensors @ 0.85`**；\n   - 默认旁路 `#15 H3_Combat_V2`（动作已由一采锁定，关闭可消微抖并减栈秩）。\n3. **15s 1080p 显存带宽与能效大提速（SeamKit v3.0）**：\n   - **`sol_dense_blocks = 48-49@0.35`**：仅末步 (`sigma≤0.35`) 开启双层稠密消缝，跳过前两步冗余 $O(S^2)$ 稠密计算（15s 省 ~60s）；\n   - **平滑头分组 `hc=10` + `out_merge=2/3` 合并残差写回**：残差 `x` (2.38 GiB) 显存读写由 14 趟降至 5~7 趟（**-50%~64%** 带宽），CUTLASS INT8 矩阵宽度翻倍，显著提升 GPU 有效功耗比；\n   - **QR-Core (GPU加速+缓存) + Rotated-INT8**：多 LoRA 旁路自动正交坍缩至 `R≤64` 并在旋转域直读 INT8 激活。\n\n## 15s 极致省时两档选择\n- **档 A（原生 1080p 2步极速，~15 分钟）**：把 `#33 ManualSigmas` 改为 `0.82, 0.34, 0.0`（保留 `v2.9` 锐度，二采直接减 1/3 耗时）；\n- **档 B（1.30MP + RelayVSR x2 真 3K，~12–15 分钟）**：改用 `workflow_singlewin_selflora_13mp_vsr3k.json`，8GB 全程 `hc=4` 满血 TDP。"
       },
       "color": "#1b263b",
       "bgcolor": "#0d1b2a"
@@ -691,7 +691,7 @@
       ],
       "widgets_values_named": {
         "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        "strength_model": 1
+        "strength_model": 0.35
       }
     },
     {
@@ -707,7 +707,7 @@
       ],
       "flags": {},
       "order": 18,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "localized_name": "模型",
@@ -744,7 +744,7 @@
           ]
         }
       ],
-      "title": "★ [二采·3] H3_Combat_V2 @ 0.15 (轻扶特效残影·极致干脆可 Ctrl+B 关)",
+      "title": "[二采默认旁路] H3_Combat_V2 (动作已由一采锁定·二采关闭更干脆且省显存)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -760,8 +760,8 @@
         0.15
       ],
       "widgets_values_named": {
-        "lora_name": "Minimax H3真实电影质感V0.1_ComfyUI通用版.safetensors",
-        "strength_model": 0.42
+        "lora_name": "H3_Combat_V2.safetensors",
+        "strength_model": 0.15
       },
       "color": "#1b4332",
       "bgcolor": "#2d6a4f"
@@ -933,6 +933,16 @@
             "name": "sol_low_sigma_tau"
           },
           "link": null
+        },
+        {
+          "localized_name": "lora_fast_mode",
+          "name": "lora_fast_mode",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "lora_fast_mode"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -945,7 +955,7 @@
           ]
         }
       ],
-      "title": "★ 一采提速 · BF16旁路全接管 + 双保险消缝 (hc=auto, dense=48-49)",
+      "title": "★ 一采提速 · 前半程全稠密保镜头逻辑 (sol_max_sigma=0.65, tau=1.10, RotINT8)",
       "properties": {
         "aux_id": "yanghuagai55/comfyui-h3-seamkit",
         "ver": "0e9d22a2b6dceb9ed0599d8b2956e1e97f7c9559",
@@ -957,35 +967,37 @@
         16384,
         true,
         "sol_attn_sparse",
-        1.2,
+        1.1,
         64,
         0,
         "exact_kv_and_rows",
         12288,
-        "48-49",
-        0.9,
+        "49@0.35",
+        0.65,
         0,
         1.0,
         1.0,
-        0
+        0,
+        "auto"
       ],
       "widgets_values_named": {
-        "head_chunks": 7,
+        "head_chunks": 0,
         "out_proj_mode": "auto",
         "token_chunk_size": 16384,
         "chunk_io_layers": true,
         "attention_mode": "sol_attn_sparse",
-        "sol_tau": 1.2,
+        "sol_tau": 1.1,
         "sol_token_aug": 64,
         "sol_topk_ratio": 0,
         "sol_sink_mode": "exact_kv_and_rows",
         "sol_min_tokens": 12288,
-        "sol_dense_blocks": "",
-        "sol_max_sigma": 0.9,
-        "sol_min_sigma": 0.0,
+        "sol_dense_blocks": "49@0.35",
+        "sol_max_sigma": 0.65,
+        "sol_min_sigma": 0,
         "rope_hf_scale": 1.0,
         "attn_temp_scale": 1.0,
-        "sol_low_sigma_tau": 0.0
+        "sol_low_sigma_tau": 0,
+        "lora_fast_mode": "auto"
       },
       "color": "#233",
       "bgcolor": "#355"
@@ -1222,6 +1234,16 @@
             "name": "sol_low_sigma_tau"
           },
           "link": null
+        },
+        {
+          "localized_name": "lora_fast_mode",
+          "name": "lora_fast_mode",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "lora_fast_mode"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -1234,7 +1256,7 @@
           ]
         }
       ],
-      "title": "★ 二采双保险消缝 · Shifted-Morton + 48-49稠密 (hc=auto, tau=1.35, rope=1.20)",
+      "title": "★ 二采高效消缝 · Shifted-Morton + 48-49@0.35末步稠密 + RotINT8 (15s大幅提速)",
       "properties": {
         "aux_id": "yanghuagai55/comfyui-h3-seamkit",
         "ver": "0e9d22a2b6dceb9ed0599d8b2956e1e97f7c9559",
@@ -1251,30 +1273,32 @@
         0,
         "exact_kv_and_rows",
         12288,
-        "48-49",
+        "48-49@0.35",
         0.95,
         0,
         1.2,
         1.0,
-        0
+        0,
+        "auto"
       ],
       "widgets_values_named": {
-        "head_chunks": 4,
+        "head_chunks": 0,
         "out_proj_mode": "auto",
         "token_chunk_size": 16384,
         "chunk_io_layers": true,
         "attention_mode": "sol_attn_sparse",
-        "sol_tau": 1.4,
+        "sol_tau": 1.35,
         "sol_token_aug": 64,
         "sol_topk_ratio": 0,
         "sol_sink_mode": "exact_kv_and_rows",
         "sol_min_tokens": 12288,
-        "sol_dense_blocks": "",
+        "sol_dense_blocks": "48-49@0.35",
         "sol_max_sigma": 0.95,
-        "sol_min_sigma": 0.0,
-        "rope_hf_scale": 1.28,
-        "attn_temp_scale": 1.02,
-        "sol_low_sigma_tau": 0.0
+        "sol_min_sigma": 0,
+        "rope_hf_scale": 1.2,
+        "attn_temp_scale": 1.0,
+        "sol_low_sigma_tau": 0,
+        "lora_fast_mode": "auto"
       },
       "color": "#233",
       "bgcolor": "#355"
@@ -1345,7 +1369,7 @@
         0.25
       ],
       "widgets_values_named": {
-        "lora_name": "minimax_h3_lms_v1.0_r64_r.safetensors",
+        "lora_name": "Minimax H3真实电影质感V0.1_ComfyUI通用版.safetensors",
         "strength_model": 0.25
       },
       "color": "#233",
@@ -2268,7 +2292,7 @@
           ]
         }
       ],
-      "title": "★ 一采双时钟 (4步 · shift 12/3 · beta57 官方推荐)",
+      "title": "★ 一采双时钟 (6步 · shift 12/3 · beta57 · 15s镜头连贯与自然惯性)",
       "properties": {
         "cnr_id": "minimax-h3-audio-T8",
         "ver": "8e1476ff786fab454d3d610094687599713dcf53",
@@ -2282,14 +2306,14 @@
         }
       },
       "widgets_values": [
-        4,
+        6,
         12,
         3,
         "dual_clock_euler",
         "beta57"
       ],
       "widgets_values_named": {
-        "steps": 4,
+        "steps": 6,
         "shift_video": 12,
         "shift_audio": 3,
         "sampler_name": "dual_clock_euler",
@@ -2993,7 +3017,7 @@
           ]
         }
       ],
-      "title": "★ 二采 Sigma (精准对齐自训3锚点 · 0.85 / 0.54 / 0.20)",
+      "title": "★ 二采 Sigma (3步画质 0.85,0.54,0.20,0.0 | 15s极速2步可改 0.82,0.34,0.0)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.33.0",
@@ -3456,7 +3480,7 @@
       "widgets_values_named": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "MiniMaxH3/H3_SelfLoRA_1080p",
+        "filename_prefix": "MiniMaxH3/H3_Combat_1080p",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 15,
@@ -3523,7 +3547,7 @@
           ]
         }
       ],
-      "title": "★ [二采·4 主力] 自训锐化 stylekeep @ 0.72 (二次元默认 / 真人换 clean)",
+      "title": "★ [二采·4 主力] v2.9 武戏锐化 action_stylekeep @ 0.85 (二次元默认 / 真人换 clean)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -3535,12 +3559,12 @@
         }
       },
       "widgets_values": [
-        "minimax_h3_sol_sharp_v2_final_stylekeep.safetensors",
-        0.72
+        "minimax_h3_sol_sharp_v2_9_action_stylekeep.safetensors",
+        0.85
       ],
       "widgets_values_named": {
-        "lora_name": "minimax_h3_sol_sharp_v2_final.safetensors",
-        "strength_model": 0.55
+        "lora_name": "minimax_h3_sol_sharp_v2_9_action_stylekeep.safetensors",
+        "strength_model": 0.85
       },
       "color": "#1b4332",
       "bgcolor": "#2d6a4f"
@@ -3564,10 +3588,10 @@
       "title": "★ 快捷对照口诀",
       "properties": {},
       "widgets_values": [
-        "### 武戏 1080p 速查口诀（v2.8）\n\n1. **控制台核对**：应打印两次 `bf16_lora=200/200`（`#16` 一采动作栈 + `#18` 二采画质栈），`sol_dense_blocks=\"48-49\"` 零接缝。\n2. **二次元/真人切换**：二次元保持 `#48 stylekeep @ 0.72` + `#19 Bypass`；真人武戏换 `#48 clean @ 0.65~0.70` + `Ctrl+B` 开启 `#19` 电影质感。\n3. **高速防重影**：`H3_speed_slider` 仅挂一采、`二采` 不要再叠加 `LMS`；追求极致干脆可 `Ctrl+B` 关掉 `#15 Combat @ 0.15`。\n4. **成品目录**：`ComfyUI/output/MiniMaxH3/H3_Combat_1080p_xxxxx-audio.mp4`。"
+        "### 武戏 1080p 速查口诀（v3.0）\n\n1. **控制台核对**：看到 `hc=auto→10` 或 `out_merge=2/3`、`dense=48-49@0.35`、`bf16_lora=200/200` 即表示全部 v3.0 提速生效。\n2. **为什么默认关 `#53 speed` 和 `#15 二采 Combat`**：`speed` 只改文本精修末层，极易打乱 15s 镜头逻辑；动作在一采已定型，二采越干净画质越锐。\n3. **15s 嫌慢 1 秒提速**：将 `#33 ManualSigmas` 从 `0.85, 0.54, 0.20, 0.0` 改为 `0.82, 0.34, 0.0`（省 1/3 二采时间，直接降到 ~15 分钟）。\n4. **真人/二次元切换**：二次元保持 `#48 v2.9 action_stylekeep @ 0.85` + `#19 关`；真人写实将 `#48` 换 `v2_9_clean` 并 `Ctrl+B` 开 `#19`。"
       ],
       "widgets_values_named": {
-        "text": "### 武戏 1080p 速查口诀（v2.8）\n\n1. **控制台核对**：应打印两次 `bf16_lora=200/200`（`#16` 一采动作栈 + `#18` 二采画质栈），`sol_dense_blocks=\"48-49\"` 零接缝。\n2. **二次元/真人切换**：二次元保持 `#48 stylekeep @ 0.72` + `#19 Bypass`；真人武戏换 `#48 clean @ 0.65~0.70` + `Ctrl+B` 开启 `#19` 电影质感。\n3. **高速防重影**：`H3_speed_slider` 仅挂一采、`二采` 不要再叠加 `LMS`；追求极致干脆可 `Ctrl+B` 关掉 `#15 Combat @ 0.15`。\n4. **成品目录**：`ComfyUI/output/MiniMaxH3/H3_Combat_1080p_xxxxx-audio.mp4`。"
+        "text": "### 武戏 1080p 速查口诀（v3.0）\n\n1. **控制台核对**：看到 `hc=auto→10` 或 `out_merge=2/3`、`dense=48-49@0.35`、`bf16_lora=200/200` 即表示全部 v3.0 提速生效。\n2. **为什么默认关 `#53 speed` 和 `#15 二采 Combat`**：`speed` 只改文本精修末层，极易打乱 15s 镜头逻辑；动作在一采已定型，二采越干净画质越锐。\n3. **15s 嫌慢 1 秒提速**：将 `#33 ManualSigmas` 从 `0.85, 0.54, 0.20, 0.0` 改为 `0.82, 0.34, 0.0`（省 1/3 二采时间，直接降到 ~15 分钟）。\n4. **真人/二次元切换**：二次元保持 `#48 v2.9 action_stylekeep @ 0.85` + `#19 关`；真人写实将 `#48` 换 `v2_9_clean` 并 `Ctrl+B` 开 `#19`。"
       },
       "color": "#233",
       "bgcolor": "#263238"
@@ -3622,7 +3646,7 @@
           ]
         }
       ],
-      "title": "★ [一采·1] pika_h3_flex @ 0.42 (松开姿势锁·大动作不僵硬)",
+      "title": "★ [一采·1] pika_h3_flex @ 0.75 (稳住人体几何与角色一致性·不僵硬)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -3635,11 +3659,11 @@
       },
       "widgets_values": [
         "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        0.42
+        0.75
       ],
       "widgets_values_named": {
         "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        "strength_model": 1
+        "strength_model": 0.75
       },
       "color": "#223344"
     },
@@ -3693,7 +3717,7 @@
           ]
         }
       ],
-      "title": "★ [一采·2] H3_Combat_V2 @ 0.70 (核心武打身法/打击感/甩镜)",
+      "title": "★ [一采·2] H3_Combat_V2 @ 0.25 (轻辅打击惯性·严防0.70强劫持镜头逻辑)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -3706,11 +3730,11 @@
       },
       "widgets_values": [
         "H3_Combat_V2.safetensors",
-        0.7
+        0.25
       ],
       "widgets_values_named": {
-        "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        "strength_model": 1
+        "lora_name": "H3_Combat_V2.safetensors",
+        "strength_model": 0.25
       },
       "color": "#442222"
     },
@@ -3764,7 +3788,7 @@
           ]
         }
       ],
-      "title": "★ [一采·3] Motion_Repair_V2 @ 0.45 (高速挥砍四肢/兵器防变形)",
+      "title": "★ [一采·3] Motion_Repair_V2 @ 0.25 (轻扶高速四肢连贯·不与武打拉扯)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -3777,11 +3801,11 @@
       },
       "widgets_values": [
         "Motion_Repair_V2.safetensors",
-        0.45
+        0.25
       ],
       "widgets_values_named": {
-        "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        "strength_model": 1
+        "lora_name": "Motion_Repair_V2.safetensors",
+        "strength_model": 0.25
       },
       "color": "#442222"
     },
@@ -3798,7 +3822,7 @@
       ],
       "flags": {},
       "order": 14,
-      "mode": 0,
+      "mode": 4,
       "inputs": [
         {
           "localized_name": "模型",
@@ -3835,7 +3859,7 @@
           ]
         }
       ],
-      "title": "★ [一采·4] H3_speed_slider @ +0.40 (去水下慢动作·严禁挂二采!)",
+      "title": "[已默认旁路·慎开] H3_speed_slider (仅改 token_refiner.1.fc2 易毁镜头与动作逻辑)",
       "properties": {
         "cnr_id": "comfy-core",
         "ver": "0.30.0",
@@ -3848,11 +3872,11 @@
       },
       "widgets_values": [
         "H3_speed_slider_1.1.safetensors",
-        0.4
+        0.2
       ],
       "widgets_values_named": {
-        "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        "strength_model": 1
+        "lora_name": "H3_speed_slider_1.1.safetensors",
+        "strength_model": 0.2
       },
       "color": "#442222"
     },
@@ -3922,8 +3946,8 @@
         0.2
       ],
       "widgets_values_named": {
-        "lora_name": "pika_h3_flex_fl2va_v1_bf16_r.safetensors",
-        "strength_model": 1
+        "lora_name": "Motion_Repair_V2.safetensors",
+        "strength_model": 0.2
       },
       "color": "#223344"
     }

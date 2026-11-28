@@ -488,9 +488,20 @@ def rot_int8_lora_down(
             and out.dtype == torch.bfloat16
         )
         if can_cuda:
-            sc_f32 = x_scale if (x_scale.dtype == torch.float32 and x_scale.is_contiguous()) else x_scale.to(torch.float32).contiguous()
-            a_bf16 = a_rot if (a_rot.dtype == torch.bfloat16 and a_rot.is_contiguous()) else a_rot.to(torch.bfloat16).contiguous()
-            stream_ptr = torch.cuda.current_stream(x_qdata.device).cuda_stream
+            dev = x_qdata.device
+            sc_f32 = (
+                x_scale
+                if (x_scale.device == dev and x_scale.dtype == torch.float32 and x_scale.is_contiguous())
+                else x_scale.to(device=dev, dtype=torch.float32).contiguous()
+            )
+            a_bf16 = (
+                a_rot
+                if (a_rot.device == dev and a_rot.dtype == torch.bfloat16 and a_rot.is_contiguous())
+                else a_rot.to(device=dev, dtype=torch.bfloat16).contiguous()
+            )
+            if out.device != dev:
+                raise ValueError(f"out tensor device ({out.device}) must match x_qdata device ({dev})")
+            stream_ptr = torch.cuda.current_stream(dev).cuda_stream
             rc = lib.h3_rot_int8_lora_down_bf16(
                 ctypes.c_void_p(x_qdata.data_ptr()),
                 ctypes.c_void_p(sc_f32.data_ptr()),
@@ -510,7 +521,10 @@ def rot_int8_lora_down(
 
     # 2. Triton Tensor/Matrix Core path (Windows without cl.exe & AMD ROCm)
     if backend in ("auto", "triton") and _HAS_TRITON and x_qdata.is_cuda and out.dtype in (torch.bfloat16, torch.float16, torch.float32):
-        return _rot_int8_lora_down_triton(x_qdata, x_scale, a_rot, out)
+        dev = x_qdata.device
+        sc_dev = x_scale if x_scale.device == dev else x_scale.to(device=dev)
+        a_dev = a_rot if a_rot.device == dev else a_rot.to(device=dev)
+        return _rot_int8_lora_down_triton(x_qdata, sc_dev, a_dev, out)
     if backend == "triton":
         raise RuntimeError("Triton backend requested, but Triton or CUDA/HIP device is unavailable.")
 

@@ -25,6 +25,7 @@ import logging
 import math
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,8 @@ _EMBEDDED_CURVE_KEYS = (
 )
 
 _CANONICAL_BASIS_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_BRIDGE_RESULT_CACHE: OrderedDict[tuple, tuple[dict[str, Any], dict[str, torch.Tensor], dict[str, Any]]] = OrderedDict()
+_BRIDGE_RESULT_CACHE_MAX = 4
 
 
 @dataclass(frozen=True)
@@ -820,6 +823,54 @@ def bridge_and_load_h3_loras(
                 linear_accum.setdefault(wk, []).extend(ents)
             m.patches_uuid = uuid.uuid4()
 
+    # Fast bounded CPU LRU cache: skips disk reload, AdaLN bridge, and 208-layer QR-Core SVD on repeat runs (<30ms!)
+    bridge_cache_key: tuple | None = None
+    if upstream_collapsed_layers == 0 and time_embedder_override is None and active_slots:
+        key_slots: list[tuple[str, int, int, float]] = []
+        cacheable = True
+        for slot_src, strength in active_slots:
+            if isinstance(slot_src, dict):
+                cacheable = False
+                break
+            p_chk = Path(slot_src)
+            if not p_chk.is_file() and folder_paths is not None:
+                resolved = folder_paths.get_full_path("loras", str(slot_src))
+                if resolved is not None:
+                    p_chk = Path(resolved)
+            if not p_chk.is_file():
+                cacheable = False
+                break
+            st_info = p_chk.stat()
+            key_slots.append((str(p_chk.resolve()), int(st_info.st_mtime_ns), int(st_info.st_size), round(float(strength), 8)))
+        if cacheable:
+            bridge_cache_key = (
+                "curve_pruned_1025x8" if use_adaln_curves else "unpruned_2688",
+                t_target_sha,
+                str(adaln_bridge_mode),
+                bool(qr_collapse),
+                int(max_rank),
+                round(float(energy_ratio), 6),
+                tuple(key_slots),
+            )
+            hit = _BRIDGE_RESULT_CACHE.get(bridge_cache_key)
+            if hit is not None:
+                _BRIDGE_RESULT_CACHE.move_to_end(bridge_cache_key)
+                cached_patches, cached_extra_dw, cached_report = hit
+                applied_keys = m.add_patches(cached_patches, strength_patch=1.0) if cached_patches else []
+                for w_key, dw_t in cached_extra_dw.items():
+                    m.add_patches({w_key: ("diff", (dw_t,))}, strength_patch=1.0)
+                total_ms = (time.perf_counter() - t_start) * 1000.0
+                report = dict(cached_report)
+                report["cache_hit"] = True
+                report["patched_targets"] = len(applied_keys)
+                report["total_elapsed_ms"] = round(total_ms, 2)
+                print(
+                    f"[SeamKit] UniversalLoRA (CACHE HIT): {len(active_slots)} slot(s) -> {len(applied_keys)} targets "
+                    f"(QR R={report['max_rank_before']}->{report['max_rank_after']} in {total_ms:.1f}ms)",
+                    flush=True,
+                )
+                return m, report
+
     bridged_adaln_count = 0
     passthrough_adaln_count = 0
     dropped_adaln_count = 0
@@ -1047,13 +1098,17 @@ def bridge_and_load_h3_loras(
         final_patches[w_key] = ("diff", (dw_mat.to(torch.bfloat16).cpu().contiguous(),))
 
     applied_keys = m.add_patches(final_patches, strength_patch=1.0) if final_patches else []
+    extra_weight_diffs: dict[str, torch.Tensor] = {}
     for w_key, dw_mat in weight_diff_accum.items():
         if w_key in linear_accum:
-            m.add_patches({w_key: ("diff", (dw_mat.to(torch.bfloat16).cpu().contiguous(),))}, strength_patch=1.0)
+            dw_bf16 = dw_mat.to(torch.bfloat16).cpu().contiguous()
+            extra_weight_diffs[w_key] = dw_bf16
+            m.add_patches({w_key: ("diff", (dw_bf16,))}, strength_patch=1.0)
 
     total_ms = (time.perf_counter() - t_start) * 1000.0
     report = {
         "schema": "seamkit.h3.universal_lora_bridge.v3",
+        "cache_hit": False,
         "target_adaln_mode": "curve_pruned_1025x8" if use_adaln_curves else "unpruned_2688",
         "slots": slot_summaries,
         "upstream_collapsed_layers": upstream_collapsed_layers,
@@ -1073,6 +1128,10 @@ def bridge_and_load_h3_loras(
         "qr_elapsed_ms": round(qr_elapsed_ms, 2),
         "total_elapsed_ms": round(total_ms, 2),
     }
+    if bridge_cache_key is not None:
+        _BRIDGE_RESULT_CACHE[bridge_cache_key] = (final_patches, extra_weight_diffs, dict(report))
+        if len(_BRIDGE_RESULT_CACHE) > _BRIDGE_RESULT_CACHE_MAX:
+            _BRIDGE_RESULT_CACHE.popitem(last=False)
     print(
         f"[SeamKit] UniversalLoRA: {len(active_slots)} slot(s) -> {len(applied_keys)} targets "
         f"(refiner={refiner_layer_hits}, adaln_bridged={bridged_adaln_count} max_err={report['adaln_rel_error_max']:.2e}, "

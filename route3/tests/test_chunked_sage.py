@@ -478,10 +478,19 @@ def test_bf16_lora_side_branch_and_hooks():
     static_fc2 = {
         "diffusion_model.blocks.0.mlp.fc2.weight": cs._extract_lora_entries_from_patches([p_fc2], (5376, 14336))
     }
+    # Legacy mode preserves uncollapsed stacked entries (qkv_n == 2)
+    rb_legacy = types.MethodType(
+        cs._make_chunked_run_blocks(_Holder._run_blocks, None, static_loras=static_fc2, lora_fast_mode="legacy"),
+        holder,
+    )
+    topts_rt = {}
+    _ = rb_legacy(torch.zeros((16, 5376), device=device, dtype=dtype), None, [(0, 16, 0)], None, topts_rt)
+    assert observed == {"dyn_stashed": True, "nondyn_stashed": True, "qkv_n": 2, "out_n": 1, "fc1_n": 1, "fc2_n": 1}, f"Legacy hook mismatch: {observed}"
+    # Default v3.0 auto mode collapses stacked 2x qkv LoRAs via QR-Core into 1 orthogonal entry (qkv_n == 1)
     rb = types.MethodType(cs._make_chunked_run_blocks(_Holder._run_blocks, None, static_loras=static_fc2), holder)
     topts_rt = {}
     _ = rb(torch.zeros((16, 5376), device=device, dtype=dtype), None, [(0, 16, 0)], None, topts_rt)
-    assert observed == {"dyn_stashed": True, "nondyn_stashed": True, "qkv_n": 2, "out_n": 1, "fc1_n": 1, "fc2_n": 1}, f"Hook mismatch: {observed}"
+    assert observed == {"dyn_stashed": True, "nondyn_stashed": True, "qkv_n": 1, "out_n": 1, "fc1_n": 1, "fc2_n": 1}, f"Auto QR hook mismatch: {observed}"
     assert block.attn.qkv_proj.weight_lowvram_function is lv_dyn
     assert block.mlp.fc1.weight_function == [lv_nondyn]
     assert "_chunked_sage_active_loras" not in topts_rt
