@@ -363,44 +363,74 @@ def cmd_milestone(run_dir, export_dir, state):
         return 0
     state_p = Path(state)
     done = set(state_p.read_text(encoding="utf-8").split()) if state_p.is_file() else set()
-    plain = sorted([p for p in steps_dir.glob("step_*.safetensors") if not p.stem.endswith("_ema")],
-                   key=lambda p: p.stat().st_mtime)
     code_dir = PERSIST_ROOT / "comfyui-h3-seamkit"
-    for p in plain:
-        m = re.search(r"step_(\d+)", p.stem)
-        if not m:
-            continue
-        sid = m.group(1)
-        if sid in done or p.stat().st_size < 1024:
-            continue
-        out = exp / f"minimax_h3_sol_sharp_v3_overnight_s{sid}_action_stylekeep.safetensors"
-        if not out.is_file():
-            _log(f"slice {p.name} -> {out.name}")
-            rc = subprocess.call([
-                sys.executable, str(code_dir / "train" / "slice_lora_stylekeep.py"),
-                "--input", str(p), "--output", str(out), "--preset", "action_stylekeep",
-            ])
-            if rc != 0:
-                _log(f"slice {p.name} FAIL rc={rc}")
-                continue
-        if _upload(out, f"candidates_v3/{out.name}") != 0:
-            continue
-        metrics = run / "logs" / "metrics.jsonl"
-        if metrics.is_file():
-            _upload(metrics, "candidates_v3/metrics_v3_overnight.jsonl")
-        with state_p.open("a", encoding="utf-8") as fh:
-            fh.write(sid + "\n")
-        done.add(sid)
-        _log(f"[MILESTONE] s{sid} sliced+uploaded")
-    # NAS 滚动保留最近 2 份（只删已切片成功的）
+
     def _step_id(path):
         m = re.search(r"step_(\d+)", path.name)
         return m.group(1) if m else ""
+
+    def _slice(src, out):
+        if out.is_file():
+            return True
+        _log(f"slice {src.name} -> {out.name}")
+        rc = subprocess.call([
+            sys.executable, str(code_dir / "train" / "slice_lora_stylekeep.py"),
+            "--input", str(src), "--output", str(out), "--preset", "action_stylekeep",
+        ])
+        if rc != 0:
+            _log(f"slice {src.name} FAIL rc={rc}")
+            return False
+        return True
+
     plain = sorted([p for p in steps_dir.glob("step_*.safetensors") if not p.stem.endswith("_ema")],
                    key=lambda p: p.stat().st_mtime)
-    ema = sorted(steps_dir.glob("step_*_ema.safetensors"), key=lambda p: p.stat().st_mtime)
-    for p in plain[:-2] + ema[:-2]:
+    for p in plain:
+        sid = _step_id(p)
+        if not sid or p.stat().st_size < 1024:
+            continue
+        if sid not in done:
+            out = exp / f"minimax_h3_sol_sharp_v3_overnight_s{sid}_action_stylekeep.safetensors"
+            if _slice(p, out) and _upload(out, f"candidates_v3/{out.name}") == 0:
+                metrics = run / "logs" / "metrics.jsonl"
+                if metrics.is_file():
+                    _upload(metrics, "candidates_v3/metrics_v3_overnight.jsonl")
+                with state_p.open("a", encoding="utf-8") as fh:
+                    fh.write(sid + "\n")
+                done.add(sid)
+                _log(f"[MILESTONE] s{sid} sliced+uploaded")
+        ema_p = steps_dir / f"step_{sid}_ema.safetensors"
+        if ema_p.is_file() and ema_p.stat().st_size >= 1024 and f"{sid}_ema" not in done:
+            eout = exp / f"minimax_h3_sol_sharp_v3_overnight_s{sid}_ema_action_stylekeep.safetensors"
+            if _slice(ema_p, eout) and _upload(eout, f"candidates_v3/{eout.name}") == 0:
+                with state_p.open("a", encoding="utf-8") as fh:
+                    fh.write(f"{sid}_ema\n")
+                done.add(f"{sid}_ema")
+                _log(f"[MILESTONE] s{sid} EMA sliced+uploaded")
+
+    # 最新完整未切片权重：固定远端路径覆盖，任意时刻可跨实例无损热启
+    if plain:
+        latest = plain[-1]
+        sid = _step_id(latest)
+        full_state = Path("/tmp/v3_full_uploaded_step.txt")
+        prev = full_state.read_text(encoding="utf-8").strip() if full_state.is_file() else ""
+        if sid and prev != sid:
+            if _upload(latest, "candidates_v3/v3_208L_latest_full.safetensors") == 0:
+                full_state.write_text(sid + "\n", encoding="utf-8")
+                _log(f"[FULL] v3_208L_latest_full <- {latest.name}")
+
+    # NAS 滚动：只删已上传成功的旧文件，保留最近 2 份 step / ema / export
+    plain_now = sorted([p for p in steps_dir.glob("step_*.safetensors") if not p.stem.endswith("_ema")],
+                       key=lambda p: p.stat().st_mtime)
+    ema_now = sorted(steps_dir.glob("step_*_ema.safetensors"), key=lambda p: p.stat().st_mtime)
+    for p in plain_now[:-2]:
         if _step_id(p) in done:
+            try:
+                p.unlink()
+                _log(f"prune {p.name}")
+            except Exception:
+                pass
+    for p in ema_now[:-2]:
+        if f"{_step_id(p)}_ema" in done:
             try:
                 p.unlink()
                 _log(f"prune {p.name}")
@@ -408,11 +438,14 @@ def cmd_milestone(run_dir, export_dir, state):
                 pass
     exports = sorted(exp.glob("*_action_stylekeep.safetensors"), key=lambda p: p.stat().st_mtime)
     for p in exports[:-2]:
-        try:
-            p.unlink()
-            _log(f"prune {p.name}")
-        except Exception:
-            pass
+        m = re.search(r"_s(\d+)(_ema)?_action_stylekeep\.safetensors$", p.name)
+        key = (m.group(1) + ("_ema" if m.group(2) else "")) if m else ""
+        if key and key in done:
+            try:
+                p.unlink()
+                _log(f"prune {p.name}")
+            except Exception:
+                pass
     return 0
 
 
@@ -654,26 +687,51 @@ if [ "${V3_SKIP_BENCH:-0}" = "1" ]; then
 else
   log "=== STAGE 1: Phase 2B Zero-Gather Triton 真机 A/B 门禁 ==="
   ms_status stage1 "Phase2B bench running"
+  rm -f /tmp/phase2_v3_bench.json
   timeout -s TERM 1500 python3 "${CODE_DIR}/train/bench_phase2_mi300x.py" \
     --seq-len 26624 --base-steps 2 --p2-steps 3 \
     --cache "${WORK_DIR}/teacher_cache" \
     --base "${MODEL_ROOT}/diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors" \
     --out-json /tmp/phase2_v3_bench.json --upload-ms >>"${BENCH_LOG}" 2>&1
   BENCH_RC=$?
-  SUMMARY=$(grep -a "\[SUMMARY\]" "${BENCH_LOG}" 2>/dev/null | tail -1)
-  log "[stage1] rc=${BENCH_RC} ${SUMMARY:-no-summary}"
-  if printf '%s' "${SUMMARY}" | grep -q "Grads = 416/416"; then
-    SPEED=$(printf '%s' "${SUMMARY}" | sed -n 's/.*End-to-End Speedup = \([0-9.]*\)x.*/\1/p')
-    if [ -n "${SPEED}" ] && awk "BEGIN{exit !(${SPEED} >= 1.0)}"; then
-      ATTN_BACKEND="triton_bs"
-    else
-      ATTN_BACKEND="sdpa_mask"
-    fi
+  SPEED="n/a"
+  GATE_OK=0
+  if [ "${BENCH_RC}" -eq 0 ] && [ -s /tmp/phase2_v3_bench.json ]; then
+    if python3 - /tmp/phase2_v3_bench.json <<'PY'
+import json, math, sys
+try:
+    r = json.load(open(sys.argv[1], encoding="utf-8"))
+    s = r["selftest"]
+    e = r["e2e_mi300x"]
+    p = e["phase2"]
+    vals = [float(s.get(k, 0.0)) for k in ("cos_out", "cos_dq", "cos_dk", "cos_dv")]
+    ok = (
+        all(math.isfinite(v) and v >= 0.999 for v in vals)
+        and p.get("grad_alive") == "416/416"
+        and float(e.get("e2e_speedup", 0.0)) >= 1.0
+        and float(p.get("peak_vram_gb", 9999.0)) <= 150.0
+    )
+    print(
+        f"[gate] cos_out={s.get('cos_out')} cos_dq={s.get('cos_dq')} "
+        f"grads={p.get('grad_alive')} speedup={e.get('e2e_speedup')} "
+        f"vram={p.get('peak_vram_gb')}GB -> {'PASS' if ok else 'FAIL'}",
+        flush=True,
+    )
+    sys.exit(0 if ok else 1)
+except Exception as exc:
+    print(f"[gate] parse/verify fail: {exc}", flush=True)
+    sys.exit(1)
+PY
+    then GATE_OK=1; fi
+    SPEED=$(python3 -c "import json;print(json.load(open('/tmp/phase2_v3_bench.json'))['e2e_mi300x']['e2e_speedup'])" 2>/dev/null || echo "n/a")
+  fi
+  if [ "${GATE_OK}" = "1" ]; then
+    ATTN_BACKEND="triton_bs"
   else
     ATTN_BACKEND="sdpa_mask"
   fi
-  log "[stage1] backend=${ATTN_BACKEND} (speedup=${SPEED:-n/a})"
-  ms_status stage1_done "backend=${ATTN_BACKEND} speedup=${SPEED:-n/a} rc=${BENCH_RC}"
+  log "[stage1] rc=${BENCH_RC} gate=${GATE_OK} backend=${ATTN_BACKEND} (speedup=${SPEED})"
+  ms_status stage1_done "backend=${ATTN_BACKEND} speedup=${SPEED} rc=${BENCH_RC} gate=${GATE_OK}"
 fi
 
 # ============================================================================
@@ -700,7 +758,7 @@ fi
 
 start_comfy() {
   if curl -fsS --max-time 3 http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then return 0; fi
-  ( cd "${COMFY_DIR}" && nohup python3 main.py --listen 127.0.0.1 --port 8188 --bf16-unet >>/tmp/v3_comfyui.log 2>&1 & )
+  ( cd "${COMFY_DIR}" && nohup python3 main.py --listen 127.0.0.1 --port 8188 --bf16-unet --disable-auto-launch >>/tmp/v3_comfyui.log 2>&1 & )
   local i
   for i in $(seq 1 100); do
     if curl -fsS --max-time 3 http://127.0.0.1:8188/system_stats >/dev/null 2>&1; then return 0; fi
@@ -806,23 +864,56 @@ done
 for f in "${WORK_DIR}/teacher_cache"/*.pt; do
   [ -e "$f" ] || continue
   [ -e "${TRAIN_CACHE}/$(basename "$f")" ] && continue
-  cp -f "$f" "${TRAIN_CACHE}/"
+  ln -sf "$f" "${TRAIN_CACHE}/$(basename "$f")" 2>/dev/null || cp -f "$f" "${TRAIN_CACHE}/"
 done
 POOL_N=$(ls "${TRAIN_CACHE}"/*.pt 2>/dev/null | wc -l | tr -d ' ')
 log "[train] pool=${POOL_N} pt  (veo_new=${VEO_NEW:-0})"
 [ "${POOL_N}" -ge 4 ] || fatal "训练池样本不足（${POOL_N}）"
 
-# 热启动权重：优先用新目录本地断点，否则 v2.9 完整权重
-INIT_LORA="${V3_INIT_LORA:-${PERSIST_ROOT}/assets/final/minimax_h3_sol_sharp_v2_final.safetensors}"
-if [ ! -s "${RUN_DIR}/resume/latest_state.pt" ] && [ ! -s "${INIT_LORA}" ]; then
-  log "[train] 本地缺少 v2.9 热启动权重，尝试从魔搭拉取 final/minimax_h3_sol_sharp_v2_final.safetensors"
-  ms dl "final/minimax_h3_sol_sharp_v2_final.safetensors" /tmp/v3_assets/minimax_h3_sol_sharp_v2_final.safetensors >>"${MAIN_LOG}" 2>&1 || true
+# 热启动优先级：V3_INIT_LORA > Day2 step_000140（/tmp 归档 / NAS / 魔搭）> v2 final
+choose_init() {
+  local c
+  INIT_LORA=""
+  if [ -n "${V3_INIT_LORA:-}" ]; then INIT_LORA="${V3_INIT_LORA}"; return; fi
+  for c in "/tmp/v3_old_run_archive/steps/step_000140.safetensors" \
+           "${WORK_DIR}/lora_run_v3/steps/step_000140.safetensors"; do
+    if [ -s "$c" ]; then INIT_LORA="$c"; return; fi
+  done
+  if [ ! -s "/tmp/v3_assets/step_000140.safetensors" ]; then
+    log "[train] 本地无 step_000140，先尝试魔搭最新完整 v3.0 权重"
+    ms dl "candidates_v3/v3_208L_latest_full.safetensors" "/tmp/v3_assets/v3_208L_latest_full.safetensors" >>"${MAIN_LOG}" 2>&1 || true
+  fi
+  if [ -s "/tmp/v3_assets/v3_208L_latest_full.safetensors" ]; then
+    INIT_LORA="/tmp/v3_assets/v3_208L_latest_full.safetensors"
+    return
+  fi
+  if [ ! -s "/tmp/v3_assets/step_000140.safetensors" ]; then
+    log "[train] 无最新完整权重，回退魔搭 candidates_v3/step_000140.safetensors"
+    ms dl "candidates_v3/step_000140.safetensors" "/tmp/v3_assets/step_000140.safetensors" >>"${MAIN_LOG}" 2>&1 || true
+  fi
+  if [ -s "/tmp/v3_assets/step_000140.safetensors" ]; then
+    INIT_LORA="/tmp/v3_assets/step_000140.safetensors"
+    return
+  fi
+  for c in "${PERSIST_ROOT}/assets/final/minimax_h3_sol_sharp_v2_final.safetensors" \
+           "/tmp/v3_assets/minimax_h3_sol_sharp_v2_final.safetensors"; do
+    if [ -s "$c" ]; then INIT_LORA="$c"; return; fi
+  done
+  log "[train] step_000140 不可用，回退 v2 final 热启动"
+  ms dl "final/minimax_h3_sol_sharp_v2_final.safetensors" "/tmp/v3_assets/minimax_h3_sol_sharp_v2_final.safetensors" >>"${MAIN_LOG}" 2>&1 || true
   INIT_LORA="/tmp/v3_assets/minimax_h3_sol_sharp_v2_final.safetensors"
+}
+
+if [ -s "${RUN_DIR}/resume/latest_state.pt" ]; then
+  INIT_LORA="${V3_INIT_LORA:-}"
+  log "[train] 检测到本地续训包，将优先 --auto-resume（init 不生效）"
+else
+  choose_init
 fi
 if [ ! -s "${RUN_DIR}/resume/latest_state.pt" ] && [ ! -s "${INIT_LORA}" ]; then
   fatal "缺少热启动权重：${INIT_LORA}（且无本地续训包）"
 fi
-log "[train] init=${INIT_LORA} resume=$([ -s "${RUN_DIR}/resume/latest_state.pt" ] && echo yes || echo no)"
+log "[train] init=${INIT_LORA:-none} resume=$([ -s "${RUN_DIR}/resume/latest_state.pt" ] && echo yes || echo no)"
 echo "rank=64/32/32 refiner=1 frames=${TRAIN_FRAMES} backend=${ATTN_BACKEND} lr=${TRAIN_LR} steps=${TRAIN_TARGET_STEPS}" > "${RUN_DIR}/.v3_config"
 
 TRAIN_CMD=(python3 "${CODE_DIR}/train/train_h3_lora.py"
@@ -855,7 +946,6 @@ rm -f "${WATCH_STOP}" /tmp/v3_milestones_done.txt
 WATCH_PID=$!
 
 TRAIN_TIMEOUT_MIN=$(( $(remaining_min) - 25 ))
-[ "${TRAIN_TIMEOUT_MIN}" -gt 330 ] && TRAIN_TIMEOUT_MIN=330
 [ "${TRAIN_TIMEOUT_MIN}" -lt 20 ] && TRAIN_TIMEOUT_MIN=20
 log "[train] timeout=${TRAIN_TIMEOUT_MIN}m backend=${ATTN_BACKEND} frames=${TRAIN_FRAMES}"
 ms_status train "started timeout=${TRAIN_TIMEOUT_MIN}m backend=${ATTN_BACKEND} pool=${POOL_N}"
@@ -882,7 +972,6 @@ if printf '%s' "${TRAIN_FRAMES}" | grep -q "73" \
   done
   TRAIN_CMD=("${NEW_CMD[@]}")
   TRAIN_TIMEOUT_MIN=$(( $(remaining_min) - 20 ))
-  [ "${TRAIN_TIMEOUT_MIN}" -gt 300 ] && TRAIN_TIMEOUT_MIN=300
   [ "${TRAIN_TIMEOUT_MIN}" -lt 20 ] && TRAIN_TIMEOUT_MIN=20
   log "[train-retry] frames=22,39 timeout=${TRAIN_TIMEOUT_MIN}m"
   ms_status train "retry no-73 frames timeout=${TRAIN_TIMEOUT_MIN}m"
