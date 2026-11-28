@@ -994,7 +994,7 @@ def patch_attention(dm, cfg: dict):
 # ----------------------------------------------------------------------------
 def _is_action_sample(stem: str) -> bool:
     s = stem.lower()
-    return s.startswith(("sakuga", "act_", "combat", "action"))
+    return s.startswith(("sakuga", "act_", "combat", "action", "v3veo"))
 
 
 def scan_cache(cache_dir: Path) -> dict[str, list[dict]]:
