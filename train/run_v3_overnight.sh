@@ -464,22 +464,29 @@ cleanup_nas() {
   before_mb=$(df -Pm /mnt/data 2>/dev/null | awk 'END{print $4}')
   log "[clean] NAS free before=${before_mb:-?}MB"
 
-  # 旧 run 的 step/ema 已全部回传 candidates_v3/，整批清掉释放配额
+  # 旧 run 的 step/ema 先搬到 /tmp 归档（本机仍可查），再从 NAS 释放配额
   python3 - "${WORK_DIR}/lora_run_v3/steps" <<'PY' || true
-import sys
+import shutil, sys
 from pathlib import Path
 d = Path(sys.argv[1])
+arch = Path("/tmp/v3_old_run_archive/steps")
+arch.mkdir(parents=True, exist_ok=True)
 if not d.is_dir():
     raise SystemExit(0)
 for p in sorted(d.glob("step_*.safetensors"), key=lambda p: p.stat().st_mtime):
-    print(f"[clean] rm {p} ({p.stat().st_size/1e6:.0f} MB)", flush=True)
-    p.unlink()
+    try:
+        shutil.move(str(p), str(arch / p.name))
+        print(f"[clean] archived {p.name} ({p.stat().st_size/1e6:.0f} MB)", flush=True)
+    except Exception as exc:
+        print(f"[clean] archive fail {p.name}: {exc}", flush=True)
 PY
 
   # 已回传魔搭的旧成品切片（candidates_v3/ 已有同名文件）
-  rm -f "${WORK_DIR}/lora_run_v3/minimax_h3_sol_sharp_v3_day2_action_stylekeep.safetensors" \
-        "${WORK_DIR}/lora_run_v3/minimax_h3_sol_sharp_v3_s120_action_stylekeep.safetensors" \
-        "${WORK_DIR}/lora_run_v3/minimax_h3_sol_sharp_v3_night1_action_stylekeep.safetensors"
+  mkdir -p /tmp/v3_old_run_archive/slices
+  for f in "${WORK_DIR}/lora_run_v3/minimax_h3_sol_sharp_v3_"*_action_stylekeep.safetensors; do
+    [ -e "$f" ] || continue
+    mv -f "$f" /tmp/v3_old_run_archive/slices/ 2>/dev/null || rm -f "$f"
+  done
   find "${WORK_DIR}/lora_run_v3" -maxdepth 1 -type f -name 'minimax_h3_sol_sharp_v3_*_action_stylekeep.safetensors' -delete 2>/dev/null || true
 
   # 临时 raw / 打包副本 / 下载暂存（严禁碰 models、assets/final、teacher_cache/*.pt）
@@ -490,10 +497,12 @@ PY
   find "${LOG_DIR}" -maxdepth 1 -type f \( -name '*.jsonl' -o -name '*.log' \) -mtime +3 -delete 2>/dev/null || true
   find "${CODE_DIR}" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 
-  # 旧 200 层续训包（Day2 step140）与新 v3.0 208 层目录不兼容；其 step 已回传魔搭，直接回收
+  # 旧 200 层续训包（Day2 step140）与新 v3.0 208 层目录不兼容；先归档到 /tmp 再释放 NAS
   if [ -s "${WORK_DIR}/lora_run_v3/resume/latest_state.pt" ]; then
-    rm -f "${WORK_DIR}/lora_run_v3/resume/latest_state.pt"
-    log "[clean] 已回收旧 200 层续训包（其 step_000140 已在魔搭仓）"
+    mkdir -p /tmp/v3_old_run_archive/resume
+    mv -f "${WORK_DIR}/lora_run_v3/resume/latest_state.pt" /tmp/v3_old_run_archive/resume/ 2>/dev/null \
+      || rm -f "${WORK_DIR}/lora_run_v3/resume/latest_state.pt"
+    log "[clean] 旧 200 层续训包已归档至 /tmp/v3_old_run_archive/（NAS 已释放）"
   fi
   after_mb=$(df -Pm /mnt/data 2>/dev/null | awk 'END{print $4}')
   log "[clean] NAS free after=${after_mb:-?}MB"
