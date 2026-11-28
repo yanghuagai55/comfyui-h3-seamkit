@@ -1741,8 +1741,8 @@ def _estimate_block_peak_bytes(
         # Live simultaneously inside ck.sol_attn(q_g, k_g, v_g): q_g, k_g, v_g, o_g + sol_attn_plan workspace
         grp = 4 * dtype_bytes * int(group_heads) * int(head_dim) * s + _sol_attn_workspace_bytes(s, group_heads, sol_token_aug)
     else:
-        # _staged_sageattn_nhd frees BF16 q,k before allocating v,o: peak is BF16 q,k + INT8 q,k + scales
-        grp = (2 * dtype_bytes + 2) * int(group_heads) * int(head_dim) * s + 16 * int(group_heads) * s
+        # _staged_sageattn_nhd peak includes BF16 q,k + INT8 q,k (or INT8 q,k + BF16 v + FP8 v + BF16 o) + allocator headroom
+        grp = (3 * dtype_bytes + 2) * int(group_heads) * int(head_dim) * s + 16 * int(group_heads) * s
     attn_peak = base + out_buf + grp
     # MLP peak inside _swiglu_chunk: x(bf16) + fc1_c[tc, 2*FFN] + act_c[tc, FFN]
     mlp_peak = dtype_bytes * int(hidden) * s + dtype_bytes * (3 * int(ffn)) * min(s, int(token_chunk))
@@ -1798,9 +1798,10 @@ def _resolve_vram_plan(
     v_gib = total_vram / gib
 
     # 1. Resolve out_proj_mode
+    exact_seq_cap = 48000 if v_gib < 12.0 else 64000
     if out_proj_mode in ("exact", "streaming"):
         eff_mode = out_proj_mode
-    elif seq_len <= 64000:
+    elif seq_len <= exact_seq_cap:
         eff_mode = "exact"
     elif v_gib >= 14.0:
         # Use exact on >=16GB GPUs whenever a reasonable hc (<= max(req_hc, 4)) fits the exact budget
@@ -1815,8 +1816,13 @@ def _resolve_vram_plan(
         eff_mode = "streaming"
 
     # 2. Solve minimum safe ConvRot-aligned head_chunks (exact ceiling max group width)
+    # WDDM TDR & DynamicVRAM guard: on <=10GB GPUs with S>=16384, never launch all 56 heads at once (hc=1):
+    # empirically at S=42,475, hc=2 (g=28) is 8% FASTER than hc=1 while using 1.70 GiB less reserved VRAM!
+    min_safe_hc = 2 if (v_gib < 12.0 and seq_len >= 16384 and max_hc >= 2) else 1
     hc_safe = max_hc
     for cand in candidates:
+        if cand < min_safe_hc:
+            continue
         g_cand = _max_group_heads_for_chunks(heads, cand, convrot_unit)
         ap, _ = _estimate_block_peak_bytes(
             seq_len, hidden, heads, head_dim, ffn, g_cand, req_tc, eff_mode, use_sol, sol_token_aug, dtype_bytes, lora_rank_sum
@@ -2912,7 +2918,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
         g_show = _max_group_heads_for_chunks(int(self.attn.heads), n_groups)
         if eff_mode == "streaming" and n_groups >= 4 and budget_gib > 0.0:
             o_grp_gib = (g_show * int(self.attn.head_dim) * x.element_size() * s) / float(1024 ** 3)
-            slack_gib = budget_gib - pred_attn_gib - 0.12
+            slack_gib = budget_gib - pred_attn_gib - 0.45
             if o_grp_gib > 0.0 and slack_gib >= o_grp_gib:
                 out_merge = min(3, 1 + int(slack_gib // o_grp_gib))
         if block_idx == 0 and (n_groups != req_groups or eff_token_chunk != token_chunk or out_merge > 1):
@@ -3380,7 +3386,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             if torch.cuda.is_available():
                 try:
                     free_b, _ = torch.cuda.mem_get_info()
-                    if free_b >= int(1.5 * (1024 ** 3)):
+                    if free_b >= int(2.5 * (1024 ** 3)):
                         qr_dev = torch.device("cuda")
                 except Exception:
                     qr_dev = torch.device("cpu")
