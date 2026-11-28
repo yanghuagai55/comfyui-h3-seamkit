@@ -6,11 +6,17 @@ Thumbs.db
 .DS_Store
 *.log
 
-# Python 缓存
+# Python 缓存与本地原生算子编译产物
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+build/
+*.dll
+*.so
+*.pyd
+*.lib
+*.exp
 
 # 交接与一次性任务书（本地留档，不进仓库）
 docs/SESSION_LOG_*.md

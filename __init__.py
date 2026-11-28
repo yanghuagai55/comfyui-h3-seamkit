@@ -37,6 +37,7 @@ from comfy_api.latest import ComfyExtension
 
 from .chunked_sage import MiniMaxH3ChunkedSageAttentionPatch
 from .h3_upscale import MiniMaxH3HardCutUpscale
+from .lora_compat_bridge import MiniMaxH3UniversalLoRALoader
 from .nodes import (
     MiniMaxH3HardCutFirstPassPlan,
     MiniMaxH3HardCutPass2Plan,
@@ -70,6 +71,7 @@ class H3HardCutExtension(ComfyExtension):
             MiniMaxH3FirstPassSampler,
             MiniMaxH3HardCutUpscale,
             MiniMaxH3ChunkedSageAttentionPatch,
+            MiniMaxH3UniversalLoRALoader,
             MiniMaxH3AVLatentSave,
             MiniMaxH3AVLatentLoad,
             MiniMaxH3SafeAVDecode,

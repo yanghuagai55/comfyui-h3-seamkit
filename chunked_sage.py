@@ -60,6 +60,21 @@ from comfy.ldm.minimax.model import (
 )
 from comfy_api.latest import io
 
+try:
+    from .lora_compat_bridge import qr_core_collapse_loras
+    from .rot_lora_ops import (
+        get_rot_lora_active_backend,
+        pre_rotate_lora_down,
+        rot_int8_lora_down,
+    )
+except ImportError:
+    from lora_compat_bridge import qr_core_collapse_loras
+    from rot_lora_ops import (
+        get_rot_lora_active_backend,
+        pre_rotate_lora_down,
+        rot_int8_lora_down,
+    )
+
 logger = logging.getLogger("comfyui-h3-seamkit.chunked_sage")
 
 try:
@@ -730,23 +745,98 @@ def _get_linear_loras(
     return []
 
 
+def _get_linear_rot_lora(
+    linear,
+    transformer_options: dict | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Resolve pre-rotated `(B [d_out, R_*], A_rot [R_*, d_in])` on `device`/`dtype` if active."""
+    rot_map = transformer_options.get("_chunked_sage_rot_loras") if isinstance(transformer_options, dict) else None
+    if not isinstance(rot_map, dict):
+        return None
+    pair = rot_map.get(id(linear))
+    if pair is None:
+        return None
+    b_t, a_rot = pair
+    if b_t.device != device or b_t.dtype != dtype:
+        b_t = b_t.to(device=device, dtype=dtype, non_blocking=True)
+    if not b_t.is_contiguous():
+        b_t = b_t.contiguous()
+    if a_rot.device != device or a_rot.dtype != dtype:
+        a_rot = a_rot.to(device=device, dtype=dtype, non_blocking=True)
+    if not a_rot.is_contiguous():
+        a_rot = a_rot.contiguous()
+    return b_t, a_rot
+
+
+def _optimize_lora_entries_for_mode(
+    entries: list[tuple[torch.Tensor, torch.Tensor, float]],
+    lora_fast_mode: str,
+    allow_rot256: bool,
+    max_rank: int = 64,
+    energy_ratio: float = 0.992,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor, float]], tuple[torch.Tensor, torch.Tensor] | None]:
+    """Collapse multi-LoRA entries via QR-Core (if enabled) and pre-rotate `A_rot = A @ H_256`."""
+    if not entries or lora_fast_mode == "legacy":
+        return entries, None
+
+    r_sum = sum(int(a.shape[0]) for _, a, _ in entries)
+    if len(entries) > 1 or r_sum > max_rank:
+        collapsed = qr_core_collapse_loras(
+            entries,
+            max_rank=max_rank,
+            energy_ratio=energy_ratio,
+            out_dtype=torch.bfloat16,
+        )
+        if collapsed is not None:
+            b_tilde, a_tilde, _ = collapsed
+            opt_entries = [(b_tilde, a_tilde, 1.0)]
+        else:
+            return [], None
+    else:
+        b0, a0, s0 = entries[0]
+        b_tilde = b0.to(dtype=torch.bfloat16).contiguous()
+        a_tilde = (
+            (a0.float() * float(s0)).to(dtype=torch.bfloat16).contiguous()
+            if float(s0) != 1.0
+            else a0.to(dtype=torch.bfloat16).contiguous()
+        )
+        opt_entries = [(b_tilde, a_tilde, 1.0)]
+
+    rot_pair: tuple[torch.Tensor, torch.Tensor] | None = None
+    if allow_rot256 and lora_fast_mode in ("auto", "rotated_int8") and int(a_tilde.shape[1]) % 256 == 0:
+        a_rot = pre_rotate_lora_down(a_tilde, group_size=256, mode="convrot")
+        rot_pair = (b_tilde, a_rot)
+    return opt_entries, rot_pair
+
+
 def _make_chunked_run_blocks(
     orig_run_blocks_fn,
     sol_cfg: dict | None,
     static_loras: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] | None = None,
     rope_hf_scale: float = 1.0,
     attn_temp_scale: float = 1.0,
+    lora_fast_mode: str = "auto",
+    static_rot_loras: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ):
-    """Wrap `MiniMaxH3Model._run_blocks` to manage BF16 LoRA side-branches, Split-Band RoPE, & Sol-Attn Morton reordering."""
+    """Wrap `MiniMaxH3Model._run_blocks` to manage BF16/Rotated-INT8 LoRA side-branches, Split-Band RoPE, & Sol-Attn Morton reordering."""
     static_loras = static_loras or {}
+    static_rot_loras = static_rot_loras or {}
+    lora_fast_mode = str(lora_fast_mode or "auto")
     rope_hf_scale = float(rope_hf_scale)
     attn_temp_scale = float(attn_temp_scale)
+    dynamic_opt_cache: dict[
+        tuple,
+        tuple[list[tuple[torch.Tensor, torch.Tensor, float]], tuple[torch.Tensor, torch.Tensor] | None],
+    ] = {}
 
     def chunked_sage_run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
         # 1. Intercept any remaining INT8 LoRA LowVramPatch / BypassForwardHook BEFORE
         #    `make_prefetch_queue` runs, so `pin_modules` never triggers 200-layer VBAR
         #    dequantize + B@A + Hadamard requantize on every step.
         active_loras: dict[int, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        active_rot_loras: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         stashed_lowvram: list[tuple[object, object]] = []
         stashed_wfn: list[tuple[object, list]] = []
         blocks = getattr(self, "blocks", None) or ()
@@ -759,6 +849,7 @@ def _make_chunked_run_blocks(
             ):
                 key = f"diffusion_model.blocks.{idx}.{suffix}.weight"
                 entries: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+                has_dynamic = False
                 if key in static_loras:
                     entries.extend(static_loras[key])
                 raw_w = getattr(lin, "weight", None)
@@ -777,7 +868,9 @@ def _make_chunked_run_blocks(
                     if lv_entries is not None:
                         stashed_lowvram.append((lin, lowvram_fn))
                         lin.weight_lowvram_function = None
-                        entries.extend(lv_entries)
+                        if lv_entries:
+                            entries.extend(lv_entries)
+                            has_dynamic = True
                 elif (
                     is_int8_q
                     and lowvram_fn is None
@@ -791,19 +884,60 @@ def _make_chunked_run_blocks(
                     if lv_entries is not None:
                         stashed_wfn.append((lin, list(w_funcs)))
                         lin.weight_function = []
-                        entries.extend(lv_entries)
+                        if lv_entries:
+                            entries.extend(lv_entries)
+                            has_dynamic = True
                 if raw_w is not None and hasattr(raw_w, "shape"):
                     bypass_entries = _extract_bypass_lora_entries(lin, tuple(raw_w.shape))
                     if bypass_entries:
                         entries.extend(bypass_entries)
+                        has_dynamic = True
                 if entries:
-                    active_loras[id(lin)] = entries
+                    if not has_dynamic and key in static_loras:
+                        active_loras[id(lin)] = entries
+                        if key in static_rot_loras:
+                            active_rot_loras[id(lin)] = static_rot_loras[key]
+                    elif lora_fast_mode != "legacy":
+                        is_convrot_256 = (
+                            suffix in ("attn.qkv_proj", "mlp.fc1")
+                            and _is_int8_tensorwise(raw_w)
+                            and bool(getattr(raw_w._params, "convrot", False))
+                            and int(getattr(raw_w._params, "convrot_groupsize", 256)) == 256
+                        )
+                        sig = (
+                            id(lin),
+                            lora_fast_mode,
+                            is_convrot_256,
+                            tuple((id(b), id(a), round(float(sc), 7)) for b, a, sc in entries),
+                        )
+                        cached = dynamic_opt_cache.get(sig)
+                        if cached is None:
+                            if len(dynamic_opt_cache) >= 512:
+                                dynamic_opt_cache.clear()
+                            cached = _optimize_lora_entries_for_mode(
+                                entries, lora_fast_mode, allow_rot256=is_convrot_256
+                            )
+                            dynamic_opt_cache[sig] = cached
+                        opt_ents, rot_p = cached
+                        if opt_ents:
+                            active_loras[id(lin)] = opt_ents
+                        if rot_p is not None:
+                            active_rot_loras[id(lin)] = rot_p
+                    else:
+                        active_loras[id(lin)] = entries
 
         prev_loras = transformer_options.get("_chunked_sage_active_loras")
+        prev_rot_loras = transformer_options.get("_chunked_sage_rot_loras")
+        prev_fast_mode = transformer_options.get("_chunked_sage_lora_fast_mode")
+        transformer_options["_chunked_sage_lora_fast_mode"] = lora_fast_mode
         if active_loras:
             transformer_options["_chunked_sage_active_loras"] = active_loras
         else:
             transformer_options.pop("_chunked_sage_active_loras", None)
+        if active_rot_loras:
+            transformer_options["_chunked_sage_rot_loras"] = active_rot_loras
+        else:
+            transformer_options.pop("_chunked_sage_rot_loras", None)
 
         prev_temp = transformer_options.get("_chunked_sage_attn_temp")
         if attn_temp_scale != 1.0:
@@ -897,6 +1031,14 @@ def _make_chunked_run_blocks(
                 transformer_options.pop("_chunked_sage_active_loras", None)
             else:
                 transformer_options["_chunked_sage_active_loras"] = prev_loras
+            if prev_rot_loras is None:
+                transformer_options.pop("_chunked_sage_rot_loras", None)
+            else:
+                transformer_options["_chunked_sage_rot_loras"] = prev_rot_loras
+            if prev_fast_mode is None:
+                transformer_options.pop("_chunked_sage_lora_fast_mode", None)
+            else:
+                transformer_options["_chunked_sage_lora_fast_mode"] = prev_fast_mode
             if prev_ctx is None:
                 transformer_options.pop("_chunked_sage_sol_ctx", None)
             else:
@@ -910,6 +1052,7 @@ def _make_chunked_run_blocks(
     chunked_sage_run_blocks._is_chunked_sage_run_blocks = True
     chunked_sage_run_blocks._orig_run_blocks_fn = orig_run_blocks_fn
     chunked_sage_run_blocks._chunked_sage_static_loras = static_loras
+    chunked_sage_run_blocks._chunked_sage_static_rot_loras = static_rot_loras
     return chunked_sage_run_blocks
 
 
@@ -1853,8 +1996,9 @@ def _run_chunked_attention_int8(
     qkv_loras=None,
     out_loras=None,
     attn_temp_scale: float = 1.0,
+    qkv_rot_pair: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
-    """INT8 TensorWise ConvRot fast path: fused RMS-AdaLN + BF16 LoRA side-branch + CUTLASS residual epilogue."""
+    """INT8 TensorWise ConvRot fast path: fused RMS-AdaLN + Rotated-INT8/BF16 LoRA side-branch + CUTLASS residual epilogue."""
     s, hidden = x.shape
     dtype = x.dtype
     device = x.device
@@ -1870,14 +2014,22 @@ def _run_chunked_attention_int8(
     x_qdata = torch.empty((s, hidden), dtype=torch.int8, device=device)
     x_scale = torch.empty((s, 1), dtype=torch.float32, device=device)
 
-    qkv_packed = _prepare_lora_packed(qkv_loras, device, dtype)
-    qkv_b_cat = qkv_packed[0] if qkv_packed is not None else None
-    qkv_a_cat = qkv_packed[1] if qkv_packed is not None else None
-    qkv_mid = (
-        torch.empty((s, qkv_a_cat.shape[0]), dtype=dtype, device=device)
-        if qkv_a_cat is not None
-        else None
-    )
+    use_rot_qkv = qkv_convrot and qkv_gs == 256 and qkv_rot_pair is not None
+    if use_rot_qkv:
+        qkv_packed = None
+        qkv_b_cat, qkv_a_rot = qkv_rot_pair
+        qkv_a_cat = None
+        qkv_mid = torch.empty((s, qkv_a_rot.shape[0]), dtype=dtype, device=device)
+    else:
+        qkv_a_rot = None
+        qkv_packed = _prepare_lora_packed(qkv_loras, device, dtype)
+        qkv_b_cat = qkv_packed[0] if qkv_packed is not None else None
+        qkv_a_cat = qkv_packed[1] if qkv_packed is not None else None
+        qkv_mid = (
+            torch.empty((s, qkv_a_cat.shape[0]), dtype=dtype, device=device)
+            if qkv_a_cat is not None
+            else None
+        )
 
     use_fused_rms = eff_mode == "streaming"
     with _cast_rmsnorm_once(block.norm1, x) as nw1:
@@ -1890,13 +2042,18 @@ def _run_chunked_attention_int8(
                 shift_msa, scale_msa, eff_scale1, shift1_cast, sub_segs,
                 use_fused_rms=use_fused_rms,
             )
-            if qkv_mid is not None:
-                qkv_mid[t0:t1] = F.linear(h_c, qkv_a_cat)
-            _quantize_int8_convrot_into(h_c, x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
-            del h_c
+            if use_rot_qkv:
+                _quantize_int8_convrot_into(h_c, x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
+                del h_c
+                rot_int8_lora_down(x_qdata[t0:t1], x_scale[t0:t1], qkv_a_rot, out=qkv_mid[t0:t1])
+            else:
+                if qkv_mid is not None:
+                    qkv_mid[t0:t1] = F.linear(h_c, qkv_a_cat)
+                _quantize_int8_convrot_into(h_c, x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
+                del h_c
 
-    # Release qkv `A` matrix immediately; only `(qkv_mid [S,R], qkv_b_cat [21504,R])` needed below
-    del qkv_a_cat, qkv_packed
+    # Release qkv `A` / `A_rot` matrix immediately; only `(qkv_mid [S,R], qkv_b_cat [21504,R])` needed below
+    del qkv_a_cat, qkv_a_rot, qkv_packed
 
     def _add_qkv_lora_inplace(buf_2d: torch.Tensor, r0: int, r1: int) -> None:
         if qkv_mid is None:
@@ -2250,7 +2407,8 @@ def _run_chunked_mlp_inplace(
         or getattr(fc2, "input_scale", None) is not None
     )
 
-    fc1_packed = _prepare_lora_packed(_get_linear_loras(fc1, transformer_options), device, dtype)
+    fc1_rot_pair = _get_linear_rot_lora(fc1, transformer_options, device, dtype)
+    fc1_packed = None if fc1_rot_pair is not None else _prepare_lora_packed(_get_linear_loras(fc1, transformer_options), device, dtype)
     fc2_packed = _prepare_lora_packed(_get_linear_loras(fc2, transformer_options), device, dtype)
     gated_fc2_cache: dict[int, torch.Tensor] = {}
     gate_mlp_cast = gate_mlp.to(dtype).contiguous()
@@ -2274,6 +2432,34 @@ def _run_chunked_mlp_inplace(
 
         with _cast_linear_once(fc1, device, dtype) as (w_fc1, b_fc1):
             with _cast_linear_once(fc2, device, dtype) as (w_fc2, b_fc2):
+                fc1_is_int8 = _is_int8_tensorwise(w_fc1)
+                fc1_convrot = bool(getattr(w_fc1._params, "convrot", False)) if fc1_is_int8 else False
+                fc1_gs = int(getattr(w_fc1._params, "convrot_groupsize", 256)) if fc1_is_int8 else 256
+                use_rot_fc1 = (
+                    fc1_rot_pair is not None
+                    and fc1_is_int8
+                    and fc1_convrot
+                    and fc1_gs == 256
+                    and x.is_cuda
+                    and _ck_cuda is not None
+                )
+                if fc1_rot_pair is not None and not use_rot_fc1:
+                    # Non-ConvRot fallback: unpack unrotated side-branch
+                    fc1_packed = _prepare_lora_packed(_get_linear_loras(fc1, transformer_options), device, dtype)
+
+                q_fc1_buf = None
+                s_fc1_buf = None
+                mid_fc1_buf = None
+                fc1_b_t = None
+                fc1_a_rot = None
+                if use_rot_fc1:
+                    fc1_b, fc1_a_rot = fc1_rot_pair
+                    fc1_b_t = fc1_b.t()
+                    max_m = min(s, token_chunk)
+                    q_fc1_buf = torch.empty((max_m, hidden), dtype=torch.int8, device=device)
+                    s_fc1_buf = torch.empty((max_m, 1), dtype=torch.float32, device=device)
+                    mid_fc1_buf = torch.empty((max_m, fc1_a_rot.shape[0]), dtype=dtype, device=device)
+
                 fc2_is_int8 = _is_int8_tensorwise(w_fc2)
                 fc2_convrot = bool(getattr(w_fc2._params, "convrot", False)) if fc2_is_int8 else False
                 fc2_gs = int(getattr(w_fc2._params, "convrot_groupsize", 256)) if fc2_is_int8 else 256
@@ -2296,10 +2482,23 @@ def _run_chunked_mlp_inplace(
                         shift_mlp, scale_mlp, eff_scale2, shift2_cast, sub_segs,
                         use_fused_rms=use_fused_rms,
                     )
-                    fc1_c = _linear_with_cast_weight(h_c, w_fc1, b_fc1)
-                    if fc1_packed is not None:
-                        _add_lora_inplace(fc1_c, h_c, fc1_packed)
-                    del h_c
+                    if use_rot_fc1:
+                        m_c = t1 - t0
+                        q_sl = q_fc1_buf[:m_c]
+                        s_sl = s_fc1_buf[:m_c]
+                        mid_sl = mid_fc1_buf[:m_c]
+                        _quantize_int8_convrot_into(h_c, q_sl, s_sl, True, 256)
+                        del h_c  # Freed BEFORE allocating [m_c, 28672] fc1_c & zero BF16 h_c re-read!
+                        rot_int8_lora_down(q_sl, s_sl, fc1_a_rot, out=mid_sl)
+                        fc1_c = _int8_gemm_prequant(
+                            q_sl, s_sl, w_fc1._qdata, w_fc1._params.scale, dtype, b_fc1
+                        )
+                        torch.addmm(fc1_c, mid_sl, fc1_b_t, beta=1.0, alpha=1.0, out=fc1_c)
+                    else:
+                        fc1_c = _linear_with_cast_weight(h_c, w_fc1, b_fc1)
+                        if fc1_packed is not None:
+                            _add_lora_inplace(fc1_c, h_c, fc1_packed)
+                        del h_c
 
                     if fc2_packed is not None:
                         # Single-pass fused Triton SwiGLU matching comfy_kitchen FP32 SiLU
@@ -2333,7 +2532,7 @@ def _run_chunked_mlp_inplace(
                         del fc1_c
                         _mod_gate(x[t0:t1], gate_mlp, mlp_c, sub_segs)
                         del mlp_c
-    del fc1_packed, fc2_packed, gated_fc2_cache
+    del fc1_packed, fc1_rot_pair, fc2_packed, gated_fc2_cache
 
 
 def _make_chunked_attn_forward(head_chunks: int, token_chunk: int, out_proj_mode: str = "auto"):
@@ -2369,6 +2568,7 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int, out_proj_mode
         qw = mm.cast_to(self.q_norm.weight, device=device) if rope_freqs is not None else None
         kw = mm.cast_to(self.k_norm.weight, device=device) if rope_freqs is not None else None
         rot_dim = rope_freqs.shape[-3] * 2 if rope_freqs is not None else 0
+        qkv_rot_sa = _get_linear_rot_lora(self.qkv_proj, transformer_options, device, dtype)
         qkv_packed = _prepare_lora_packed(qkv_loras_sa, device, dtype)
         out_packed = _prepare_lora_packed(out_loras_sa, device, dtype)
 
@@ -2380,22 +2580,33 @@ def _make_chunked_attn_forward(head_chunks: int, token_chunk: int, out_proj_mode
                 qkv_gs = int(getattr(w_qkv._params, "convrot_groupsize", 256))
                 x_qdata = torch.empty((s, x.shape[1]), dtype=torch.int8, device=device)
                 x_scale = torch.empty((s, 1), dtype=torch.float32, device=device)
-                qkv_mid = (
-                    torch.empty((s, qkv_packed[1].shape[0]), dtype=dtype, device=device)
-                    if qkv_packed is not None
-                    else None
-                )
+                use_rot_sa = qkv_convrot and qkv_gs == 256 and qkv_rot_sa is not None
+                if use_rot_sa:
+                    qkv_b_sa, qkv_a_rot_sa = qkv_rot_sa
+                    qkv_mid = torch.empty((s, qkv_a_rot_sa.shape[0]), dtype=dtype, device=device)
+                else:
+                    qkv_b_sa = qkv_packed[0] if qkv_packed is not None else None
+                    qkv_a_rot_sa = None
+                    qkv_mid = (
+                        torch.empty((s, qkv_packed[1].shape[0]), dtype=dtype, device=device)
+                        if qkv_packed is not None
+                        else None
+                    )
                 for t0 in range(0, s, eff_token_chunk):
                     t1 = min(t0 + eff_token_chunk, s)
-                    if qkv_mid is not None:
-                        qkv_mid[t0:t1] = F.linear(x[t0:t1], qkv_packed[1])
-                    _quantize_int8_convrot_into(x[t0:t1], x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
-                del x
+                    if use_rot_sa:
+                        _quantize_int8_convrot_into(x[t0:t1], x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
+                        rot_int8_lora_down(x_qdata[t0:t1], x_scale[t0:t1], qkv_a_rot_sa, out=qkv_mid[t0:t1])
+                    else:
+                        if qkv_mid is not None:
+                            qkv_mid[t0:t1] = F.linear(x[t0:t1], qkv_packed[1])
+                        _quantize_int8_convrot_into(x[t0:t1], x_qdata[t0:t1], x_scale[t0:t1], qkv_convrot, qkv_gs)
+                del x, qkv_a_rot_sa
 
                 def _add_sa_qkv_lora(buf_2d: torch.Tensor, r0: int, r1: int) -> None:
                     if qkv_mid is None:
                         return
-                    torch.addmm(buf_2d, qkv_mid, qkv_packed[0][r0:r1].t(), beta=1.0, alpha=1.0, out=buf_2d)
+                    torch.addmm(buf_2d, qkv_mid, qkv_b_sa[r0:r1].t(), beta=1.0, alpha=1.0, out=buf_2d)
 
                 def _sc(r0, r1):
                     return qkv_scale[r0:r1] if (qkv_scale.ndim > 0 and qkv_scale.numel() > 1) else qkv_scale
@@ -2567,6 +2778,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
         )
 
         if not has_qkv_extra_scales:
+            qkv_rot_pair = _get_linear_rot_lora(self.attn.qkv_proj, transformer_options, device, dtype)
             with _cast_linear_once(self.attn.qkv_proj, device, dtype) as (w_qkv, b_qkv):
                 if _is_int8_tensorwise(w_qkv) and x.is_cuda and _ck_cuda is not None:
                     _run_chunked_attention_int8(
@@ -2575,6 +2787,7 @@ def _make_chunked_block_forward(head_chunks: int, out_proj_mode: str, token_chun
                         sol_ctx=sol_ctx, block_idx=block_idx,
                         qkv_loras=qkv_loras, out_loras=out_loras,
                         attn_temp_scale=attn_temp_scale,
+                        qkv_rot_pair=qkv_rot_pair,
                     )
                     handled = True
                 elif not isinstance(w_qkv, qops.QuantizedTensor):
@@ -2864,6 +3077,20 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
                     advanced=True,
                     tooltip="当 sigma < sol_min_sigma 时的末步策略：0.0=退回100%稠密KJ Sage（864p/10s默认）；设为 0.90 则切 Tight-Sol（tau=0.90, aug≥128, 首尾各3层稠密），15s 1080p 末步提速 2.5×！",
                 ),
+                io.Combo.Input(
+                    "lora_fast_mode",
+                    options=["auto", "rotated_int8", "qr_collapsed", "legacy"],
+                    default="auto",
+                    optional=True,
+                    advanced=True,
+                    tooltip=(
+                        "SeamKit v3.0 LoRA 旁路底层算子加速模式：\n"
+                        "• auto / rotated_int8：自动执行 QR-Core 多 LoRA 正交坍缩（R≤64）+ Hadamard 旋转域直读 INT8×BF16 融合核，"
+                        "qkv_proj 与 fc1 免除未旋转 BF16 激活重读（单步省 316 GB 显存带宽）；\n"
+                        "• qr_collapsed：仅执行 QR-Core 正交坍缩，保留原版 BF16 激活输入；\n"
+                        "• legacy：原版拼接 BF16 旁路。"
+                    ),
+                ),
             ],
             outputs=[
                 io.Model.Output(display_name="model"),
@@ -2890,6 +3117,7 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
         rope_hf_scale: float = 1.0,
         attn_temp_scale: float = 1.0,
         sol_low_sigma_tau: float = 0.0,
+        lora_fast_mode: str = "auto",
     ) -> io.NodeOutput:
         if _cuda_archs is None:
             raise RuntimeError(
@@ -2986,6 +3214,37 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             if popped_any:
                 m.patches_uuid = uuid.uuid4()
 
+        eff_lora_fast_mode = str(lora_fast_mode or "auto")
+        if eff_lora_fast_mode not in ("auto", "rotated_int8", "qr_collapsed", "legacy"):
+            eff_lora_fast_mode = "auto"
+        static_rot_loras: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        if eff_lora_fast_mode != "legacy" and static_loras:
+            for idx, block in enumerate(blocks):
+                for suffix, lin in (
+                    ("attn.qkv_proj", block.attn.qkv_proj),
+                    ("attn.out_proj", block.attn.out_proj),
+                    ("mlp.fc1", block.mlp.fc1),
+                    ("mlp.fc2", block.mlp.fc2),
+                ):
+                    key = f"diffusion_model.blocks.{idx}.{suffix}.weight"
+                    if key not in static_loras or not static_loras[key]:
+                        continue
+                    raw_w = getattr(lin, "weight", None)
+                    allow_rot256 = (
+                        suffix in ("attn.qkv_proj", "mlp.fc1")
+                        and _is_int8_tensorwise(raw_w)
+                        and bool(getattr(raw_w._params, "convrot", False))
+                        and int(getattr(raw_w._params, "convrot_groupsize", 256)) == 256
+                    )
+                    opt_ents, rot_pair = _optimize_lora_entries_for_mode(
+                        static_loras[key],
+                        eff_lora_fast_mode,
+                        allow_rot256=allow_rot256,
+                    )
+                    static_loras[key] = opt_ents
+                    if rot_pair is not None:
+                        static_rot_loras[key] = rot_pair
+
         attn_fwd = _make_chunked_attn_forward(head_chunks, token_chunk_size, str(out_proj_mode))
         block_fwd = _make_chunked_block_forward(head_chunks, str(out_proj_mode), token_chunk_size)
 
@@ -3014,6 +3273,8 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             static_loras=static_loras,
             rope_hf_scale=float(rope_hf_scale),
             attn_temp_scale=float(attn_temp_scale),
+            lora_fast_mode=eff_lora_fast_mode,
+            static_rot_loras=static_rot_loras,
         )
         m.add_object_patch(
             "diffusion_model._run_blocks",
@@ -3056,7 +3317,10 @@ class MiniMaxH3ChunkedSageAttentionPatch(io.ComfyNode):
             "sol_token_aug": sol_token_aug,
             "sol_topk_ratio": float(sol_topk_ratio),
             "sol_sink_mode": str(sol_sink_mode),
+            "lora_fast_mode": eff_lora_fast_mode,
             "lora_side_branch_layers": len(static_loras),
+            "lora_rot_int8_layers": len(static_rot_loras),
+            "lora_rot_backend": get_rot_lora_active_backend() if static_rot_loras else "none",
             "arch": _cuda_archs[0] if _cuda_archs else "unknown",
             "sageplus_sm89": _sageplus_sm89_available,
             "sol_attn_available": _sol_attn_available,
