@@ -114,7 +114,7 @@ def preflight(role: str, min_vram: float, work_root: str, model_root: str) -> bo
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["teacher", "train", "auto"], default="auto")
-    ap.add_argument("--repo", required=True)
+    ap.add_argument("--repo", default="", help="HF 私有仓；留空=纯本地模式（魔搭等 HF 不可达环境，产物只落本地/NAS）")
     ap.add_argument("--prefix", default="teacher_cache_v3_action")
     ap.add_argument("--train-shard-prefixes", default="",
                     help="训练时拉取的分片前缀（逗号分隔，如 teacher_cache_v1,teacher_cache_v3_action）")
@@ -175,9 +175,12 @@ def main() -> int:
     os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    if not Path(args.token_file).is_file() or not Path(args.token_file).read_text(encoding="utf-8").strip():
+    if args.repo and (not Path(args.token_file).is_file()
+                      or not Path(args.token_file).read_text(encoding="utf-8").strip()):
         _log(f"缺少或空的 HF token 文件: {args.token_file}")
         return 2
+    if not args.repo:
+        _log("本地模式：未指定 --repo，教师分片与断点只落本地磁盘（不自愈上云）")
 
     if not args.skip_preflight and not preflight(
         "train" if args.mode == "train" else "teacher",
@@ -203,9 +206,10 @@ def main() -> int:
             "--optim", args.optim, "--attn-backend", args.attn_backend, "--block-size", "64",
             "--save-every", str(args.save_every), "--log-every", str(args.log_every),
             "--grad-clamp", str(args.grad_clamp), "--auto-resume",
-            "--pull-shards", "--hf-repo", args.repo, "--hf-prefix", args.hf_prefix,
-            "--shard-prefix", shard_prefixes, "--token-file", args.token_file,
         ]
+        if args.repo:
+            cmd += ["--pull-shards", "--hf-repo", args.repo, "--hf-prefix", args.hf_prefix,
+                    "--shard-prefix", shard_prefixes, "--token-file", args.token_file]
         if args.frames:
             cmd += ["--frames", args.frames]
         if args.lf_base_anchor:

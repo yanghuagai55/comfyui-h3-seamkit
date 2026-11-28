@@ -131,9 +131,11 @@ def main() -> int:
     prompts = {str(s["id"]): s for s in samples}
 
     store = ShardStore(args.repo, args.prefix, args.token_file) if args.repo else None
-    done = store.done_ids() if store else set()
+    cloud_done = store.done_ids() if store else set()
+    local_done = {p.stem for p in cache.glob("*.pt") if p.stat().st_size > 1024}
+    done = cloud_done | local_done
     pending = [s for s in samples if str(s["id"]) not in done]
-    _log(f"prompts={len(samples)} cloud_done={len(done)} pending={len(pending)}")
+    _log(f"prompts={len(samples)} cloud_done={len(cloud_done)} local_done={len(local_done)} pending={len(pending)}")
 
     ready = [str(s["id"]) for s in pending if _raw_ready(out_root, str(s["id"]))]
     queue = [s for s in pending if str(s["id"]) not in ready]

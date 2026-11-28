@@ -42,7 +42,15 @@ for cand in /tmp /root /var/tmp /; do
     fi
   fi
 done
+MODEL_ROOT_EXPLICIT="${MODEL_ROOT:-}"
 MODEL_ROOT="${MODEL_ROOT:-${BEST_TMP%/}/h3_rocm_models}"
+# 公共 NAS（/mnt/data，跨实例共享）已部署好只读权重时直接复用，避免每次开机重下 ~96GB
+SHARED_MODEL_ROOT="${SHARED_MODEL_ROOT:-/mnt/data/h3_v3/models}"
+if [ -z "${MODEL_ROOT_EXPLICIT}" ] && [ -f "${SHARED_MODEL_ROOT}/diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors" ] \
+   && [ -f "${SHARED_MODEL_ROOT}/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors" ]; then
+  MODEL_ROOT="${SHARED_MODEL_ROOT}"
+  echo "[disk] 检测到公共目录已就绪权重，直接复用: ${MODEL_ROOT}"
+fi
 AVAIL_GB=$((BEST_KB / 1024 / 1024))
 echo "[disk] 选定只读大模型目录: ${MODEL_ROOT} (所在分区剩余 ~${AVAIL_GB} GiB)"
 echo "[disk] 持久化断点与代码目录: ${PERSIST_ROOT} (跨日关机保留)"
@@ -135,6 +143,14 @@ fi
 echo "=================================================================="
 echo "[4/6] 自动枚举并下载 ROCm 兼容版 BF16 底模 / 非-NVFP4 CLIP / Sol-VAE / Upscaler ..."
 echo "=================================================================="
+# 魔搭实例出网白名单：huggingface.co / hf-mirror 均不可达时，自动改走魔搭 HD mirror 仓（阿里 CDN）
+MODEL_SOURCE="${H3_MODEL_SOURCE:-auto}"
+HF_REACHABLE=0
+if [ "${MODEL_SOURCE}" != "modelscope" ] && curl -fsS --connect-timeout 5 --max-time 8 \
+     https://huggingface.co/api/models/Comfy-Org/MiniMax-H3 >/dev/null 2>&1; then
+  HF_REACHABLE=1
+fi
+if [ "${HF_REACHABLE}" = "1" ]; then
 MODEL_ROOT="${MODEL_ROOT}" WORK_DIR="${WORK_DIR}" python3 - <<'PY'
 import os
 from pathlib import Path
@@ -217,6 +233,12 @@ if not upscaler_target.is_file():
         upscaler_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(got, upscaler_target)
 PY
+else
+  echo "[model] HuggingFace 不可达（或 H3_MODEL_SOURCE=modelscope），改走魔搭镜像仓 ${MS_REPO:-Comfy-Org/MiniMax-H3}"
+  MODEL_ROOT="${MODEL_ROOT}" WORK_DIR="${WORK_DIR}" COMFY_DIR="${COMFY_DIR}" WITH_UPSCALER=1 \
+    bash "${SCRIPT_REPO}/train/fetch_models_modelscope.sh" \
+      --model-root "${MODEL_ROOT}" --work-dir "${WORK_DIR}" --comfy "${COMFY_DIR}"
+fi
 
 echo "=================================================================="
 echo "[5/6] 软链模型至 ComfyUI/models 各子目录 ..."
