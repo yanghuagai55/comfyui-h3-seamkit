@@ -109,7 +109,7 @@ def compute_motion_peak_qa(vae, video_latent: torch.Tensor) -> dict:
     )
     global_lap = float(np.var(lap))
 
-    # 按 32×32 块选取运动能量最高的前 25% 区域计算 LapVar（避免暗色静止背景拉低动作主体锐度评分）
+    # 按 32×32 块选取运动能量最高的前 25% 区域计算 LapVar 与 Tenengrad（避免暗色静止背景拉低动作主体锐度评分）
     lh, lw = lap.shape
     bh, bw = max(1, lh // 32), max(1, lw // 32)
     crop_h, crop_w = bh * 32, bw * 32
@@ -120,12 +120,37 @@ def compute_motion_peak_qa(vae, video_latent: torch.Tensor) -> dict:
     roi_pixels = lap_blocks.transpose(0, 2, 1, 3)[mask]
     motion_roi_lap = float(np.var(roi_pixels)) if roi_pixels.size > 0 else global_lap
 
+    gx = gray[1:-1, 2:] - gray[1:-1, :-2]
+    gy = gray[2:, 1:-1] - gray[:-2, 1:-1]
+    ten_map = gx * gx + gy * gy
+    ten_blocks = ten_map[:crop_h, :crop_w].reshape(bh, 32, bw, 32)
+    roi_ten = ten_blocks.transpose(0, 2, 1, 3)[mask]
+    motion_roi_tenengrad = float(np.mean(roi_ten)) if roi_ten.size > 0 else float(np.mean(ten_map))
+
+    if n_f >= 3:
+        med_f_diff = float(np.median(f_diffs))
+        temporal_flicker_ratio = float(np.max(f_diffs) / max(med_f_diff, 1e-4))
+        df0 = (arr[1:-1].astype(np.float32) - arr[:-2].astype(np.float32)).reshape(n_f - 2, -1)
+        df1 = (arr[2:].astype(np.float32) - arr[1:-1].astype(np.float32)).reshape(n_f - 2, -1)
+        num = np.sum(df0 * df1, axis=-1)
+        den = np.linalg.norm(df0, axis=-1) * np.linalg.norm(df1, axis=-1) + 1e-6
+        flow_consistency_cos = float(np.mean(num / den))
+    elif n_f == 2:
+        temporal_flicker_ratio = 1.0
+        flow_consistency_cos = 1.0
+    else:
+        temporal_flicker_ratio = 1.0
+        flow_consistency_cos = 1.0
+
     return {
         "peak_latent_t": peak_t,
         "window_latents": [t0, t1],
         "peak_local_frame": best_f,
         "global_lap": round(global_lap, 2),
         "motion_roi_lap": round(motion_roi_lap, 2),
+        "motion_roi_tenengrad": round(motion_roi_tenengrad, 2),
+        "temporal_flicker_ratio": round(temporal_flicker_ratio, 4),
+        "flow_consistency_cos": round(flow_consistency_cos, 4),
         "max_block_diff": round(float(diff_crop.max()), 2),
     }
 

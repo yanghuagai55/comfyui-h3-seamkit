@@ -36,6 +36,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_TRAIN_DIR = Path(__file__).resolve().parent
+if str(_TRAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_TRAIN_DIR))
+
+from triton_block_sparse_attn import (  # noqa: E402
+    TritonBlockSparsePlan,
+    build_csr_csc_block_tables,
+    triton_block_sparse_attn,
+    triton_bs_available,
+)
+
 LORA_TARGETS = ("qkv_proj", "out_proj", "fc1", "fc2")
 ATTN_TARGETS = ("qkv_proj", "out_proj")
 DEFAULT_TOKEN_FILE = "/content/work/hftoken.txt"
@@ -83,6 +94,8 @@ class LoRALayer(nn.Module):
         self.B = nn.Parameter(torch.zeros(out_f, self.rank))
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
         self.scale = float(self.rank if alpha is None else alpha) / float(self.rank)
+        self._orth_r_old: int = 0
+        self._orth_a0_hat: torch.Tensor | None = None
 
     def delta(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(F.linear(x, self.A.to(x.dtype)), self.B.to(x.dtype)) * self.scale
@@ -159,6 +172,137 @@ def _spatial_grad_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 0.5 * (F.l1_loss(dx_p, dx_t) + F.l1_loss(dy_p, dy_t))
 
 
+def _temporal_vel_jacobian_l1(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    m_mot: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """跨帧速度场一阶时间差分雅可比 L1 损失: || M_mot ⊙ (Δ_t v_θ - Δ_t v*) ||_1（专治高速动作肢体反折/断剑瞬移）。"""
+    if pred.ndim != 5 or int(pred.shape[2]) < 2:
+        return pred.float().sum() * 0.0
+    pf = pred.float()
+    tf = target.float()
+    dt_p = pf[:, :, 1:] - pf[:, :, :-1]
+    dt_t = tf[:, :, 1:] - tf[:, :, :-1]
+    diff = (dt_p - dt_t).abs()
+    if m_mot is not None:
+        mf = m_mot.float()
+        if int(mf.shape[2]) == int(pred.shape[2]):
+            mf = torch.maximum(mf[:, :, :-1], mf[:, :, 1:])
+        diff = diff * mf
+    return diff.mean()
+
+
+def _iter_lora_modules(dm):
+    """遍历主干 `blocks` 与可选 `token_refiner.blocks` 上的全部已挂载 `(key, LoRALayer)`。"""
+    for i, blk in enumerate(getattr(dm, "blocks", ())):
+        for name in LORA_TARGETS:
+            is_attn = name in ATTN_TARGETS
+            owner = blk.attn if is_attn else blk.mlp
+            lora = getattr(getattr(owner, name, None), "_train_lora", None)
+            if lora is not None:
+                yield f"blocks.{i}.{'attn' if is_attn else 'mlp'}.{name}", lora
+    tr = getattr(dm, "token_refiner", None)
+    if tr is not None and hasattr(tr, "blocks"):
+        for i, blk in enumerate(tr.blocks):
+            for name in LORA_TARGETS:
+                is_attn = name in ATTN_TARGETS
+                owner = blk.attn if is_attn else blk.mlp
+                lora = getattr(getattr(owner, name, None), "_train_lora", None)
+                if lora is not None:
+                    yield f"token_refiner.blocks.{i}.{'attn' if is_attn else 'mlp'}.{name}", lora
+
+
+def compute_graviton_orth_loss(dm) -> torch.Tensor:
+    """Graviton 谱正交扩秩正则: mean_l || A_new @ A0_hat^T ||_F^2（锁死旧结构基底、正交展开新二次元秩）。"""
+    terms: list[torch.Tensor] = []
+    dev = None
+    for _, lora in _iter_lora_modules(dm):
+        dev = lora.A.device
+        r_old = int(getattr(lora, "_orth_r_old", 0) or 0)
+        a0_hat = getattr(lora, "_orth_a0_hat", None)
+        if a0_hat is not None and 0 < r_old < int(lora.A.shape[0]):
+            a_new = lora.A[r_old:].float()
+            a0 = a0_hat.to(device=a_new.device, dtype=torch.float32)
+            terms.append((a_new @ a0.transpose(0, 1)).pow(2).sum())
+    if not terms:
+        return torch.zeros((), device=dev if dev is not None else "cpu", dtype=torch.float32)
+    return torch.stack(terms).mean()
+
+
+class LoRAEMA:
+    """零显存开销的 CPU FP32 指数滑动平均权重（导出 `*_ema.safetensors` 并随断点持久化）。"""
+
+    def __init__(self, dm, decay: float = 0.995):
+        self.decay = float(decay)
+        self.num_updates = 0
+        self.shadow: dict[str, dict] = {}
+        self.reset_from_model(dm)
+
+    def reset_from_model(self, dm) -> None:
+        self.shadow = {}
+        for key, lora in _iter_lora_modules(dm):
+            self.shadow[key] = {
+                "A": lora.A.detach().to(device="cpu", dtype=torch.float32).clone(),
+                "B": lora.B.detach().to(device="cpu", dtype=torch.float32).clone(),
+                "scale": float(lora.scale),
+            }
+
+    @torch.no_grad()
+    def update(self, dm) -> None:
+        d = self.decay
+        one_minus_d = 1.0 - d
+        self.num_updates += 1
+        for key, lora in _iter_lora_modules(dm):
+            a_cur = lora.A.detach().to(device="cpu", dtype=torch.float32)
+            b_cur = lora.B.detach().to(device="cpu", dtype=torch.float32)
+            entry = self.shadow.get(key)
+            if entry is None or entry["A"].shape != a_cur.shape or entry["B"].shape != b_cur.shape:
+                self.shadow[key] = {"A": a_cur.clone(), "B": b_cur.clone(), "scale": float(lora.scale)}
+            else:
+                entry["A"].mul_(d).add_(a_cur, alpha=one_minus_d)
+                entry["B"].mul_(d).add_(b_cur, alpha=one_minus_d)
+                entry["scale"] = float(lora.scale)
+
+    def lora_dict(self) -> dict[str, dict]:
+        return {
+            k: {"A": v["A"], "B": v["B"], "scale": float(v["scale"])}
+            for k, v in self.shadow.items()
+        }
+
+    def state_dict(self) -> dict:
+        return {
+            "decay": self.decay,
+            "num_updates": self.num_updates,
+            "shadow": {
+                k: {"A": v["A"].clone(), "B": v["B"].clone(), "scale": float(v["scale"])}
+                for k, v in self.shadow.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict, dm=None) -> None:
+        if not state:
+            return
+        self.num_updates = int(state.get("num_updates", 0))
+        src_shadow = state.get("shadow") or {}
+        for k, v in src_shadow.items():
+            if k in self.shadow:
+                a_s = v["A"].to(device="cpu", dtype=torch.float32)
+                b_s = v["B"].to(device="cpu", dtype=torch.float32)
+                dst = self.shadow[k]
+                if a_s.shape == dst["A"].shape and b_s.shape == dst["B"].shape:
+                    dst["A"].copy_(a_s)
+                    dst["B"].copy_(b_s)
+                    dst["scale"] = float(v.get("scale", 1.0))
+                elif a_s.shape[0] < dst["A"].shape[0] and dm is not None:
+                    r_old = int(a_s.shape[0])
+                    s_old = float(v.get("scale", 1.0))
+                    dst["A"][:r_old].copy_(a_s * s_old)
+                    dst["B"].zero_()
+                    dst["B"][:, :r_old].copy_(b_s)
+                    dst["scale"] = 1.0
+
+
 def _parse_blocks(spec: str, n: int) -> list[int]:
     if not spec.strip():
         return list(range(n))
@@ -175,12 +319,68 @@ def _parse_blocks(spec: str, n: int) -> list[int]:
     return sorted(i for i in out if 0 <= i < n)
 
 
+def attach_token_refiner_lora(dm, rank_refiner: int = 32) -> list[nn.Parameter]:
+    """为 `dm.token_refiner.blocks.{0,1}` 附加 8 个纯线性 LoRA 层（构成完整 208 层），并改为非原地残差。"""
+    tr = getattr(dm, "token_refiner", None)
+    if tr is None or not hasattr(tr, "blocks"):
+        return []
+    r_tr = max(1, int(rank_refiner))
+    tr_params: list[nn.Parameter] = []
+
+    def _tr_mlp_fwd(self_mlp, x):
+        g = _lora_linear(self_mlp.fc1, x)
+        gate, up = g.chunk(2, dim=-1)
+        return _lora_linear(self_mlp.fc2, F.silu(gate) * up)
+
+    def _tr_attn_fwd(self_attn, x, rope_freqs=None, transformer_options=None):
+        s = x.shape[0]
+        heads = self_attn.heads
+        hd = self_attn.head_dim
+        inner = heads * hd
+        q, k, v = _lora_linear(self_attn.qkv_proj, x).split(inner, dim=-1)
+        q = _rms_norm(
+            q.view(s, heads, hd),
+            self_attn.q_norm.weight,
+            float(self_attn.q_norm.eps) if self_attn.q_norm.eps is not None else 1e-6,
+        )
+        k = _rms_norm(
+            k.view(s, heads, hd),
+            self_attn.k_norm.weight,
+            float(self_attn.k_norm.eps) if self_attn.k_norm.eps is not None else 1e-6,
+        )
+        v = v.view(s, heads, hd)
+        q_b = q.unsqueeze(0).transpose(1, 2)
+        k_b = k.unsqueeze(0).transpose(1, 2)
+        v_b = v.unsqueeze(0).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q_b, k_b, v_b, dropout_p=0.0, is_causal=False)
+        return _lora_linear(self_attn.out_proj, out.transpose(1, 2).squeeze(0).contiguous().view(s, inner))
+
+    def _tr_blk_fwd(self_blk, x, transformer_options=None):
+        to = {} if transformer_options is None else transformer_options
+        x = self_blk.attn(self_blk.norm1(x), transformer_options=to) + x
+        return self_blk.mlp(self_blk.norm2(x)) + x
+
+    for blk in tr.blocks:
+        for name in LORA_TARGETS:
+            is_attn = name in ATTN_TARGETS
+            lin = getattr(blk.attn if is_attn else blk.mlp, name)
+            lora = LoRALayer(lin.weight.shape[0], lin.weight.shape[1], r_tr).to(lin.weight.device)
+            lin._train_lora = lora
+            tr_params.extend(lora.parameters())
+        blk.mlp.forward = types.MethodType(_tr_mlp_fwd, blk.mlp)
+        blk.attn.forward = types.MethodType(_tr_attn_fwd, blk.attn)
+        blk.forward = types.MethodType(_tr_blk_fwd, blk)
+    return tr_params
+
+
 def attach_lora(
     dm,
     rank: int,
     blocks_spec: str = "",
     rank_attn: int = 0,
     rank_mlp: int = 0,
+    train_refiner: bool = False,
+    rank_refiner: int = 32,
 ) -> list[nn.Parameter]:
     r_attn = int(rank_attn) if int(rank_attn) > 0 else int(rank)
     r_mlp = int(rank_mlp) if int(rank_mlp) > 0 else int(rank)
@@ -203,6 +403,10 @@ def attach_lora(
 
     for blk in dm.blocks:
         blk.mlp.forward = types.MethodType(_mlp_forward, blk.mlp)
+
+    if train_refiner:
+        r_ref = int(rank_refiner) if int(rank_refiner) > 0 else int(rank)
+        params.extend(attach_token_refiner_lora(dm, rank_refiner=r_ref))
     return params
 
 
@@ -222,31 +426,45 @@ class _GradClamp(torch.autograd.Function):
         return grad, None
 
 
-def lora_state(dm) -> dict[str, dict[str, torch.Tensor]]:
+def lora_state(dm) -> dict[str, dict]:
     out = {}
-    for i, blk in enumerate(dm.blocks):
-        for name in LORA_TARGETS:
-            owner = blk.attn if name in ATTN_TARGETS else blk.mlp
-            lin = getattr(owner, name)
-            lora = getattr(lin, "_train_lora", None)
-            if lora is not None:
-                out[f"blocks.{i}.{'attn' if name in ATTN_TARGETS else 'mlp'}.{name}"] = {
-                    "A": lora.A.detach().cpu(),
-                    "B": lora.B.detach().cpu(),
-                    "scale": float(lora.scale),
-                }
+    for key, lora in _iter_lora_modules(dm):
+        entry = {
+            "A": lora.A.detach().cpu(),
+            "B": lora.B.detach().cpu(),
+            "scale": float(lora.scale),
+        }
+        if getattr(lora, "_orth_a0_hat", None) is not None and int(getattr(lora, "_orth_r_old", 0)) > 0:
+            entry["orth_r_old"] = int(lora._orth_r_old)
+            entry["orth_a0_hat"] = lora._orth_a0_hat.detach().cpu()
+        out[key] = entry
     return out
 
 
+def _resolve_target_lora(dm, key: str) -> LoRALayer | None:
+    parts = key.split(".")
+    if len(parts) == 4 and parts[0] == "blocks" and parts[1].isdigit():
+        idx = int(parts[1])
+        if 0 <= idx < len(dm.blocks) and parts[2] in ("attn", "mlp"):
+            owner = dm.blocks[idx].attn if parts[2] == "attn" else dm.blocks[idx].mlp
+            lin = getattr(owner, parts[3], None)
+            return getattr(lin, "_train_lora", None) if lin is not None else None
+    if len(parts) == 5 and parts[0] == "token_refiner" and parts[1] == "blocks" and parts[2].isdigit():
+        tr = getattr(dm, "token_refiner", None)
+        idx = int(parts[2])
+        if tr is not None and hasattr(tr, "blocks") and 0 <= idx < len(tr.blocks) and parts[3] in ("attn", "mlp"):
+            owner = tr.blocks[idx].attn if parts[3] == "attn" else tr.blocks[idx].mlp
+            lin = getattr(owner, parts[4], None)
+            return getattr(lin, "_train_lora", None) if lin is not None else None
+    return None
+
+
 def load_lora_state(dm, state: dict) -> tuple[int, int]:
-    """加载 LoRA 权重；当目标层 rank > 源权重 rank 时执行逐位等价无损扩秩热启动。"""
+    """加载 LoRA 权重；当目标层 rank > 源权重 rank 时执行逐位等价无损扩秩热启动并锁定 Graviton 正交基 A0_hat。"""
     exact_cnt = 0
     expanded_cnt = 0
     for key, val in state.items():
-        parts = key.split(".")
-        blk = dm.blocks[int(parts[1])]
-        owner = blk.attn if parts[2] == "attn" else blk.mlp
-        lora = getattr(getattr(owner, parts[3]), "_train_lora", None)
+        lora = _resolve_target_lora(dm, key)
         if lora is None:
             continue
         a_src = val["A"].to(device=lora.A.device, dtype=torch.float32)
@@ -258,14 +476,21 @@ def load_lora_state(dm, state: dict) -> tuple[int, int]:
             lora.A.data.copy_(a_src.to(lora.A.dtype))
             lora.B.data.copy_(b_src.to(lora.B.dtype))
             lora.scale = src_scale
+            if val.get("orth_a0_hat") is not None and int(val.get("orth_r_old", 0)) > 0:
+                lora._orth_r_old = int(val["orth_r_old"])
+                lora._orth_a0_hat = val["orth_a0_hat"].to(device=lora.A.device, dtype=torch.float32)
             exact_cnt += 1
         elif r_old < r_new:
             # 无损扩秩：前 r_old 秩吸收 src_scale 后与原模型 step=0 100% 等价；
-            # 后 (r_new - r_old) 秩保持 A=Kaiming、B=0，step=1 反向立即获得非零梯度！
+            # 后 (r_new - r_old) 秩保持 A=Kaiming、B=0，并冻结单位化 A0_hat 供 Graviton 正交正则使用！
             lora.A.data[:r_old].copy_((a_src * src_scale).to(lora.A.dtype))
             lora.B.data.zero_()
             lora.B.data[:, :r_old].copy_(b_src.to(lora.B.dtype))
             lora.scale = 1.0
+            lora._orth_r_old = r_old
+            lora._orth_a0_hat = F.normalize(a_src.detach().float(), p=2, dim=-1).to(
+                device=lora.A.device, dtype=torch.float32
+            )
             expanded_cnt += 1
         else:
             # 截断降秩兜底（SVD 取前 r_new 主奇异方向）
@@ -354,9 +579,22 @@ def _flex_fn():
 
 def resolve_attn_backend(spec: str) -> str:
     s = (spec or "auto").strip().lower()
+    if s == "triton_bs":
+        if triton_bs_available():
+            return "triton_bs"
+        print("[attn] triton_bs 不可用，自动回退至 sdpa_mask", flush=True)
+        return "sdpa_mask"
     if s in ("flex", "sdpa_mask"):
         return s
-    return "sdpa_mask" if _is_rocm() else "flex"
+    # auto: ROCm 优先选 Phase 2B Zero-Gather triton_bs，CUDA 优先选 flex（带干净兜底）
+    if _is_rocm():
+        return "triton_bs" if triton_bs_available() else "sdpa_mask"
+    try:
+        from torch.nn.attention import flex_attention as _fa  # noqa: F401
+
+        return "flex"
+    except Exception:
+        return "triton_bs" if triton_bs_available() else "sdpa_mask"
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -414,13 +652,16 @@ def _make_attn_forward(head_dim: int, attn_temp: float):
             k = _permute_bhsd_video(k, m_va, m_vb, m_perm)
             v = _permute_bhsd_video(v, m_va, m_vb, m_perm)
 
+        tbs = to.get("_h3_triton_bs")
         bm = to.get("_h3_block_mask")
         sdpa_mask = to.get("_h3_sdpa_mask")
-        if bm is not None:
+        if tbs is not None:
+            out = triton_block_sparse_attn(q, k, v, tbs, scale=scale)
+        elif bm is not None:
             try:
                 out = _flex_fn()(q, k, v, block_mask=bm, scale=scale)
             except Exception as exc:
-                raise RuntimeError(f"flex_attention 执行失败（可加 --attn-backend sdpa_mask 切换）: {exc}") from exc
+                raise RuntimeError(f"flex_attention 执行失败（可加 --attn-backend triton_bs 或 sdpa_mask 切换）: {exc}") from exc
         elif sdpa_mask is not None:
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=sdpa_mask, dropout_p=0.0, is_causal=False, scale=scale
@@ -602,15 +843,23 @@ def build_sparse_mask(
     h_ref: torch.Tensor | None = None,
     jitter: float = 0.05,
 ):
-    """按 backend 生成 `BlockMask`（CUDA flex）或 `[1, 1, S, S]` bool 掩码（ROCm/通用 sdpa_mask）。"""
+    """按 backend 生成 `TritonBlockSparsePlan` (`triton_bs`)、`BlockMask` (`flex`) 或 `[1,1,S,S]` bool 掩码 (`sdpa_mask`)。"""
     sel = _select_sparse_blocks(g, topk_ratio, topk_max_ratio, device, h_ref=h_ref, jitter=jitter)
 
     # 注意：keep 的 padding 文本位全部落在 `< va`，不受视频区间 Morton 重排影响
+    if backend == "triton_bs":
+        with torch.no_grad():
+            keep_slice = keep[:g.S].to(device=device, dtype=torch.bool).contiguous() if keep is not None else None
+            tables = build_csr_csc_block_tables(sel, keep_slice, block_size=g.block)
+        return TritonBlockSparsePlan(tables=tables, keep_kv=keep_slice, block_size=g.block, seq_len=g.S)
+
     if backend == "sdpa_mask":
         with torch.no_grad():
             tok_mask = sel.repeat_interleave(g.block, dim=0).repeat_interleave(g.block, dim=1)
             tok_mask = tok_mask[:g.S, :g.S] & keep[None, :g.S]
-            tok_mask.diagonal().fill_(True)
+            empty_rows = ~tok_mask.any(dim=-1)
+            if empty_rows.any():
+                tok_mask.diagonal()[empty_rows] = True
         return tok_mask.unsqueeze(0).unsqueeze(0)
 
     from torch.nn.attention.flex_attention import BlockMask
@@ -688,7 +937,9 @@ def patch_run_blocks(dm, h3, cfg: dict):
                 mask_obj = None
 
             if mask_obj is not None:
-                if backend == "sdpa_mask":
+                if backend == "triton_bs":
+                    step_to["_h3_triton_bs"] = mask_obj
+                elif backend == "sdpa_mask":
                     step_to["_h3_sdpa_mask"] = mask_obj
                 else:
                     step_to["_h3_block_mask"] = mask_obj
@@ -876,6 +1127,10 @@ def main() -> int:
     ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--rank-attn", type=int, default=0, help="Attention 层独立 rank（0=沿用 --rank；v3 推荐 64）")
     ap.add_argument("--rank-mlp", type=int, default=0, help="MLP 层独立 rank（0=沿用 --rank；v3 推荐 32）")
+    ap.add_argument("--train-refiner", action="store_true",
+                    help="同时训练 token_refiner.blocks.{0,1} 的 8 个线性层（构成完整 208 层）")
+    ap.add_argument("--rank-refiner", type=int, default=32,
+                    help="TokenRefiner 8 层的 LoRA rank（默认 32）")
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--sigma-min", type=float, default=0.14)
     ap.add_argument("--sigma-max", type=float, default=0.75)
@@ -888,8 +1143,8 @@ def main() -> int:
     ap.add_argument("--topk-max", type=float, default=0.30)
     ap.add_argument("--block-size", type=int, default=64, help="稀疏块大小（默认 64，对齐 4060 Sol-Attn 8x8 Morton 块）")
     ap.add_argument("--neighbors", type=int, default=2)
-    ap.add_argument("--attn-backend", choices=["auto", "flex", "sdpa_mask"], default="auto",
-                    help="稀疏注意力训练后端（auto 在 AMD ROCm 下自动选 sdpa_mask，CUDA 下选 flex）")
+    ap.add_argument("--attn-backend", choices=["auto", "flex", "triton_bs", "sdpa_mask"], default="auto",
+                    help="稀疏注意力训练后端（auto 在 AMD ROCm 下优先选 triton_bs，CUDA 下选 flex）")
     ap.add_argument("--audio-weight", type=float, default=0.1)
     ap.add_argument("--lf-base-anchor", action="store_true",
                     help="开启高低频解耦去油目标（配合 --motion-gate-tau 实现静处去油、动处重塑轮廓）")
@@ -898,6 +1153,14 @@ def main() -> int:
                     help="运动门控阈值（>0 时在高速运动区放开低频向满血教师对齐；0=退回 v2 全图锁低频）")
     ap.add_argument("--grad-xy-weight", type=float, default=0.15,
                     help="潜空间一阶空间梯度 L1 损失权重（抑制大动作边缘发糊；0=关闭）")
+    ap.add_argument("--vel-t-weight", type=float, default=0.20,
+                    help="跨帧运动速度雅可比 L1 损失权重 λ_t（根治旋身/交锋肢体错位与闪烁；0=关闭）")
+    ap.add_argument("--orth-weight", type=float, default=0.02,
+                    help="Graviton 谱正交扩秩正则权重 λ_orth（惩罚 ||A_new @ A0_hat^T||_F^2；0=关闭）")
+    ap.add_argument("--grad-accum", type=int, default=1,
+                    help="梯度累积微步数（等效放大 batch 至 2~4 且零额外激活显存）")
+    ap.add_argument("--ema-decay", type=float, default=0.995,
+                    help="CPU FP32 影子 EMA 衰减率（推荐 0.995 导出 *_ema.safetensors；<=0 关闭）")
     ap.add_argument("--action-boost", type=float, default=2.5,
                     help="混训时对 sakuga*/act_* 高动态样本的抽样倍率加权（默认 2.5）")
     ap.add_argument("--dense", action="store_true", help="关闭稀疏（稠密 SDPA 对照）")
@@ -934,11 +1197,21 @@ def main() -> int:
     eff_backend = resolve_attn_backend(args.attn_backend)
     r_attn = args.rank_attn if args.rank_attn > 0 else args.rank
     r_mlp = args.rank_mlp if args.rank_mlp > 0 else args.rank
+    r_refiner = args.rank_refiner if args.rank_refiner > 0 else args.rank
+    grad_accum = max(1, int(args.grad_accum))
 
     mm, comfy_sd, h3 = bootstrap(args.comfy)
     patch_out_of_place(h3)
     dm = load_dm(comfy_sd, args.base, device)
-    params = attach_lora(dm, args.rank, args.blocks, rank_attn=r_attn, rank_mlp=r_mlp)
+    params = attach_lora(
+        dm,
+        args.rank,
+        args.blocks,
+        rank_attn=r_attn,
+        rank_mlp=r_mlp,
+        train_refiner=bool(args.train_refiner),
+        rank_refiner=r_refiner,
+    )
     patch_attention(dm, {"attn_temp": args.attn_temp})
     cfg = {
         "rope_hf": args.rope_hf,
@@ -955,7 +1228,9 @@ def main() -> int:
         args.lf_kernel += 1
     print(
         f"[init] backend={eff_backend} rocm={_is_rocm()} block_size={args.block_size} "
-        f"lora_params={sum(p.numel() for p in params) / 1e6:.1f}M rank_attn={r_attn} rank_mlp={r_mlp}",
+        f"lora_layers={len(params) // 2} ({sum(p.numel() for p in params) / 1e6:.1f}M params) "
+        f"rank_attn={r_attn} rank_mlp={r_mlp} refiner={bool(args.train_refiner)}(r={r_refiner}) "
+        f"grad_accum={grad_accum} ema={args.ema_decay}",
         flush=True,
     )
     if args.lf_base_anchor:
@@ -1094,6 +1369,13 @@ def main() -> int:
             ex_c, exp_c = load_lora_state(dm, ck["lora"])
             print(f"[init] warm-start from {init_path.name}: exact={ex_c} rank_expanded={exp_c} (step=0)", flush=True)
 
+    # 初始化 CPU FP32 EMA 影子权重（热启动后与模型一致，或从断点 ck["ema"] 无损恢复）
+    ema: LoRAEMA | None = LoRAEMA(dm, decay=float(args.ema_decay)) if float(args.ema_decay) > 0.0 else None
+    if ema is not None and resume_file is not None and Path(resume_file).is_file():
+        if ck.get("ema") is not None:
+            ema.load_state_dict(ck["ema"], dm=dm)
+            print(f"[init] EMA shadow restored (decay={ema.decay}, updates={ema.num_updates})", flush=True)
+
     # 强制同步最新 --lr 与最新总终点 --steps（彻底根治跨日接力续训时旧 scheduler 覆写新 lr/终点问题！）
     for pg in opt.param_groups:
         pg["lr"] = float(args.lr)
@@ -1142,6 +1424,8 @@ def main() -> int:
             "step": str(cur_step),
             "rank_attn": str(r_attn),
             "rank_mlp": str(r_mlp),
+            "rank_refiner": str(r_refiner if args.train_refiner else 0),
+            "layers": str(len(lora)),
         })
         tmp.replace(path)
 
@@ -1150,6 +1434,7 @@ def main() -> int:
         state = {
             "step": step,
             "lora": lora,
+            "ema": ema.state_dict() if ema is not None else None,
             "optim": opt.state_dict(),
             "sched": sched.state_dict(),
             "rng": {
@@ -1164,9 +1449,17 @@ def main() -> int:
         step_safe = out_dir / "steps" / f"step_{step:06d}.safetensors"
         step_safe.parent.mkdir(parents=True, exist_ok=True)
         _export_safetensors(lora, step_safe, step)
-        print(f"[ckpt] step {step} -> {resume_path.name} + {step_safe.name}", flush=True)
+        ema_msg = ""
+        step_ema_safe = None
+        if ema is not None:
+            step_ema_safe = out_dir / "steps" / f"step_{step:06d}_ema.safetensors"
+            _export_safetensors(ema.lora_dict(), step_ema_safe, step)
+            ema_msg = f" + {step_ema_safe.name}"
+        print(f"[ckpt] step {step} -> {resume_path.name} + {step_safe.name}{ema_msg}", flush=True)
         if uploader is not None:
             uploader.submit(step_safe, f"{args.hf_prefix}/steps/{step_safe.name}")
+            if step_ema_safe is not None:
+                uploader.submit(step_ema_safe, f"{args.hf_prefix}/steps/{step_ema_safe.name}")
             uploader.submit(resume_path, f"{args.hf_prefix}/resume/latest_state.pt")
             uploader.submit(metrics_path, f"{args.hf_prefix}/logs/metrics.jsonl")
 
@@ -1186,89 +1479,131 @@ def main() -> int:
     t_start = time.time()
 
     for step in range(start_step, args.steps):
-        if step - start_step < len(keys):
-            cur_key = keys[(step - start_step) % len(keys)]
-        else:
-            cur_key = random.choices(keys, weights=key_weights, k=1)[0]
-        group = plan_groups[cur_key]
-        rec = random.choices(group.records, weights=rec_weights_by_key[cur_key], k=1)[0]
+        opt.zero_grad(set_to_none=True)
 
-        if args.phase == "B" and sigmas_fixed:
-            sigma = random.choice(sigmas_fixed)
-        elif args.anchor_prob > 0.0 and sigmas_fixed and random.random() < args.anchor_prob:
-            sigma = random.choice(sigmas_fixed)
-        else:
-            sigma = random.uniform(args.sigma_min, args.sigma_max)
-        sigma_a = h3.time_shift_sigma(sigma, 12.0, 3.0) if hasattr(h3, "time_shift_sigma") else sigma
-        batch = build_batch(rec, group, sigma, sigma_a, device, gen)
-
-        layout = group.layout
-        old_pos = layout.position_ids
-        layout.position_ids = batch["pos"]
-        base_v = None
-        try:
-            with torch.no_grad():
-                context = dm.preprocess_text_embeds(batch["text"])
-            cfg["topk"] = random.uniform(args.topk_min, args.topk_max)
-            t_vec = torch.tensor([sigma * 1000.0], device=device)
-            saved_bm = None
-            if args.lf_base_anchor:
-                with _disable_lora(), torch.no_grad():
-                    to_base = {"_h3_plan": group, "_h3_keep_kv": batch["keep"], "_h3_save_bm": True}
-                    out_base = dm(batch["x"], t_vec, context,
-                                  transformer_options=to_base, minimax_payload=batch["payload"])
-                    base_v = out_base[0].detach().float()
-                    saved_bm = to_base.get("_h3_saved_bm")
-                    del out_base
-            to = {"_h3_plan": group, "_h3_keep_kv": batch["keep"]}
-            if saved_bm is not None:
-                to["_h3_prebuilt_mask"] = saved_bm
-            out = dm(batch["x"], t_vec, context,
-                     transformer_options=to, minimax_payload=batch["payload"])
-        finally:
-            layout.position_ids = old_pos
-
-        pred_v, pred_a = out[0], out[1]
-        pred_vf = pred_v.float()
-        tgt_v = batch["tgt"][0]
+        acc_loss = 0.0
+        acc_loss_v = 0.0
+        acc_loss_a = 0.0
         loss_lf_val = None
         loss_hf_val = None
         loss_grad_val = None
+        loss_vel_t_val = None
+        loss_orth_val = None
         mot_mean_val = None
+        last_sigma = 0.0
+        last_topk = 0.0
+        last_bucket = ""
+        last_sample = ""
 
-        if args.lf_base_anchor and base_v is not None:
-            lf_base = _spatial_lowpass(base_v, args.lf_kernel)
-            lf_tgt = _spatial_lowpass(tgt_v, args.lf_kernel)
-            hf_tgt = tgt_v - lf_tgt
-            tgt_static_clean = lf_base + hf_tgt
-            if args.motion_gate_tau > 0.0:
-                m_mot = _motion_gate_mask(batch["z_video"], args.motion_gate_tau)
-                mot_mean_val = float(m_mot.mean().item())
-                tgt_ref = (1.0 - m_mot) * tgt_static_clean + m_mot * tgt_v
+        for micro in range(grad_accum):
+            if step == start_step and micro == 0 and len(keys) > 0:
+                cur_key = keys[0]
+            elif step - start_step < len(keys) and micro == 0:
+                cur_key = keys[(step - start_step) % len(keys)]
             else:
-                tgt_ref = tgt_static_clean
-            loss_mse = F.mse_loss(pred_vf, tgt_ref)
-            with torch.no_grad():
-                lf_pred = _spatial_lowpass(pred_vf.detach(), args.lf_kernel)
-                loss_lf_val = float(F.mse_loss(lf_pred, lf_base))
-                loss_hf_val = float(F.mse_loss(pred_vf.detach() - lf_pred, hf_tgt))
-            del base_v, lf_base, lf_tgt, hf_tgt, tgt_static_clean
-        else:
-            tgt_ref = tgt_v
-            loss_mse = F.mse_loss(pred_vf, tgt_ref)
+                cur_key = random.choices(keys, weights=key_weights, k=1)[0]
+            group = plan_groups[cur_key]
+            rec = random.choices(group.records, weights=rec_weights_by_key[cur_key], k=1)[0]
 
-        if args.grad_xy_weight > 0.0:
-            loss_grad = _spatial_grad_l1(pred_vf, tgt_ref)
-            loss_grad_val = float(loss_grad.detach().item())
-            loss_v = loss_mse + float(args.grad_xy_weight) * loss_grad
-        else:
+            if args.phase == "B" and sigmas_fixed:
+                sigma = random.choice(sigmas_fixed)
+            elif args.anchor_prob > 0.0 and sigmas_fixed and random.random() < args.anchor_prob:
+                sigma = random.choice(sigmas_fixed)
+            else:
+                sigma = random.uniform(args.sigma_min, args.sigma_max)
+            sigma_a = h3.time_shift_sigma(sigma, 12.0, 3.0) if hasattr(h3, "time_shift_sigma") else sigma
+            batch = build_batch(rec, group, sigma, sigma_a, device, gen)
+
+            layout = group.layout
+            old_pos = layout.position_ids
+            layout.position_ids = batch["pos"]
+            base_v = None
+            try:
+                with _disable_lora(), torch.no_grad():
+                    ctx_base = dm.preprocess_text_embeds(batch["text"])
+                cfg["topk"] = random.uniform(args.topk_min, args.topk_max)
+                t_vec = torch.tensor([sigma * 1000.0], device=device)
+                saved_bm = None
+                if args.lf_base_anchor:
+                    with _disable_lora(), torch.no_grad():
+                        to_base = {"_h3_plan": group, "_h3_keep_kv": batch["keep"], "_h3_save_bm": True}
+                        out_base = dm(batch["x"], t_vec, ctx_base,
+                                      transformer_options=to_base, minimax_payload=batch["payload"])
+                        base_v = out_base[0].detach().float()
+                        saved_bm = to_base.get("_h3_saved_bm")
+                        del out_base
+                to = {"_h3_plan": group, "_h3_keep_kv": batch["keep"]}
+                if saved_bm is not None:
+                    to["_h3_prebuilt_mask"] = saved_bm
+                # --train-refiner 时传入原始 5120 维文本让梯度穿透 condition_proj + token_refiner.blocks.{0,1}
+                ctx_student = batch["text"] if args.train_refiner else ctx_base
+                out = dm(batch["x"], t_vec, ctx_student,
+                         transformer_options=to, minimax_payload=batch["payload"])
+            finally:
+                layout.position_ids = old_pos
+
+            pred_v, pred_a = out[0], out[1]
+            pred_vf = pred_v.float()
+            tgt_v = batch["tgt"][0]
+            m_mot = None
+
+            if args.lf_base_anchor and base_v is not None:
+                lf_base = _spatial_lowpass(base_v, args.lf_kernel)
+                lf_tgt = _spatial_lowpass(tgt_v, args.lf_kernel)
+                hf_tgt = tgt_v - lf_tgt
+                tgt_static_clean = lf_base + hf_tgt
+                if args.motion_gate_tau > 0.0:
+                    m_mot = _motion_gate_mask(batch["z_video"], args.motion_gate_tau)
+                    mot_mean_val = float(m_mot.mean().item())
+                    tgt_ref = (1.0 - m_mot) * tgt_static_clean + m_mot * tgt_v
+                else:
+                    tgt_ref = tgt_static_clean
+                loss_mse = F.mse_loss(pred_vf, tgt_ref)
+                with torch.no_grad():
+                    lf_pred = _spatial_lowpass(pred_vf.detach(), args.lf_kernel)
+                    loss_lf_val = float(F.mse_loss(lf_pred, lf_base))
+                    loss_hf_val = float(F.mse_loss(pred_vf.detach() - lf_pred, hf_tgt))
+                del base_v, lf_base, lf_tgt, hf_tgt, tgt_static_clean
+            else:
+                tgt_ref = tgt_v
+                loss_mse = F.mse_loss(pred_vf, tgt_ref)
+
             loss_v = loss_mse
+            if args.grad_xy_weight > 0.0:
+                loss_grad = _spatial_grad_l1(pred_vf, tgt_ref)
+                loss_grad_val = float(loss_grad.detach().item())
+                loss_v = loss_v + float(args.grad_xy_weight) * loss_grad
 
-        loss_a = F.mse_loss(pred_a.float(), batch["tgt"][1])
-        loss = loss_v + args.audio_weight * loss_a
+            if args.vel_t_weight > 0.0 and int(pred_vf.shape[2]) >= 2:
+                if m_mot is None:
+                    tau_eff = float(args.motion_gate_tau) if float(args.motion_gate_tau) > 0.0 else 0.35
+                    m_mot = _motion_gate_mask(batch["z_video"], tau_eff)
+                    mot_mean_val = float(m_mot.mean().item())
+                loss_vel_t = _temporal_vel_jacobian_l1(pred_vf, tgt_v, m_mot=m_mot)
+                loss_vel_t_val = float(loss_vel_t.detach().item())
+                loss_v = loss_v + float(args.vel_t_weight) * loss_vel_t
 
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
+            loss_a = F.mse_loss(pred_a.float(), batch["tgt"][1])
+            micro_loss = loss_v + args.audio_weight * loss_a
+
+            acc_loss += float(micro_loss.detach().item()) / grad_accum
+            acc_loss_v += float(loss_v.detach().item()) / grad_accum
+            acc_loss_a += float(loss_a.detach().item()) / grad_accum
+            last_sigma = sigma
+            last_topk = float(cfg["topk"])
+            last_bucket = cur_key.split("|")[0]
+            last_sample = rec["stem"]
+
+            (micro_loss / float(grad_accum)).backward()
+            del out, pred_v, pred_a, pred_vf, tgt_v, tgt_ref, m_mot, batch
+
+        if args.orth_weight > 0.0:
+            loss_orth = compute_graviton_orth_loss(dm)
+            loss_orth_val = float(loss_orth.detach().item())
+            if loss_orth.requires_grad:
+                (float(args.orth_weight) * loss_orth).backward()
+                acc_loss += float(args.orth_weight) * loss_orth_val
+
         if step in (start_step, start_step + 1):
             n_nz = sum(
                 1 for p in params
@@ -1290,17 +1625,20 @@ def main() -> int:
             continue
         opt.step()
         sched.step()
+        if ema is not None:
+            ema.update(dm)
 
         if (step + 1) % args.log_every == 0:
             rec_line = {
                 "step": step + 1,
-                "loss": round(float(loss), 5),
-                "loss_v": round(float(loss_v), 5),
-                "loss_a": round(float(loss_a), 5),
-                "sigma": round(sigma, 4),
-                "topk": round(float(cfg["topk"]), 3),
-                "bucket": cur_key.split("|")[0],
-                "sample": rec["stem"],
+                "loss": round(float(acc_loss), 5),
+                "loss_v": round(float(acc_loss_v), 5),
+                "loss_a": round(float(acc_loss_a), 5),
+                "sigma": round(last_sigma, 4),
+                "topk": round(last_topk, 3),
+                "grad_accum": grad_accum,
+                "bucket": last_bucket,
+                "sample": last_sample,
                 "lr": f"{sched.get_last_lr()[0]:.2e}",
                 "gn": round(float(gn), 4),
                 "sec": round((time.time() - t_start) / max(1, step + 1 - start_step), 2),
@@ -1311,6 +1649,10 @@ def main() -> int:
                 rec_line["loss_hf"] = round(loss_hf_val, 5)
             if loss_grad_val is not None:
                 rec_line["loss_grad_xy"] = round(loss_grad_val, 5)
+            if loss_vel_t_val is not None:
+                rec_line["loss_vel_t"] = round(loss_vel_t_val, 5)
+            if loss_orth_val is not None:
+                rec_line["loss_orth"] = round(loss_orth_val, 6)
             if mot_mean_val is not None:
                 rec_line["mot_gate"] = round(mot_mean_val, 3)
             with metrics_path.open("a", encoding="utf-8") as fh:

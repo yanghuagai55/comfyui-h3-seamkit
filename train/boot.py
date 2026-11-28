@@ -136,6 +136,8 @@ def main() -> int:
     ap.add_argument("--teacher-cfg", type=float, default=5.5)
     ap.add_argument("--zup-mode", choices=["hybrid", "real_pass1", "downsample"], default="hybrid")
     ap.add_argument("--min-motion-lapvar", type=float, default=75.0)
+    ap.add_argument("--best-of-k", type=int, default=1,
+                    help="Best-of-K 黄金教师门禁：每条提示词运行 K 个种子并严选运动学平滑+高速锐度最优 Top-1（推荐 3）")
     ap.add_argument("--train-out", default="/content/work/lora_run_v3")
     ap.add_argument("--api", default="http://127.0.0.1:8188")
     ap.add_argument("--deadline-utc", default="")
@@ -150,6 +152,8 @@ def main() -> int:
     ap.add_argument("--phase", choices=["A", "B"], default="A")
     ap.add_argument("--rank-attn", type=int, default=64)
     ap.add_argument("--rank-mlp", type=int, default=32)
+    ap.add_argument("--train-refiner", action="store_true", help="开启 TokenRefiner 8 层训练（完整 208 层）")
+    ap.add_argument("--rank-refiner", type=int, default=32)
     ap.add_argument("--lr", type=float, default=8e-5)
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--sigma-min", type=float, default=0.14)
@@ -161,9 +165,13 @@ def main() -> int:
     ap.add_argument("--lf-kernel", type=int, default=5)
     ap.add_argument("--motion-gate-tau", type=float, default=0.35)
     ap.add_argument("--grad-xy-weight", type=float, default=0.15)
+    ap.add_argument("--vel-t-weight", type=float, default=0.20)
+    ap.add_argument("--orth-weight", type=float, default=0.02)
+    ap.add_argument("--grad-accum", type=int, default=1)
+    ap.add_argument("--ema-decay", type=float, default=0.995)
     ap.add_argument("--action-boost", type=float, default=2.5)
     ap.add_argument("--optim", choices=["auto", "adamw", "adamw8bit"], default="auto")
-    ap.add_argument("--attn-backend", choices=["auto", "flex", "sdpa_mask"], default="auto")
+    ap.add_argument("--attn-backend", choices=["auto", "flex", "triton_bs", "sdpa_mask"], default="auto")
     ap.add_argument("--init-lora", default="")
     ap.add_argument("--init-lora-hf", default="")
     ap.add_argument("--save-every", type=int, default=50)
@@ -202,11 +210,17 @@ def main() -> int:
             "--sigmas", args.sigmas, "--anchor-prob", str(args.anchor_prob),
             "--motion-gate-tau", str(args.motion_gate_tau),
             "--grad-xy-weight", str(args.grad_xy_weight),
+            "--vel-t-weight", str(args.vel_t_weight),
+            "--orth-weight", str(args.orth_weight),
+            "--grad-accum", str(args.grad_accum),
+            "--ema-decay", str(args.ema_decay),
             "--action-boost", str(args.action_boost),
             "--optim", args.optim, "--attn-backend", args.attn_backend, "--block-size", "64",
             "--save-every", str(args.save_every), "--log-every", str(args.log_every),
             "--grad-clamp", str(args.grad_clamp), "--auto-resume",
         ]
+        if args.train_refiner:
+            cmd += ["--train-refiner", "--rank-refiner", str(args.rank_refiner)]
         if args.repo:
             cmd += ["--pull-shards", "--hf-repo", args.repo, "--hf-prefix", args.hf_prefix,
                     "--shard-prefix", shard_prefixes, "--token-file", args.token_file]
@@ -233,12 +247,17 @@ def main() -> int:
         "--video-vae", args.video_vae, "--audio-vae", args.audio_vae, "--upscaler", args.upscaler,
         "--steps", str(args.teacher_steps), "--cfg", str(args.teacher_cfg),
         "--zup-mode", args.zup_mode, "--min-motion-lapvar", str(args.min_motion_lapvar),
+        "--best-of-k", str(args.best_of_k),
         "--shard-size", str(args.shard_size), "--api", args.api,
         "--base", args.base, "--train-out", args.train_out, "--train-hf-prefix", args.hf_prefix,
         "--train-shard-prefixes", shard_prefixes, "--train-frames", args.frames,
         "--rank-attn", str(args.rank_attn), "--rank-mlp", str(args.rank_mlp),
+        "--vel-t-weight", str(args.vel_t_weight), "--orth-weight", str(args.orth_weight),
+        "--grad-accum", str(args.grad_accum), "--ema-decay", str(args.ema_decay),
         "--lr", str(args.lr), "--optim", args.optim, "--attn-backend", args.attn_backend,
     ]
+    if args.train_refiner:
+        cmd += ["--train-refiner", "--rank-refiner", str(args.rank_refiner)]
     if args.limit > 0:
         cmd += ["--limit", str(args.limit)]
     if args.init_lora:

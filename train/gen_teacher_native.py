@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import sys
 import time
@@ -79,7 +80,8 @@ def build_graph(sample: dict, args) -> dict:
     width_low, height_low = width // 2, height // 2  # 960×544 (exact 2x latent match: 60×34)
 
     eff_zup = resolve_zup_mode(getattr(args, "zup_mode", "downsample"), key)
-    enable_qa = float(getattr(args, "min_motion_lapvar", 0.0) or 0.0) > 0.0
+    best_of_k = max(1, int(getattr(args, "best_of_k", 1) or 1))
+    enable_qa = float(getattr(args, "min_motion_lapvar", 0.0) or 0.0) > 0.0 or best_of_k > 1
     pass1_sigmas = str(getattr(args, "pass1_sigmas", "0.68, 0.34, 0.0") or "0.68, 0.34, 0.0")
     pass1_cfg = float(getattr(args, "pass1_cfg", 3.0) or 3.0)
     zup_tmp_dir = str(getattr(args, "zup_tmp_dir", "/tmp/h3_zup_tmp") or "/tmp/h3_zup_tmp")
@@ -306,22 +308,167 @@ def expected(out_root: Path, key: str):
     return [out_root / f"{key}.z_native.pt", out_root / f"{key}.z_up.pt", out_root / f"{key}.cond.pt"]
 
 
+def score_teacher_kinematic_candidate(
+    z_video,
+    qa_data: dict | None = None,
+    min_motion_lapvar: float = 0.0,
+    max_flicker_ratio: float = 3.2,
+) -> dict:
+    """Evaluate a teacher candidate latent (& optional pixel QA) for Best-of-K selection.
+
+    Maximizes:
+      1. Kinematic smoothness (low 2nd-order temporal acceleration / jerk ratio + positive
+         frame-to-frame velocity directional cosine coherence -> anti-limb-flip / anti-teleport);
+      2. High-motion ROI edge sharpness (latent spatial Tenengrad in top-25% motion regions +
+         decoded pixel `motion_roi_lap` / `motion_roi_tenengrad` when available);
+    While strictly rejecting:
+      3. Temporal flicker spikes (`step_diff_max / step_diff_median > max_flicker_ratio` or
+         violent velocity reversal `accel_ratio > 1.75` or low-frequency color flash spikes).
+    """
+    import torch
+
+    zf = z_video.detach().float()
+    if zf.ndim == 4:
+        zf = zf.unsqueeze(0)
+    t_len = int(zf.shape[2])
+
+    if t_len >= 2:
+        vel = zf[:, :, 1:] - zf[:, :, :-1]  # [B, C, T-1, H, W]
+        step_l1 = vel.abs().mean(dim=(0, 1, 3, 4))  # [T-1]
+        mean_vel = float(step_l1.mean().item())
+        med_vel = float(step_l1.median().item())
+        max_vel = float(step_l1.max().item())
+        lat_flicker_ratio = max_vel / max(med_vel, 1e-5)
+
+        # Low-frequency spatial-mean conservation check (anti-exposure flash)
+        lf_frame = zf.mean(dim=(3, 4))  # [B, C, T]
+        lf_jump = float((lf_frame[:, :, 1:] - lf_frame[:, :, :-1]).abs().max().item())
+    else:
+        vel = torch.zeros_like(zf)
+        mean_vel = 0.0
+        lat_flicker_ratio = 1.0
+        lf_jump = 0.0
+
+    if t_len >= 3:
+        acc = vel[:, :, 1:] - vel[:, :, :-1]  # 2nd-order temporal difference z_{t+2} - 2 z_{t+1} + z_t
+        accel_l1 = float(acc.abs().mean().item())
+        accel_ratio = accel_l1 / max(mean_vel, 1e-5)
+
+        v0 = vel[:, :, :-1].reshape(vel.shape[2] - 1, -1)
+        v1 = vel[:, :, 1:].reshape(vel.shape[2] - 1, -1)
+        v_cos = float(((v0 * v1).sum(dim=-1) / (v0.norm(dim=-1) * v1.norm(dim=-1) + 1e-6)).mean().item())
+    else:
+        accel_ratio = 0.0
+        v_cos = 1.0
+
+    # Latent high-motion spatial Tenengrad edge energy (Gx^2 + Gy^2 weighted by motion ROI)
+    if zf.shape[-1] >= 3 and zf.shape[-2] >= 3:
+        gx = zf[:, :, :, 1:-1, 2:] - zf[:, :, :, 1:-1, :-2]
+        gy = zf[:, :, :, 2:, 1:-1] - zf[:, :, :, :-2, 1:-1]
+        ten_lat = (gx * gx + gy * gy).mean(dim=1)  # [B, T, H-2, W-2]
+        if t_len >= 2:
+            mot_map = vel.abs().mean(dim=1)[:, :, 1:-1, 1:-1]  # [B, T-1, H-2, W-2]
+            ten_mot_frames = 0.5 * (ten_lat[:, :-1] + ten_lat[:, 1:])
+            q75 = torch.quantile(mot_map.reshape(-1), 0.75)
+            roi_sel = mot_map >= q75
+            lat_tenengrad = float(ten_mot_frames[roi_sel].mean().item()) if bool(roi_sel.any()) else float(ten_lat.mean().item())
+        else:
+            lat_tenengrad = float(ten_lat.mean().item())
+    else:
+        lat_tenengrad = 0.0
+
+    qa = qa_data or {}
+    pix_lap = float(qa.get("motion_roi_lap", 0.0) or 0.0)
+    pix_ten = float(qa.get("motion_roi_tenengrad", 0.0) or 0.0)
+    pix_flicker = float(qa.get("temporal_flicker_ratio", 1.0) or 1.0)
+    pix_flow_cos = float(qa.get("flow_consistency_cos", v_cos) if "flow_consistency_cos" in qa else v_cos)
+
+    eff_flicker = max(lat_flicker_ratio, pix_flicker)
+    eff_flow_cos = 0.5 * (v_cos + pix_flow_cos)
+
+    is_flicker_spike = bool(
+        eff_flicker > float(max_flicker_ratio)
+        or accel_ratio > 1.75
+        or eff_flow_cos < -0.25
+        or lf_jump > 1.5
+    )
+    lap_ok = True if min_motion_lapvar <= 0.0 or pix_lap <= 0.0 else (pix_lap >= float(min_motion_lapvar))
+
+    # Smoothness in [0, ~1.5]: rewards low normalized jerk/accel and coherent velocity direction
+    kinematic_smoothness = max(0.0, 1.25 - 0.65 * accel_ratio) + 0.35 * eff_flow_cos
+
+    # Normalized sharpness bonus combining latent Tenengrad and decoded pixel sharpness
+    sharp_term = 0.35 * math.tanh(lat_tenengrad / 2.5)
+    if pix_lap > 0.0:
+        sharp_term += 0.45 * math.tanh(pix_lap / 160.0)
+    if pix_ten > 0.0:
+        sharp_term += 0.20 * math.tanh(pix_ten / 5000.0)
+
+    flicker_penalty = max(0.0, eff_flicker - 1.5) * 0.25 + max(0.0, lf_jump - 0.5) * 0.20
+    composite = kinematic_smoothness + sharp_term - flicker_penalty
+    if is_flicker_spike:
+        composite -= 5.0
+    if not lap_ok:
+        composite -= 2.0
+
+    return {
+        "composite_score": round(float(composite), 5),
+        "kinematic_smoothness": round(float(kinematic_smoothness), 5),
+        "accel_ratio": round(float(accel_ratio), 5),
+        "vel_cos": round(float(eff_flow_cos), 5),
+        "temporal_flicker_ratio": round(float(eff_flicker), 4),
+        "latent_motion_tenengrad": round(float(lat_tenengrad), 5),
+        "motion_roi_lap": round(pix_lap, 2) if pix_lap > 0 else None,
+        "is_flicker_spike": is_flicker_spike,
+        "lap_ok": lap_ok,
+    }
+
+
 def generate_one_with_qa(sample: dict, args, api: str, out_root: Path, timeout: int = 2400) -> dict:
-    """执行单条教师生成；若开启 min_motion_lapvar 则在未达标时自动换 seed 重抽并保留最锐利的一版。"""
+    """执行单条教师生成；支持 `--best-of-k K` 多随机种子解剖学平滑度+高速锐度严选与自动筛糊门禁。"""
+    import torch
+
     key = str(sample["id"])
     base_seed = int(sample.get("seed") or 0)
     min_lap = float(getattr(args, "min_motion_lapvar", 0.0) or 0.0)
+    best_of_k = max(1, int(getattr(args, "best_of_k", 1) or 1))
     max_retries = max(0, int(getattr(args, "max_qa_retries", 2) or 0)) if min_lap > 0 else 0
+    zup_tmp_dir = Path(str(getattr(args, "zup_tmp_dir", "/tmp/h3_zup_tmp") or "/tmp/h3_zup_tmp"))
 
-    best_lap = -1.0
+    total_budget_runs = best_of_k + (max_retries if best_of_k == 1 else 0)
+    best_score = -1e9
+    best_meta: dict = {}
     best_backup_dir = out_root / f"_best_{key}"
     last_pid = ""
+    rejected_spikes = 0
+    evaluated = 0
     t_total = time.time()
 
+    def _backup_current() -> None:
+        best_backup_dir.mkdir(parents=True, exist_ok=True)
+        qa_p = out_root / f"{key}.qa.json"
+        for p in expected(out_root, key) + ([qa_p] if qa_p.is_file() else []):
+            if p.is_file():
+                shutil.copy2(p, best_backup_dir / p.name)
+        zup_f = zup_tmp_dir / f"{key}_zup_force.pt"
+        if zup_f.is_file():
+            shutil.copy2(zup_f, best_backup_dir / zup_f.name)
+
+    def _restore_best() -> None:
+        if not best_backup_dir.is_dir():
+            return
+        for p in best_backup_dir.iterdir():
+            if p.name.endswith("_zup_force.pt"):
+                zup_tmp_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, zup_tmp_dir / p.name)
+            else:
+                shutil.copy2(p, out_root / p.name)
+
     try:
-        for attempt in range(max_retries + 1):
+        for attempt in range(total_budget_runs):
+            cur_seed = base_seed + attempt * 10007
             cur_sample = dict(sample)
-            cur_sample["seed"] = base_seed + attempt * 10007
+            cur_sample["seed"] = cur_seed
             graph = build_graph(cur_sample, args)
             pid = submit(api, graph)
             last_pid = pid
@@ -329,49 +476,86 @@ def generate_one_with_qa(sample: dict, args, api: str, out_root: Path, timeout: 
             missing = [p.name for p in expected(out_root, key) if not p.is_file()]
             if missing:
                 raise RuntimeError(f"missing outputs: {missing}")
+            evaluated += 1
 
-            if min_lap <= 0.0:
+            if best_of_k <= 1 and min_lap <= 0.0:
+                best_meta = {"seed": cur_seed, "motion_roi_lap": None, "composite_score": None}
                 break
 
             qa_path = out_root / f"{key}.qa.json"
-            cur_lap = 9999.0
+            qa_data = {}
             if qa_path.is_file():
                 try:
                     qa_data = json.loads(qa_path.read_text(encoding="utf-8"))
-                    cur_lap = float(qa_data.get("motion_roi_lap", 0.0))
                 except Exception:
-                    cur_lap = 9999.0
+                    qa_data = {}
 
-            if cur_lap >= min_lap:
-                best_lap = cur_lap
-                break
+            raw_nat = torch.load(out_root / f"{key}.z_native.pt", map_location="cpu", weights_only=False)
+            z_vid = raw_nat["parts"][0]
+            cand = score_teacher_kinematic_candidate(z_vid, qa_data=qa_data, min_motion_lapvar=min_lap)
+            cand["seed"] = cur_seed
+            cand["prompt_id"] = pid
+            if cand["is_flicker_spike"]:
+                rejected_spikes += 1
 
-            print(
-                f"[qa-gate] {key} attempt {attempt + 1}/{max_retries + 1} "
-                f"motion_roi_lap={cur_lap:.1f} < {min_lap:.1f}",
-                flush=True,
-            )
-            if cur_lap > best_lap:
-                best_lap = cur_lap
-                if max_retries > 0 and attempt < max_retries:
-                    best_backup_dir.mkdir(parents=True, exist_ok=True)
-                    for p in expected(out_root, key) + [qa_path]:
-                        if p.is_file():
-                            shutil.copy2(p, best_backup_dir / p.name)
-            if attempt == max_retries and best_backup_dir.is_dir():
-                # 恢复历次尝试中锐度最高的一版
-                for p in best_backup_dir.iterdir():
-                    shutil.copy2(p, out_root / p.name)
-                print(f"[qa-gate] {key} keep sharpest attempt (motion_roi_lap={best_lap:.1f})", flush=True)
+            if best_of_k > 1:
+                print(
+                    f"[best-of-{best_of_k}] {key} cand {attempt + 1}/{best_of_k} seed={cur_seed} "
+                    f"score={cand['composite_score']:.4f} smooth={cand['kinematic_smoothness']:.4f} "
+                    f"lap={cand['motion_roi_lap']} flicker={cand['temporal_flicker_ratio']:.2f} "
+                    f"spike_reject={cand['is_flicker_spike']}",
+                    flush=True,
+                )
+                if cand["composite_score"] > best_score:
+                    best_score = cand["composite_score"]
+                    best_meta = cand
+                    _backup_current()
+                if attempt == best_of_k - 1:
+                    _restore_best()
+                    print(
+                        f"[best-of-{best_of_k}] {key} SELECTED seed={best_meta.get('seed')} "
+                        f"score={best_meta.get('composite_score'):.4f} "
+                        f"(rejected_spikes={rejected_spikes}/{evaluated})",
+                        flush=True,
+                    )
+                    break
+            else:
+                cur_lap = float(qa_data.get("motion_roi_lap", 9999.0)) if qa_data else 9999.0
+                if cur_lap >= min_lap and not cand["is_flicker_spike"]:
+                    best_meta = cand
+                    break
+                print(
+                    f"[qa-gate] {key} attempt {attempt + 1}/{total_budget_runs} "
+                    f"motion_roi_lap={cur_lap:.1f} (min={min_lap:.1f}) spike={cand['is_flicker_spike']}",
+                    flush=True,
+                )
+                if cand["composite_score"] > best_score:
+                    best_score = cand["composite_score"]
+                    best_meta = cand
+                    if attempt < total_budget_runs - 1:
+                        _backup_current()
+                if attempt == total_budget_runs - 1 and best_backup_dir.is_dir():
+                    _restore_best()
+                    print(
+                        f"[qa-gate] {key} keep best attempt (seed={best_meta.get('seed')}, "
+                        f"lap={best_meta.get('motion_roi_lap')})",
+                        flush=True,
+                    )
     finally:
         if best_backup_dir.is_dir():
             shutil.rmtree(best_backup_dir, ignore_errors=True)
 
     return {
-        "prompt_id": last_pid,
+        "prompt_id": best_meta.get("prompt_id", last_pid),
+        "seed": best_meta.get("seed", base_seed),
         "sec": round(time.time() - t_total, 1),
         "zup_mode": resolve_zup_mode(getattr(args, "zup_mode", "downsample"), key),
-        "motion_roi_lap": round(best_lap, 2) if best_lap >= 0 else None,
+        "motion_roi_lap": best_meta.get("motion_roi_lap"),
+        "kinematic_smoothness": best_meta.get("kinematic_smoothness"),
+        "composite_score": best_meta.get("composite_score"),
+        "best_of_k": best_of_k,
+        "candidates_evaluated": evaluated,
+        "rejected_spikes": rejected_spikes,
     }
 
 
@@ -394,6 +578,8 @@ def main():
     ap.add_argument("--min-motion-lapvar", type=float, default=0.0,
                     help="运动前景 ROI 最低 LapVar 门禁（推荐 75.0；0=关闭）")
     ap.add_argument("--max-qa-retries", type=int, default=2)
+    ap.add_argument("--best-of-k", type=int, default=1,
+                    help="每条提示词运行 K 个候选随机种子并选取运动学平滑度+高速边缘锐度最优且无闪烁尖峰的 Top-1（推荐 3）")
     ap.add_argument("--budget-min", type=float, default=0.0, help="0=不限制；到点停止并保留已完成样本")
     ap.add_argument("--timeout", type=int, default=2400)
     ap.add_argument("--resume", action="store_true")

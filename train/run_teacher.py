@@ -82,6 +82,8 @@ def main() -> int:
     ap.add_argument("--zup-tmp-dir", default="/tmp/h3_zup_tmp")
     ap.add_argument("--min-motion-lapvar", type=float, default=75.0)
     ap.add_argument("--max-qa-retries", type=int, default=2)
+    ap.add_argument("--best-of-k", type=int, default=1,
+                    help="Best-of-K 黄金教师门禁：每条跑 K 个种子，选运动学最平滑+最高锐度且无帧间闪烁尖峰的 Top-1（推荐 3）")
     ap.add_argument("--api", default="http://127.0.0.1:8188")
     ap.add_argument("--comfy", default="/content/ComfyUI")
     ap.add_argument("--unet", default=G.DEFAULT_UNET)
@@ -108,9 +110,15 @@ def main() -> int:
     ap.add_argument("--init-lora-hf", default="")
     ap.add_argument("--rank-attn", type=int, default=64)
     ap.add_argument("--rank-mlp", type=int, default=32)
+    ap.add_argument("--train-refiner", action="store_true", help="开启 TokenRefiner 8 层训练（完整 208 层）")
+    ap.add_argument("--rank-refiner", type=int, default=32)
+    ap.add_argument("--vel-t-weight", type=float, default=0.20)
+    ap.add_argument("--orth-weight", type=float, default=0.02)
+    ap.add_argument("--grad-accum", type=int, default=1)
+    ap.add_argument("--ema-decay", type=float, default=0.995)
     ap.add_argument("--lr", type=float, default=8e-5)
     ap.add_argument("--optim", choices=["auto", "adamw", "adamw8bit"], default="auto")
-    ap.add_argument("--attn-backend", choices=["auto", "flex", "sdpa_mask"], default="auto")
+    ap.add_argument("--attn-backend", choices=["auto", "flex", "triton_bs", "sdpa_mask"], default="auto")
     ap.add_argument("--base", default="/content/local_models/diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors")
     args = ap.parse_args()
 
@@ -149,7 +157,7 @@ def main() -> int:
         sampler="dual_clock_euler", frames=args.frames,
         zup_mode=args.zup_mode, pass1_sigmas=args.pass1_sigmas, pass1_cfg=args.pass1_cfg,
         zup_tmp_dir=args.zup_tmp_dir, min_motion_lapvar=args.min_motion_lapvar,
-        max_qa_retries=args.max_qa_retries,
+        max_qa_retries=args.max_qa_retries, best_of_k=args.best_of_k,
     )
 
     started = time.time()
@@ -282,9 +290,15 @@ def main() -> int:
                 "--attn-backend", args.attn_backend, "--block-size", "64",
                 "--lf-base-anchor", "--lf-kernel", "5",
                 "--motion-gate-tau", "0.35", "--grad-xy-weight", "0.15",
+                "--vel-t-weight", str(args.vel_t_weight),
+                "--orth-weight", str(args.orth_weight),
+                "--grad-accum", str(args.grad_accum),
+                "--ema-decay", str(args.ema_decay),
                 "--save-every", "50", "--log-every", "5",
                 "--auto-resume", "--grad-clamp", "10",
             ]
+            if args.train_refiner:
+                cmd += ["--train-refiner", "--rank-refiner", str(args.rank_refiner)]
             if args.train_frames:
                 cmd += ["--frames", args.train_frames]
             if args.init_lora:

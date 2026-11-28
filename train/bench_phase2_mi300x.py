@@ -36,6 +36,13 @@ TRAIN_DIR = Path(__file__).resolve().parent
 if str(TRAIN_DIR) not in sys.path:
     sys.path.insert(0, str(TRAIN_DIR))
 
+from triton_block_sparse_attn import (  # noqa: E402
+    TritonBlockSparsePlan,
+    build_csr_csc_block_tables,
+    get_compiled_shared_memory_bytes,
+    triton_block_sparse_attn,
+)
+
 
 # ============================================================================
 # 1. 核心算子：Macro-Tile Morton KV-Gather 无掩码 FlashAttention
@@ -258,7 +265,7 @@ def macro_gather_flash_attn(
 
 
 # ============================================================================
-# 2. 合成等价性单元测试 & 单层前反向微基准 (--self-test)
+# 2. 合成等价性单元测试 & 单层前反向微基准 (--self-test: Phase 2B triton_bs Zero-Gather)
 # ============================================================================
 def run_synthetic_selftest(seq_len: int = 8192, heads: int = 56, head_dim: int = 128) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -282,16 +289,13 @@ def run_synthetic_selftest(seq_len: int = 8192, heads: int = 56, head_dim: int =
     keep = torch.ones(seq_len, dtype=torch.bool, device=device)
     keep[200:256] = False  # 模拟文本 padding 位
 
-    plan = build_macro_gather_plan(sel, block, seq_len, va, vb, keep_kv=keep, macro_mult=4, macro_chunk=16)
+    tables = build_csr_csc_block_tables(sel, keep, block_size=block)
+    tbs_plan = TritonBlockSparsePlan(tables=tables, keep_kv=keep, block_size=block, seq_len=seq_len)
 
-    # 构造与 plan 完全对应的展开布尔掩码以验证逐位等价性
-    ref_mask = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
-    ref_mask[plan["sink_q_idx"][:, None], plan["all_valid_idx"][None, :]] = True
-    for m_i, rn in enumerate(plan["macro_valid_q_lens"]):
-        q_t = plan["macro_q_idx"][m_i, :rn]
-        kv_t = plan["macro_kv_idx"][m_i]
-        ref_mask[q_t[:, None], kv_t[None, :]] = True
-    ref_mask_4d = ref_mask.unsqueeze(0).unsqueeze(0)
+    # 精确对应块展开布尔掩码以验证数学等价性
+    tok_mask = sel.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)[:seq_len, :seq_len] & keep[None, :seq_len]
+    ref_mask_4d = tok_mask.unsqueeze(0).unsqueeze(0)
+    keep_ratio = round(float(tok_mask.float().mean().item()), 4)
 
     scale = (head_dim ** -0.5) * 1.08
     q_base = torch.randn((1, heads, seq_len, head_dim), device=device, dtype=torch.bfloat16) * 0.5
@@ -304,7 +308,7 @@ def run_synthetic_selftest(seq_len: int = 8192, heads: int = 56, head_dim: int =
     (out_ref * grad_out).sum().backward()
 
     q2, k2, v2 = [t.clone().detach().requires_grad_(True) for t in (q_base, k_base, v_base)]
-    out_new = macro_gather_flash_attn(q2, k2, v2, plan, scale=scale)
+    out_new = triton_block_sparse_attn(q2, k2, v2, tbs_plan, scale=scale)
     (out_new * grad_out).sum().backward()
 
     def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -316,22 +320,25 @@ def run_synthetic_selftest(seq_len: int = 8192, heads: int = 56, head_dim: int =
     cos_dk = _cos(k1.grad, k2.grad)
     cos_dv = _cos(v1.grad, v2.grad)
     finite_all = all(torch.isfinite(t).all().item() for t in (out_new, q2.grad, k2.grad, v2.grad))
+    lds_bytes = get_compiled_shared_memory_bytes()
 
     print(
-        f"[self-test S={seq_len}] keep_ratio={plan['keep_ratio']} finite={finite_all} | "
+        f"[self-test S={seq_len}] keep_ratio={keep_ratio} tables={tbs_plan.total_bytes / 1024:.1f}KB "
+        f"finite={finite_all} lds={lds_bytes} | "
         f"cos(out)={cos_out:.6f} cos(dQ)={cos_dq:.6f} cos(dK)={cos_dk:.6f} cos(dV)={cos_dv:.6f}",
         flush=True,
     )
     assert finite_all and min(cos_out, cos_dq, cos_dk, cos_dv) > 0.9995, "Self-test equivalence failed!"
 
-    # 单层前向+反向微基准
-    def _time_fwd_bwd(fn, iters: int = 4) -> float:
+    # 单层前向+反向微基准 & 峰值显存对比
+    def _time_fwd_bwd(fn, iters: int = 4) -> tuple[float, float]:
         for _ in range(2):
             qt, kt, vt = [t.clone().detach().requires_grad_(True) for t in (q_base, k_base, v_base)]
             y = fn(qt, kt, vt)
             (y * grad_out).sum().backward()
         if device.type == "cuda":
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         for _ in range(iters):
             qt, kt, vt = [t.clone().detach().requires_grad_(True) for t in (q_base, k_base, v_base)]
@@ -339,25 +346,36 @@ def run_synthetic_selftest(seq_len: int = 8192, heads: int = 56, head_dim: int =
             (y * grad_out).sum().backward()
         if device.type == "cuda":
             torch.cuda.synchronize()
-        return (time.time() - t0) / iters * 1000.0
+            peak_mib = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        else:
+            peak_mib = 0.0
+        return (time.time() - t0) / iters * 1000.0, peak_mib
 
-    ms_masked = _time_fwd_bwd(lambda q, k, v: F.scaled_dot_product_attention(q, k, v, attn_mask=ref_mask_4d, scale=scale))
-    ms_gather = _time_fwd_bwd(lambda q, k, v: macro_gather_flash_attn(q, k, v, plan, scale=scale))
-    speedup = ms_masked / max(ms_gather, 1e-6)
+    ms_masked, vram_masked = _time_fwd_bwd(
+        lambda q, k, v: F.scaled_dot_product_attention(q, k, v, attn_mask=ref_mask_4d, scale=scale)
+    )
+    ms_triton, vram_triton = _time_fwd_bwd(
+        lambda q, k, v: triton_block_sparse_attn(q, k, v, tbs_plan, scale=scale)
+    )
+    speedup = ms_masked / max(ms_triton, 1e-6)
     print(
-        f"[micro-bench S={seq_len} fwd+bwd] sdpa_mask={ms_masked:.1f} ms vs "
-        f"macro_gather_flash={ms_gather:.1f} ms  (speedup = {speedup:.2f}x)",
+        f"[micro-bench S={seq_len} fwd+bwd] sdpa_mask={ms_masked:.1f} ms ({vram_masked:.1f} MiB) vs "
+        f"triton_bs_zero_gather={ms_triton:.1f} ms ({vram_triton:.1f} MiB)  (speedup = {speedup:.2f}x)",
         flush=True,
     )
     return {
         "seq_len": seq_len,
-        "keep_ratio": plan["keep_ratio"],
+        "keep_ratio": keep_ratio,
+        "tables_bytes": tbs_plan.total_bytes,
+        "lds_shared_bytes": lds_bytes,
         "cos_out": round(cos_out, 6),
         "cos_dq": round(cos_dq, 6),
         "cos_dk": round(cos_dk, 6),
         "cos_dv": round(cos_dv, 6),
         "ms_sdpa_mask_fwdbwd": round(ms_masked, 2),
-        "ms_gather_flash_fwdbwd": round(ms_gather, 2),
+        "ms_triton_bs_fwdbwd": round(ms_triton, 2),
+        "peak_vram_sdpa_mask_mib": round(vram_masked, 2),
+        "peak_vram_triton_bs_mib": round(vram_triton, 2),
         "layer_attn_speedup": round(speedup, 2),
     }
 
@@ -544,7 +562,7 @@ def run_full_mi300x_ab(args) -> dict:
     rec = group.records[0]
     print(f"[phase2] selected real sample={rec['stem']} bucket={chosen_k.split('|')[0]} S={group.S}", flush=True)
 
-    # 安装支持 sdpa_mask 与 macro_gather_flash 双模式切换的 attention forward
+    # 安装支持 sdpa_mask 与 Phase 2B triton_bs (Zero-Gather) 双模式切换的 attention forward
     def _make_dual_attn_forward(head_dim: int, attn_temp: float):
         scale_base = head_dim ** -0.5
 
@@ -576,9 +594,12 @@ def run_full_mi300x_ab(args) -> dict:
                 k = T._permute_bhsd_video(k, m_va, m_vb, m_perm)
                 v = T._permute_bhsd_video(v, m_va, m_vb, m_perm)
 
+            tbs_plan = to.get("_h3_triton_bs")
             gather_plan = to.get("_h3_gather_plan")
             sdpa_mask = to.get("_h3_sdpa_mask")
-            if gather_plan is not None:
+            if tbs_plan is not None:
+                out = triton_block_sparse_attn(q, k, v, tbs_plan, scale=scale)
+            elif gather_plan is not None:
                 out = macro_gather_flash_attn(q, k, v, gather_plan, scale=scale)
             else:
                 out = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_mask, dropout_p=0.0, is_causal=False, scale=scale)
@@ -602,7 +623,7 @@ def run_full_mi300x_ab(args) -> dict:
     opt = torch.optim.AdamW(all_params, lr=5e-5)
     gen = torch.Generator(device=device).manual_seed(2026)
 
-    def _run_mode(mode_name: str, use_gather: bool, n_steps: int) -> dict:
+    def _run_mode(mode_name: str, use_triton_bs: bool, n_steps: int) -> dict:
         torch.cuda.reset_peak_memory_stats()
         step_times: list[float] = []
         nonzero_grads = 0
@@ -614,18 +635,15 @@ def run_full_mi300x_ab(args) -> dict:
                 sigma_a = h3.time_shift_sigma(sigma, 12.0, 3.0) if hasattr(h3, "time_shift_sigma") else sigma
                 batch = T.build_batch(rec, group, sigma, sigma_a, device, gen)
 
-                # 预构造同一稀疏块矩阵对应的 mask 或 gather_plan
-                sel = T._select_sparse_blocks(group, 0.22, 0.25, device, h_ref=None, jitter=0.0)
+                # 预构造同一稀疏块矩阵对应的 sdpa_mask 或 Phase 2B Zero-Gather triton_bs CSR/CSC 表
                 to_extra: dict = {"_h3_plan": group, "_h3_keep_kv": batch["keep"]}
-                if use_gather:
-                    gplan = build_macro_gather_plan(
-                        sel, group.block, group.S, group.va, group.vb,
-                        keep_kv=batch["keep"], macro_mult=args.macro_mult, macro_chunk=args.macro_chunk,
+                if use_triton_bs:
+                    tbs_plan = T.build_sparse_mask(
+                        group, 0.22, 0.25, batch["keep"], device, backend="triton_bs", jitter=0.0
                     )
-                    to_extra["_h3_gather_plan"] = gplan
+                    to_extra["_h3_triton_bs"] = tbs_plan
                     to_extra["_h3_prebuilt_mask"] = None
                     to_extra["_use_compiled_rope"] = compiled_rope_ok
-                    # 防止 patch_run_blocks 再构造旧 sdpa_mask
                     to_extra["_h3_keep_kv"] = None
                 else:
                     smask = T.build_sparse_mask(group, 0.22, 0.25, batch["keep"], device, backend="sdpa_mask", jitter=0.0)
@@ -634,14 +652,14 @@ def run_full_mi300x_ab(args) -> dict:
                 old_pos = group.layout.position_ids
                 group.layout.position_ids = batch["pos"]
                 try:
-                    # 直接传原始 5120 维 b["text"] 进 dm(...)，让 _forward 原生可微穿过 condition_proj + token_refiner！
+                    # 直接传原始 5120 维 batch["text"] 进 dm(...)，让 _forward 原生可微穿过 condition_proj + token_refiner！
                     with T._disable_lora(), torch.no_grad():
                         ctx_base = dm.preprocess_text_embeds(batch["text"])
                         base_out = dm(batch["x"], torch.tensor([sigma * 1000.0], device=device), ctx_base,
                                       transformer_options=dict(to_extra), minimax_payload=batch["payload"])
                         base_v = base_out[0].detach().float()
 
-                    ctx_in = batch["text"] if use_gather else dm.preprocess_text_embeds(batch["text"])
+                    ctx_in = batch["text"] if use_triton_bs else dm.preprocess_text_embeds(batch["text"])
                     out = dm(batch["x"], torch.tensor([sigma * 1000.0], device=device), ctx_in,
                              transformer_options=dict(to_extra), minimax_payload=batch["payload"])
                 finally:
@@ -653,7 +671,12 @@ def run_full_mi300x_ab(args) -> dict:
                 lf_tgt = T._spatial_lowpass(tgt_v, 5)
                 m_mot = T._motion_gate_mask(batch["z_video"], 0.75)
                 tgt_ref = (1.0 - m_mot) * (lf_base + (tgt_v - lf_tgt)) + m_mot * tgt_v
-                loss = F.mse_loss(pred_vf, tgt_ref) + 0.15 * T._spatial_grad_l1(pred_vf, tgt_ref) + 0.1 * F.mse_loss(out[1].float(), batch["tgt"][1])
+                loss = (
+                    F.mse_loss(pred_vf, tgt_ref)
+                    + 0.15 * T._spatial_grad_l1(pred_vf, tgt_ref)
+                    + 0.20 * T._temporal_vel_jacobian_l1(pred_vf, tgt_v, m_mot=m_mot)
+                    + 0.1 * F.mse_loss(out[1].float(), batch["tgt"][1])
+                )
 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -685,10 +708,10 @@ def run_full_mi300x_ab(args) -> dict:
         return res
 
     print("\n=== [A] Running Baseline: sdpa_mask (200 active DiT layers) ===", flush=True)
-    res_base = _run_mode("baseline_sdpa_mask", use_gather=False, n_steps=args.base_steps)
+    res_base = _run_mode("baseline_sdpa_mask", use_triton_bs=False, n_steps=args.base_steps)
 
-    print("\n=== [B] Running Phase 2: rocm_gather_flash + compiled_rope + 208 layers (with TokenRefiner) ===", flush=True)
-    res_p2 = _run_mode("phase2_rocm_gather_flash_208L", use_gather=True, n_steps=args.p2_steps)
+    print("\n=== [B] Running Phase 2B: triton_bs (Zero-Gather 64x64) + compiled_rope + 208 layers (with TokenRefiner) ===", flush=True)
+    res_p2 = _run_mode("phase2b_triton_bs_zero_gather_208L", use_triton_bs=True, n_steps=args.p2_steps)
 
     e2e_speedup = round(res_base["steady_avg_sec"] / max(res_p2["steady_avg_sec"], 0.01), 2)
     print(

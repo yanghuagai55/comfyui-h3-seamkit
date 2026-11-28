@@ -45,7 +45,10 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 _KEY_RE = re.compile(
-    r"^(?P<prefix>.*blocks\.(?P<block>\d+)\.(?P<mod>attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2)))\.(?P<part>alpha|lora_down\.weight|lora_up\.weight)$"
+    r"^(?P<prefix>(?:diffusion_model\.|transformer\.|model\.)?blocks\.(?P<block>\d+)\.(?P<mod>attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2)))\.(?P<part>alpha|lora_down\.weight|lora_up\.weight)$"
+)
+_REFINER_KEY_RE = re.compile(
+    r"^(?P<prefix>(?:diffusion_model\.|transformer\.|model\.)?token_refiner\.blocks\.(?P<block>\d+)\.(?P<mod>attn\.(?:qkv_proj|out_proj)|mlp\.(?:fc1|fc2)))\.(?P<part>alpha|lora_down\.weight|lora_up\.weight)$"
 )
 
 
@@ -77,6 +80,7 @@ def slice_lora(
     mlp_early: float = 0.25,
     mlp_mid: float = 0.45,
     mlp_late: float = 0.15,
+    refiner_scale: float = 1.0,
 ) -> dict:
     out_tensors: dict[str, torch.Tensor] = {}
     stats = defaultdict(lambda: {"orig_norm": 0.0, "new_norm": 0.0, "layers": 0})
@@ -89,8 +93,13 @@ def slice_lora(
 
         # Group by layer prefix so we can verify completeness and cleanly drop 0-scale layers
         groups: dict[str, dict[str, str]] = defaultdict(dict)
+        refiner_groups: dict[str, dict[str, str]] = defaultdict(dict)
         passthrough: list[str] = []
         for k in keys:
+            mr = _REFINER_KEY_RE.match(k)
+            if mr:
+                refiner_groups[mr.group("prefix")][mr.group("part")] = k
+                continue
             m = _KEY_RE.match(k)
             if not m:
                 passthrough.append(k)
@@ -102,6 +111,36 @@ def slice_lora(
 
         kept_layers = 0
         dropped_layers = 0
+
+        # Pass through 208-layer TokenRefiner linear LoRAs (pure text semantic routing, 0 brushstroke prior)
+        for prefix, parts in sorted(refiner_groups.items()):
+            up_t = f.get_tensor(parts["lora_up.weight"])
+            down_t = f.get_tensor(parts["lora_down.weight"])
+            alpha_t = f.get_tensor(parts["alpha"]) if "alpha" in parts else None
+
+            u32 = up_t.float()
+            d32 = down_t.float()
+            rank = d32.shape[0]
+            alpha_val = float(alpha_t.item()) if alpha_t is not None else float(rank)
+            eff_mul = alpha_val / float(rank)
+            orig_frob = float(torch.sqrt(torch.clamp(((u32.T @ u32) * (d32 @ d32.T)).sum(), min=0.0)).item()) * eff_mul
+            stats["token_refiner"]["orig_norm"] += orig_frob
+            stats["token_refiner"]["layers"] += 1
+
+            if refiner_scale == 0.0:
+                dropped_layers += 1
+                continue
+            kept_layers += 1
+            new_up = up_t if refiner_scale == 1.0 else (u32 * refiner_scale).to(up_t.dtype)
+            nu32 = new_up.float()
+            new_frob = float(torch.sqrt(torch.clamp(((nu32.T @ nu32) * (d32 @ d32.T)).sum(), min=0.0)).item()) * eff_mul
+            stats["token_refiner"]["new_norm"] += new_frob
+
+            out_tensors[parts["lora_down.weight"]] = down_t
+            out_tensors[parts["lora_up.weight"]] = new_up
+            if alpha_t is not None:
+                out_tensors[parts["alpha"]] = alpha_t
+
         for prefix, parts in sorted(groups.items()):
             m = _KEY_RE.match(next(iter(parts.values())))
             assert m is not None
@@ -171,10 +210,13 @@ def slice_lora(
     size_mib = os.path.getsize(output_path) / (1024 * 1024)
     print(f"[slice] {preset} -> {output_path}")
     print(f"        kept={kept_layers} layers ({len(out_tensors)} tensors), dropped={dropped_layers} layers, size={size_mib:.2f} MiB")
-    for bucket in ("attn_all", "mlp_0_4", "mlp_5_31", "mlp_32_49"):
+    buckets = ["attn_all", "mlp_0_4", "mlp_5_31", "mlp_32_49"]
+    if stats["token_refiner"]["layers"] > 0:
+        buckets.append("token_refiner")
+    for bucket in buckets:
         s = stats[bucket]
         ratio = (s["new_norm"] / s["orig_norm"]) if s["orig_norm"] > 0 else 0.0
-        print(f"        {bucket:9s} ({s['layers']:3d}L): orig_frob={s['orig_norm']:7.2f} -> new_frob={s['new_norm']:7.2f} ({ratio:.3f}x)")
+        print(f"        {bucket:13s} ({s['layers']:3d}L): orig_frob={s['orig_norm']:7.2f} -> new_frob={s['new_norm']:7.2f} ({ratio:.3f}x)")
 
     return {
         "output": output_path,
