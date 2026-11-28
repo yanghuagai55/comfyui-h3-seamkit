@@ -475,8 +475,9 @@ if not d.is_dir():
     raise SystemExit(0)
 for p in sorted(d.glob("step_*.safetensors"), key=lambda p: p.stat().st_mtime):
     try:
-        shutil.move(str(p), str(arch / p.name))
-        print(f"[clean] archived {p.name} ({p.stat().st_size/1e6:.0f} MB)", flush=True)
+        dst = arch / p.name
+        shutil.move(str(p), str(dst))
+        print(f"[clean] archived {p.name} ({dst.stat().st_size/1e6:.0f} MB)", flush=True)
     except Exception as exc:
         print(f"[clean] archive fail {p.name}: {exc}", flush=True)
 PY
@@ -526,17 +527,17 @@ pkill -f "main.py --listen 127.0.0.1 --port 8188" 2>/dev/null || true
 sleep 3
 
 sync_code() {
-  local ok=0 m cfg
-  if [ -d "${CODE_DIR}/.git" ]; then
+  local mode="${V3_CODE_MODE:-auto}" ok=0 m cfg
+  if [ "${mode}" != "bundle" ] && [ -d "${CODE_DIR}/.git" ]; then
     for m in "" "https://ghfast.top/https://github.com/" "https://gh-proxy.com/https://github.com/"; do
       cfg=()
       [ -n "${m}" ] && cfg=(-c "url.${m}https://github.com/.insteadOf=https://github.com/")
-      if timeout 200 git -C "${CODE_DIR}" "${cfg[@]}" fetch --depth 1 origin main >>"${MAIN_LOG}" 2>&1; then
+      if timeout 120 git -C "${CODE_DIR}" "${cfg[@]}" fetch --depth 1 origin main >>"${MAIN_LOG}" 2>&1; then
         if git -C "${CODE_DIR}" reset --hard FETCH_HEAD >>"${MAIN_LOG}" 2>&1; then ok=1; break; fi
       fi
     done
   fi
-  if [ "${ok}" -ne 1 ] && [ ! -d "${CODE_DIR}/.git" ]; then
+  if [ "${mode}" = "git" ] && [ "${ok}" -ne 1 ] && [ ! -d "${CODE_DIR}/.git" ]; then
     for m in "https://ghfast.top/https://github.com/" "https://github.com/" "https://gh-proxy.com/https://github.com/"; do
       rm -rf /tmp/v3_clone
       if timeout 300 git clone --depth 1 "${m}yanghuagai55/comfyui-h3-seamkit.git" /tmp/v3_clone >>"${MAIN_LOG}" 2>&1; then
@@ -546,7 +547,7 @@ sync_code() {
     done
   fi
   if [ "${ok}" -ne 1 ]; then
-    log "[WARN] git 同步失败，回退魔搭代码包"
+    log "[code] 使用魔搭代码包（V3_CODE_MODE=${mode}；git 克隆在魔搭常被限速）"
     ms dl "bundle/comfyui-h3-seamkit-train_v3_overnight.tar.gz" /tmp/v3boot/code.tar.gz || return 1
     mkdir -p "${CODE_DIR}"
     tar -xzf /tmp/v3boot/code.tar.gz -C "${CODE_DIR}" || return 1
@@ -617,6 +618,17 @@ import importlib.util, torch
 print(f"[deps] torch={torch.__version__} hip={getattr(torch.version,'hip',None)} cuda_avail={torch.cuda.is_available()}")
 print(f"[deps] triton={importlib.util.find_spec('triton') is not None}")
 PY
+
+# ComfyUI 运行依赖（新实例系统盘会丢 pip 包：comfy-aimdo 等必须补齐）
+if [ -d "${COMFY_DIR}" ] && [ -s "${COMFY_DIR}/requirements.txt" ]; then
+  if ! ( cd "${COMFY_DIR}" && python3 -c "import comfy.model_management" >/dev/null 2>&1 ); then
+    log "[deps] ComfyUI 依赖缺失，安装 requirements（过滤 torch）"
+    grep -viE '^(torch|torchvision|torchaudio)([=<>!~ ]|$)' "${COMFY_DIR}/requirements.txt" > /tmp/v3_req_filtered.txt 2>/dev/null || true
+    if [ -s /tmp/v3_req_filtered.txt ]; then
+      python3 -m pip install -q -r /tmp/v3_req_filtered.txt >>"${MAIN_LOG}" 2>&1 || log "[deps] ComfyUI requirements 安装失败"
+    fi
+  fi
+fi
 
 # veo_cast 参考图
 VEO_PNG=$(ls "${COMFY_DIR}/input/veo_cast"/*.png 2>/dev/null | wc -l | tr -d ' ')
